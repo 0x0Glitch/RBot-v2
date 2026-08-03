@@ -173,6 +173,7 @@ const GAUGE_NAMES: &[&str] = &[
 const COUNTER_NAMES: &[&str] = &[
     "reallocator_snapshot_success_total",
     "reallocator_snapshot_retry_total",
+    "reallocator_idle_ledger_replay_failure_total",
     "reallocator_same_head_preflight_retry_total",
     "reallocator_transaction_reverts_total",
     "reallocator_interleaving_opportunity_detected_total",

@@ -302,14 +302,18 @@ independent-event persistent-unlock path still gate production Execute.
   topology from acknowledged JSON logs/checkpoints, refreshes exact state at the
   canonical head and publishes real runtime/API/health/metric state. The same
   live state owner is exercised inside the signed Anvil E2E.
-- Idle-lock attribution is deliberately unverified in the live service until its
-  receipt-origin consumer is composed, so Execute cannot become ready or invoke
-  a signer whenever nonzero idle cannot be classified. Exact zero idle safely
-  proves an empty lock balance.
+- The live receipt-origin consumer now reconstructs the unified idle-lock ledger
+  from durable canonical logs in exact block/transaction/log order, verifies
+  every transaction sender and canonical identity, recognizes durable bot
+  hashes, and reconciles the replayed end balance to the atomic exact vault-token
+  balance. Native deposits remain unlocked; donations and unknown/external
+  deallocations remain held. Missing or inconsistent evidence marks the entire
+  idle balance unattributed and disables Execute.
 - Observe publishes no plans. Shadow and fail-closed Execute operation now own
-  durable rate detection, consecutive short confirmation, bounded exact solving,
-  semantic-plan hashing, independent firewall validation, JSON persistence and
-  `/plan` publication. The persistent continuous-time path is live and retains
+  the normative LiquidityMaintenance -> CapitalDeployment -> RateRebalance
+  priority, durable rate detection, consecutive short confirmation, bounded
+  exact solving, semantic-plan hashing, independent firewall validation, JSON
+  persistence and `/plan` publication. The persistent continuous-time path is live and retains
   the frozen target-threshold direction; exact independent-event unlocking
   remains fail closed.
 
@@ -322,18 +326,27 @@ independent-event persistent-unlock path still gate production Execute.
   cap-data persistence, atomic exact state, an improving two-action bounded rate
   solution, independent firewall validation, real-EOA `eth_call`, restricted
   signing, raw submission, confirmation, exact event conformance, current-state
-  reconciliation and terminal restart recovery.
+  reconciliation and terminal restart recovery. The same test now creates a
+  second native deposit after rate reconciliation, reconstructs it as unlocked,
+  autonomously builds/signs/submits a CapitalDeployment transaction, validates
+  its canonical receipt and reconciles exact post-state. It then sends a direct
+  token donation and proves those units become an active unattributed safety
+  lock and never enter a capital plan.
 - The live fixture exposed and fixed dynamic cap-ID ABI encoding: Solidity
   `abi.encode` argument sequences require Alloy `abi_encode_params`, not a
   dynamically nested tuple encoding.
-- The deterministic local transaction is
-  `0x6f82ceadd58398c817d82acaa744a5f6b7fb53776c30f4d3b1343ece08827640`;
-  its exact spot-rate spread improves from `20833333333` to `18065268066`
+- The latest deterministic local rate transaction is
+  `0x40302f44e5fe875e74fbf90ecf1146e4e26baac9792cd38f7a4c46fa239fc41d`;
+  its exact spot-rate spread improves from `20864935103` to approximately `18103017437`
   per-second WAD units. A later cap event forces an exact refreshed cap value;
   adapter removal hard-pauses projection, and re-addition restores capability
   and produces a fresh improving plan. The supervised state owner then confirms
   a new live episode on the next direct-parent block and publishes a durable,
   firewalled improving Shadow plan.
+- The same run's deposit-driven capital transaction is
+  `0xc2550672e53d65f760d66194a28b3b1dff12dd9f1cca7eed59d740cb01e00b44`;
+  it deploys all `500000` newly deposited fixture asset units and reaches exact
+  canonical receipt conformance and post-state reconciliation.
 - Base Sepolia subsequently completed five autonomous two-action rebalances
   against the pinned exact-accrual fixture. Transactions
   `0x7a76bf553fa00236e38daf4920333fac45357715421a5e9b77884eb5805fb431`,

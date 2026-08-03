@@ -131,6 +131,7 @@ impl RuntimeVaultState {
                     | Self::LockAccountingUncertain
                     | Self::PausedByOperator
                     | Self::PausedUnsupportedConfiguration
+                    | Self::PausedSignerFailure
             ),
             Self::LockAccountingUncertain
             | Self::PausedByOperator
@@ -140,7 +141,15 @@ impl RuntimeVaultState {
             | Self::PausedReconciliationFailure => {
                 matches!(
                     next,
-                    Self::Recovery | Self::CatchingUp | Self::Observe | Self::Shadow
+                    Self::Recovery
+                        | Self::CatchingUp
+                        | Self::Observe
+                        | Self::Shadow
+                        | Self::PendingTransaction
+                        | Self::IdleLocksActive
+                        | Self::LockAccountingUncertain
+                        | Self::PausedUnsupportedConfiguration
+                        | Self::PausedSignerFailure
                 )
             }
         }
@@ -273,5 +282,48 @@ impl RuntimeRegistry {
             .get_mut(&vault)
             .ok_or(ControllerError::InvalidTransition)?;
         update(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::Address;
+
+    use super::{RuntimeVaultState, VaultRuntimeStatus};
+    use crate::domain::VaultAddress;
+
+    #[test]
+    fn durable_pending_and_idle_locks_override_other_fail_closed_states() {
+        let mut status = VaultRuntimeStatus::starting(VaultAddress(Address::with_last_byte(1)));
+        assert!(
+            status
+                .transition(RuntimeVaultState::CatchingUp, None)
+                .is_ok()
+        );
+        assert!(
+            status
+                .transition(RuntimeVaultState::PausedSignerFailure, None)
+                .is_ok()
+        );
+        assert!(
+            status
+                .transition(RuntimeVaultState::PendingTransaction, None)
+                .is_ok()
+        );
+        assert!(
+            status
+                .transition(RuntimeVaultState::IdleLocksActive, None)
+                .is_ok()
+        );
+        assert!(
+            status
+                .transition(RuntimeVaultState::PausedSignerFailure, None)
+                .is_ok()
+        );
+        assert!(
+            status
+                .transition(RuntimeVaultState::LockAccountingUncertain, None)
+                .is_ok()
+        );
     }
 }

@@ -38,6 +38,8 @@ Application configuration is strict schema-v3 JSON. Unknown fields fail startup;
 risk values live only in the file, while secrets and HTTP/WebSocket endpoints
 are referenced by environment-variable name. `protocol-lock.toml` remains the
 separate immutable protocol identity lock.
+See `docs/configuration.md` for the operator-facing layout, value conventions,
+environment references, and validation commands.
 
 The normative architecture and implementation roadmap live under
 `docs/normative/` and are protected by digest checks.

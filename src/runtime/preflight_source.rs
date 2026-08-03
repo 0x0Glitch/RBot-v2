@@ -10,14 +10,16 @@ use crate::{
     api::ApiDataStore,
     chain::multicall::AtomicSnapshotProvider,
     config::ValidatedConfig,
-    domain::{BlockRef, IdleLockLedgerSnapshot, RateObjectiveBranch, VaultAddress},
+    domain::{BlockRef, IdleLockLedgerSnapshot, PlanReason, RateObjectiveBranch, VaultAddress},
     planner::{
         objective::rate_spread,
         simulator::{no_plan_terminal_existing_shareholder_assets, simulate_actions},
     },
     runtime::{
         identity::RuntimeIdentities,
-        planning_service::build_validated_rate_plan,
+        planning_service::{
+            build_validated_capital_plan, build_validated_liquidity_plan, build_validated_rate_plan,
+        },
         state_service::{EventSourceRegistry, replay_topology_through},
     },
     state::{
@@ -117,23 +119,35 @@ impl<P: AtomicSnapshotProvider> LiveRatePreflightSource<P> {
         let topology = replay_topology_through(&self.config, &sources, &self.storage, vault, head)
             .await
             .map_err(|_| PreflightSourceError::Failed)?;
-        let episode = self
+        let active_episode = self
             .storage
             .load_active_rate_episode(vault.address, vault.rate_group.id)
             .await
-            .map_err(|_| PreflightSourceError::Failed)?
+            .map_err(|_| PreflightSourceError::Failed)?;
+        let published_reason = self
+            .api
+            .plan(vault.address)
+            .await
+            .map(|plan| plan.reason)
+            .or_else(|| active_episode.as_ref().map(|_| PlanReason::RateRebalance))
             .ok_or(PreflightSourceError::Failed)?;
+        let episode = if published_reason == PlanReason::RateRebalance {
+            Some(active_episode.ok_or(PreflightSourceError::Failed)?)
+        } else {
+            None
+        };
         let topology_revision = topology
             .revision()
             .map_err(|_| PreflightSourceError::Failed)?;
-        if episode.config_revision != self.config.revision
-            || episode.topology_revision != topology_revision
-            || scenarios
-                .iter()
-                .map(|scenario| scenario.projected_timestamp)
-                .max()
-                .is_none_or(|latest| latest >= episode.expires_at)
-        {
+        if episode.as_ref().is_some_and(|episode| {
+            episode.config_revision != self.config.revision
+                || episode.topology_revision != topology_revision
+                || scenarios
+                    .iter()
+                    .map(|scenario| scenario.projected_timestamp)
+                    .max()
+                    .is_none_or(|latest| latest >= episode.expires_at)
+        }) {
             return Err(PreflightSourceError::Failed);
         }
         let maximum_scenario_timestamp = scenarios
@@ -199,17 +213,32 @@ impl<P: AtomicSnapshotProvider> LiveRatePreflightSource<P> {
             .find(|(kind, _)| *kind == InclusionScenarioKind::Expected)
             .map(|(_, projection)| projection)
             .ok_or(PreflightSourceError::Failed)?;
-        let prepared =
-            build_validated_rate_plan(&self.config, vault, &snapshot, expected, &episode)
-                .map_err(|_| PreflightSourceError::Failed)?
-                .ok_or(PreflightSourceError::Failed)?;
+        let prepared = match published_reason {
+            PlanReason::LiquidityMaintenance => {
+                build_validated_liquidity_plan(&self.config, vault, &snapshot, expected)
+            }
+            PlanReason::CapitalDeployment => {
+                build_validated_capital_plan(&self.config, vault, &snapshot, expected)
+            }
+            PlanReason::RateRebalance => build_validated_rate_plan(
+                &self.config,
+                vault,
+                &snapshot,
+                expected,
+                episode.as_ref().ok_or(PreflightSourceError::Failed)?,
+            ),
+            PlanReason::PositionSyncRequired => return Err(PreflightSourceError::Failed),
+        }
+        .map_err(|_| PreflightSourceError::Failed)?
+        .ok_or(PreflightSourceError::Failed)?;
         for (_, projection) in &projections {
             validate_scenario(
                 &snapshot,
                 projection,
                 vault,
                 &self.config,
-                &episode,
+                published_reason,
+                episode.as_ref(),
                 prepared.plan.actions(),
             )?;
         }
@@ -247,7 +276,8 @@ fn validate_scenario(
     projection: &ProjectedVaultView,
     vault: &crate::config::ValidatedVaultConfig,
     config: &ValidatedConfig,
-    episode: &crate::planner::episodes::RateSignalEpisode,
+    reason: PlanReason,
+    episode: Option<&crate::planner::episodes::RateSignalEpisode>,
     actions: &[crate::domain::V2Action],
 ) -> Result<(), PreflightSourceError> {
     let state = simulate_actions(snapshot, projection, vault, actions)
@@ -258,63 +288,67 @@ fn validate_scenario(
     if state.immediate_loss_assets > vault.maximum_immediate_rebalance_loss_assets {
         return Err(PreflightSourceError::Failed);
     }
-    let before_portfolio = rate_spread(episode.evaluation_markets.iter().filter_map(|market| {
-        projection
-            .markets
-            .get(market)
-            .map(|state| &state.spot_borrow_rate)
-    }));
-    let before_controllable =
-        rate_spread(episode.controllable_markets.iter().filter_map(|market| {
-            projection
-                .markets
-                .get(market)
-                .map(|state| &state.spot_borrow_rate)
-        }));
-    let after_portfolio = rate_spread(episode.evaluation_markets.iter().filter_map(|market| {
-        state
-            .markets
-            .get(market)
-            .map(|state| &state.spot_borrow_rate)
-    }));
-    let after_controllable =
-        rate_spread(episode.controllable_markets.iter().filter_map(|market| {
+    if reason == PlanReason::RateRebalance {
+        let episode = episode.ok_or(PreflightSourceError::Failed)?;
+        let before_portfolio =
+            rate_spread(episode.evaluation_markets.iter().filter_map(|market| {
+                projection
+                    .markets
+                    .get(market)
+                    .map(|state| &state.spot_borrow_rate)
+            }));
+        let before_controllable =
+            rate_spread(episode.controllable_markets.iter().filter_map(|market| {
+                projection
+                    .markets
+                    .get(market)
+                    .map(|state| &state.spot_borrow_rate)
+            }));
+        let after_portfolio = rate_spread(episode.evaluation_markets.iter().filter_map(|market| {
             state
                 .markets
                 .get(market)
                 .map(|state| &state.spot_borrow_rate)
         }));
-    let (before, after, minimum_improvement) = match episode.objective_branch {
-        RateObjectiveBranch::Portfolio => (
-            before_portfolio,
-            after_portfolio,
-            config
-                .app
-                .strategy
-                .minimum_portfolio_improvement_rate_per_second
-                .0,
-        ),
-        RateObjectiveBranch::Controllable => (
-            before_controllable,
-            after_controllable,
-            config
-                .app
-                .strategy
-                .minimum_controllable_improvement_rate_per_second
-                .0,
-        ),
-    };
-    let maximum_allowed = before
-        .checked_add(
-            config
-                .app
-                .strategy
-                .portfolio_spread_tolerance_rate_per_second
-                .0,
-        )
-        .unwrap_or(U256::MAX);
-    if after > maximum_allowed || before.saturating_sub(after) < minimum_improvement {
-        return Err(PreflightSourceError::Failed);
+        let after_controllable =
+            rate_spread(episode.controllable_markets.iter().filter_map(|market| {
+                state
+                    .markets
+                    .get(market)
+                    .map(|state| &state.spot_borrow_rate)
+            }));
+        let (before, after, minimum_improvement) = match episode.objective_branch {
+            RateObjectiveBranch::Portfolio => (
+                before_portfolio,
+                after_portfolio,
+                config
+                    .app
+                    .strategy
+                    .minimum_portfolio_improvement_rate_per_second
+                    .0,
+            ),
+            RateObjectiveBranch::Controllable => (
+                before_controllable,
+                after_controllable,
+                config
+                    .app
+                    .strategy
+                    .minimum_controllable_improvement_rate_per_second
+                    .0,
+            ),
+        };
+        let maximum_allowed = before
+            .checked_add(
+                config
+                    .app
+                    .strategy
+                    .portfolio_spread_tolerance_rate_per_second
+                    .0,
+            )
+            .unwrap_or(U256::MAX);
+        if after > maximum_allowed || before.saturating_sub(after) < minimum_improvement {
+            return Err(PreflightSourceError::Failed);
+        }
     }
     let horizon = projection
         .head

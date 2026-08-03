@@ -194,6 +194,13 @@ impl IdleLockLedger {
         if !effect.net_consumed_assets.is_zero() {
             let unlocked = self.routine_available_idle()?;
             let mut from_locks = effect.net_consumed_assets.saturating_sub(unlocked);
+            if transaction.origin == FlowOrigin::BotRebalance && !from_locks.is_zero() {
+                // Routine calldata is authorized to consume verified unlocked idle only. A
+                // canonical receipt proving otherwise is a conformance failure, never an
+                // implicit release of held assets.
+                self.verified = false;
+                return Err(IdleLockError::LockInvariant);
+            }
             for kind in [
                 IdleLockKind::ForceExit,
                 IdleLockKind::ExternalEmergencyDeallocation,

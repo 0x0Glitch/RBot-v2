@@ -439,6 +439,13 @@ pub enum StorageCommand {
         /// Unique matching receipt.
         reply: oneshot::Sender<Result<Option<CanonicalReceiptRecord>, StorageError>>,
     },
+    /// Check whether a hash belongs to a durably signed bot attempt.
+    IsKnownTransactionHash {
+        /// Exact transaction hash.
+        transaction_hash: B256,
+        /// Whether the hash is owned by this bot's restricted signer lifecycle.
+        reply: oneshot::Sender<Result<bool, StorageError>>,
+    },
     /// Load one durable conformance proof.
     LoadConformance {
         /// Stable transaction identity.
@@ -779,6 +786,18 @@ impl StorageHandle {
         self.request(|reply| StorageCommand::LoadCanonicalReceipt {
             chain_id,
             transaction_hashes,
+            reply,
+        })
+        .await
+    }
+
+    /// Returns whether `transaction_hash` is one of this bot's durable signed attempts.
+    pub async fn is_known_transaction_hash(
+        &self,
+        transaction_hash: B256,
+    ) -> Result<bool, StorageError> {
+        self.request(|reply| StorageCommand::IsKnownTransactionHash {
+            transaction_hash,
             reply,
         })
         .await
@@ -1206,6 +1225,17 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                     )),
                 };
                 let _ = reply.send(result);
+            }
+            StorageCommand::IsKnownTransactionHash {
+                transaction_hash,
+                reply,
+            } => {
+                let known = store
+                    .state
+                    .transaction_attempts
+                    .iter()
+                    .any(|attempt| attempt.transaction_hash == transaction_hash);
+                let _ = reply.send(Ok(known));
             }
             StorageCommand::LoadConformance {
                 transaction_id,

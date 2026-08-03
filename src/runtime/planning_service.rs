@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use alloy::primitives::{B256, U256, keccak256};
+use alloy::primitives::{B256, I256, U256, keccak256};
 use thiserror::Error;
 
 use crate::{
@@ -13,10 +13,14 @@ use crate::{
         RateObjectiveBranch, SolverCertificate, V2Plan,
     },
     planner::{
+        capital::solve_capital_deployment,
         episodes::{EpisodeError, RateEpisodeState, RateSignalEpisode},
+        liquidity::solve_liquidity_maintenance,
         objective::rate_spread,
         rate::solve_rate_rebalance,
-        simulator::ActionProjection,
+        simulator::{
+            ActionProjection, SimulationState, no_plan_terminal_existing_shareholder_assets,
+        },
     },
     runtime::controller::{ControllerError, RuntimeRegistry},
     state::projection::ProjectedVaultView,
@@ -45,6 +49,9 @@ pub enum PlanningServiceError {
     /// The configured episode lifetime cannot be represented in seconds.
     #[error("rate episode lifetime exceeds runtime timestamp domain")]
     TimestampRange,
+    /// A non-rate plan projection could not be represented exactly.
+    #[error("non-rate plan projection could not be represented exactly")]
+    PlanConstruction,
 }
 
 struct RateSignal {
@@ -64,6 +71,28 @@ pub struct PreparedRatePlan {
     pub plan: ValidatedPlan,
     /// Exact expected action effects in transaction order.
     pub action_projections: Vec<ActionProjection>,
+}
+
+/// Runs plan classes in the normative priority order and publishes at most one plan.
+#[allow(clippy::too_many_arguments)]
+pub async fn refresh_priority_plan(
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    storage: &StorageHandle,
+    api: &ApiDataStore,
+    runtime: &RuntimeRegistry,
+) -> Result<Option<V2Plan>, PlanningServiceError> {
+    if let Some(prepared) = build_validated_liquidity_plan(config, vault, snapshot, projection)? {
+        terminate_rate_episode(vault, projection, storage, api).await?;
+        return publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await;
+    }
+    if let Some(prepared) = build_validated_capital_plan(config, vault, snapshot, projection)? {
+        terminate_rate_episode(vault, projection, storage, api).await?;
+        return publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await;
+    }
+    refresh_rate_plan(config, vault, snapshot, projection, storage, api, runtime).await
 }
 
 /// Updates the durable episode state and publishes one fully firewalled Shadow rate plan.
@@ -291,6 +320,226 @@ pub fn build_validated_rate_plan(
         plan,
         action_projections,
     }))
+}
+
+/// Builds the highest-priority exact liquidity-maintenance plan, if service is degraded.
+pub fn build_validated_liquidity_plan(
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
+    let solved = solve_liquidity_maintenance(snapshot, projection, vault, &config.app.solver);
+    let Some(state) = solved.state else {
+        return Ok(None);
+    };
+    if solved.actions.is_empty() {
+        return Ok(None);
+    }
+    build_validated_non_rate_plan(
+        config,
+        vault,
+        snapshot,
+        projection,
+        PlanReason::LiquidityMaintenance,
+        solved.actions,
+        state,
+        keccak256(b"liquidity-maintenance-ordered-search-v1"),
+        1,
+    )
+    .map(Some)
+}
+
+/// Builds a maximal verified-idle capital deployment without waiting for a rate episode.
+pub fn build_validated_capital_plan(
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
+    let solved = solve_capital_deployment(
+        snapshot,
+        projection,
+        vault,
+        &config.app.solver,
+        config.app.strategy.benefit_horizon_seconds,
+    );
+    let Some(state) = solved.state else {
+        return Ok(None);
+    };
+    if solved.actions.is_empty() || !solved.certificate.search_complete {
+        return Ok(None);
+    }
+    build_validated_non_rate_plan(
+        config,
+        vault,
+        snapshot,
+        projection,
+        PlanReason::CapitalDeployment,
+        solved.actions,
+        state,
+        solved.certificate.candidate_lattice_hash,
+        solved.certificate.nodes_evaluated,
+    )
+    .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_validated_non_rate_plan(
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    reason: PlanReason,
+    actions: Vec<crate::domain::V2Action>,
+    state: SimulationState,
+    candidate_lattice_hash: B256,
+    nodes_evaluated: u64,
+) -> Result<PreparedRatePlan, PlanningServiceError> {
+    let markets = vault
+        .positions
+        .iter()
+        .map(|position| position.market_id)
+        .collect::<BTreeSet<_>>();
+    let before_spread = rate_spread(markets.iter().filter_map(|market| {
+        projection
+            .markets
+            .get(market)
+            .map(|state| &state.spot_borrow_rate)
+    }));
+    let after_spread = rate_spread(markets.iter().filter_map(|market| {
+        state
+            .markets
+            .get(market)
+            .map(|state| &state.spot_borrow_rate)
+    }));
+    let movement_assets = action_movement(&actions)?;
+    let horizon_timestamp = projection
+        .head
+        .timestamp
+        .checked_add(config.app.strategy.benefit_horizon_seconds)
+        .ok_or(PlanningServiceError::PlanConstruction)?;
+    let no_plan_terminal = no_plan_terminal_existing_shareholder_assets(
+        snapshot,
+        vault,
+        projection,
+        horizon_timestamp,
+    )
+    .map_err(|_| PlanningServiceError::PlanConstruction)?;
+    let plan_terminal = state
+        .terminal_existing_shareholder_assets(snapshot, projection, horizon_timestamp)
+        .map_err(|_| PlanningServiceError::PlanConstruction)?;
+    if plan_terminal
+        .checked_add(vault.maximum_terminal_value_sacrifice_assets)
+        .is_none_or(|allowed| allowed < no_plan_terminal)
+    {
+        return Err(PlanningServiceError::PlanConstruction);
+    }
+    let terminal_value_delta_assets = I256::try_from(plan_terminal)
+        .ok()
+        .zip(I256::try_from(no_plan_terminal).ok())
+        .and_then(|(planned, baseline)| planned.checked_sub(baseline))
+        .ok_or(PlanningServiceError::PlanConstruction)?;
+    let action_projections = state.actions.clone();
+    let mut plan = V2Plan {
+        plan_id: PlanId(B256::ZERO),
+        reason,
+        vault: vault.address,
+        snapshot: snapshot.context.clone(),
+        config_revision: config.revision,
+        topology_revision: snapshot.context.dynamic_topology_revision,
+        actions,
+        projection: PlanProjection {
+            movement_assets,
+            before_spread,
+            after_spread,
+            immediate_loss_assets: state.immediate_loss_assets,
+            terminal_value_delta_assets,
+        },
+        solver_certificate: SolverCertificate {
+            candidate_lattice_hash,
+            nodes_evaluated,
+            node_limit: config.app.solver.maximum_nodes,
+            search_complete_for_lattice: true,
+            rate_episode_id: None,
+            objective_branch: None,
+            target_reachable: false,
+            target_reached: false,
+        },
+        episode_id: None,
+        plan_hash: B256::ZERO,
+    };
+    plan.plan_id = derive_plan_id(&plan)?;
+    plan.plan_hash = canonical_plan_hash(&plan)?;
+    let plan = validate_plan(plan, config)?;
+    Ok(PreparedRatePlan {
+        plan,
+        action_projections,
+    })
+}
+
+fn action_movement(actions: &[crate::domain::V2Action]) -> Result<U256, PlanningServiceError> {
+    let mut allocated = U256::ZERO;
+    let mut deallocated = U256::ZERO;
+    for action in actions {
+        match action {
+            crate::domain::V2Action::Allocate {
+                requested_assets, ..
+            } => {
+                allocated = allocated
+                    .checked_add(requested_assets.0)
+                    .ok_or(PlanningServiceError::PlanConstruction)?;
+            }
+            crate::domain::V2Action::Deallocate {
+                requested_assets, ..
+            } => {
+                deallocated = deallocated
+                    .checked_add(requested_assets.0)
+                    .ok_or(PlanningServiceError::PlanConstruction)?;
+            }
+        }
+    }
+    Ok(allocated.max(deallocated))
+}
+
+async fn terminate_rate_episode(
+    vault: &ValidatedVaultConfig,
+    projection: &ProjectedVaultView,
+    storage: &StorageHandle,
+    api: &ApiDataStore,
+) -> Result<(), PlanningServiceError> {
+    if let Some(mut episode) = storage
+        .load_active_rate_episode(vault.address, vault.rate_group.id)
+        .await?
+    {
+        // A higher-priority plan changes the comparison state. Complete the frozen episode so
+        // its immediate budget and direction can never be reused after that transaction.
+        episode.complete();
+        storage
+            .persist_rate_episode(episode.clone(), projection.head.timestamp)
+            .await?;
+        api.record_episode(episode).await;
+    }
+    Ok(())
+}
+
+async fn publish_plan(
+    plan: V2Plan,
+    storage: &StorageHandle,
+    api: &ApiDataStore,
+    runtime: &RuntimeRegistry,
+    episode_id: Option<crate::domain::EpisodeId>,
+) -> Result<Option<V2Plan>, PlanningServiceError> {
+    storage
+        .persist_plan(plan.clone(), plan.snapshot.block.timestamp)
+        .await?;
+    api.record_plan(plan.clone()).await;
+    runtime
+        .update(plan.vault, |status| {
+            status.record_planning(Some(plan.plan_id), episode_id)
+        })
+        .await?;
+    Ok(Some(plan))
 }
 
 fn detect_rate_signal(

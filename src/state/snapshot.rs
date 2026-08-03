@@ -875,6 +875,64 @@ pub fn hash_exact_snapshot(snapshot: &ExactVaultSnapshot) -> Result<B256, Snapsh
     Ok(keccak256(bytes))
 }
 
+/// Rebinds a transaction-attributed idle-lock ledger to an already atomic exact snapshot.
+///
+/// The authoritative idle balance remains the value read in the snapshot. This function only
+/// replaces the causal lock classification, re-derives every capability affected by it and
+/// produces a new canonical snapshot hash. It is used after ordered receipt replay has been
+/// reconciled to that exact balance.
+pub fn bind_idle_lock_ledger(
+    snapshot: &mut ExactVaultSnapshot,
+    blueprint: &SnapshotBlueprint<'_>,
+    mut idle_locks: IdleLockLedgerSnapshot,
+) -> Result<(), SnapshotError> {
+    let locked = idle_locks
+        .locks
+        .iter()
+        .try_fold(U256::ZERO, |total, lock| {
+            total
+                .checked_add(lock.remaining_assets)
+                .ok_or(SnapshotError::NumericRange)
+        })?;
+    if locked > snapshot.parent.idle_assets
+        || idle_locks.unattributed_idle_assets > snapshot.parent.idle_assets
+    {
+        return Err(SnapshotError::IdentityMismatch);
+    }
+    if snapshot.parent.idle_assets.is_zero()
+        && idle_locks.locks.is_empty()
+        && idle_locks.unattributed_idle_assets.is_zero()
+    {
+        idle_locks.verified = true;
+    }
+    let enabled_adapters = blueprint
+        .topology
+        .adapters
+        .iter()
+        .filter_map(|(adapter, topology)| topology.currently_enabled.then_some(*adapter))
+        .collect::<BTreeSet<_>>();
+    let report = classify_capabilities(CapabilityInputs {
+        config: blueprint.vault,
+        strategy: blueprint.strategy,
+        parent: &snapshot.parent,
+        adapters: &snapshot.adapters,
+        positions: &snapshot.positions,
+        markets: &snapshot.markets,
+        caps: &snapshot.caps,
+        enabled_adapters: &enabled_adapters,
+        pending_admin: &snapshot.pending_admin,
+        administrative_horizon_timestamp: blueprint.administrative_horizon_timestamp,
+        expected_inclusion_timestamp: blueprint.expected_inclusion_timestamp,
+        lock_ledger_verified: idle_locks.verified,
+        unattributed_idle_assets: idle_locks.unattributed_idle_assets,
+        rate_episode_state_verified: blueprint.rate_episode_state_verified,
+    })?;
+    snapshot.capabilities = report.capabilities;
+    snapshot.idle_locks = idle_locks;
+    snapshot.snapshot_hash = hash_exact_snapshot(snapshot)?;
+    Ok(())
+}
+
 /// Returns canonical sorted JSON suitable for durable audit storage.
 pub fn canonical_snapshot_json(snapshot: &ExactVaultSnapshot) -> Result<String, SnapshotError> {
     let bytes = canonical_snapshot_bytes(snapshot, snapshot.snapshot_hash)?;

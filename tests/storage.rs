@@ -838,6 +838,30 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
         recovered.last_attempt_kind,
         TransactionAttemptKind::Cancellation
     );
+    assert!(
+        service
+            .handle()
+            .is_known_transaction_hash(initial_hash)
+            .await?
+    );
+    assert!(
+        service
+            .handle()
+            .is_known_transaction_hash(replacement_hash)
+            .await?
+    );
+    assert!(
+        service
+            .handle()
+            .is_known_transaction_hash(cancellation_hash)
+            .await?
+    );
+    assert!(
+        !service
+            .handle()
+            .is_known_transaction_hash(B256::repeat_byte(0xfe))
+            .await?
+    );
     let included = block(16, 0x16, 0x15);
     service
         .handle()

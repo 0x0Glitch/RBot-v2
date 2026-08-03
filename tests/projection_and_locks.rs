@@ -337,6 +337,26 @@ fn ordered_lock_replay_consumes_unlocked_then_kind_fifo_and_is_deterministic()
 }
 
 #[test]
+fn bot_receipt_may_not_consume_any_locked_idle() -> Result<(), Box<dyn Error>> {
+    let vault = VaultAddress(Address::with_last_byte(1));
+    let mut ledger = IdleLockLedger::new(vault, U256::ZERO);
+    ledger.apply_transaction(
+        &transaction(10, 0, FlowOrigin::DirectDonation, 100, 0),
+        U256::from(100_u8),
+    )?;
+    assert!(
+        ledger
+            .apply_transaction(
+                &transaction(11, 0, FlowOrigin::BotRebalance, 0, 1),
+                U256::from(99_u8),
+            )
+            .is_err()
+    );
+    assert!(!ledger.verified);
+    Ok(())
+}
+
+#[test]
 fn shared_token_balance_is_registered_once_and_consumed_sequentially() -> Result<(), LiquidityError>
 {
     let token = TokenAddress(Address::with_last_byte(1));

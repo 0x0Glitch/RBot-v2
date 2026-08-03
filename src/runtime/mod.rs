@@ -4,6 +4,7 @@ pub mod controller;
 pub mod current_state_source;
 pub mod execution_service;
 pub mod identity;
+pub mod idle_ledger_service;
 pub mod messages;
 pub mod planning_service;
 pub mod preflight_source;

@@ -10,6 +10,7 @@ use crate::{
     chain::{
         logs::{EventDecodeError, EventSource, RawEventLog, decode_event},
         multicall::{AtomicSnapshotProvider, MulticallError},
+        provider::TransactionLookupProvider,
     },
     config::{RuntimeMode, ValidatedConfig, ValidatedVaultConfig},
     domain::{BlockRef, IdleLockLedgerSnapshot, TokenAddress, VaultAddress},
@@ -17,14 +18,16 @@ use crate::{
     runtime::{
         controller::{ControllerError, RuntimeRegistry, RuntimeVaultState},
         identity::{RuntimeIdentities, RuntimeIdentityError},
+        idle_ledger_service::{apply_idle_logs, rebuild_idle_ledger},
         messages::ChainUpdate,
-        planning_service::{PlanningServiceError, refresh_rate_plan},
+        planning_service::{PlanningServiceError, refresh_priority_plan},
         readiness::{ReadinessInputs, evaluate_readiness},
     },
     state::{
         caps::direct_position_cap_data,
+        idle_locks::IdleLockLedger,
         projection::{ProjectionError, project_snapshot_to_head},
-        snapshot::{SnapshotBlueprint, SnapshotError, build_exact_snapshot},
+        snapshot::{SnapshotBlueprint, SnapshotError, bind_idle_lock_ledger, build_exact_snapshot},
         topology::{EventLocation, TopologyError, TopologyIndex},
     },
     storage::{StorageError, actor::StorageHandle, models::CanonicalLogRecord},
@@ -138,6 +141,7 @@ fn insert_source(
 
 struct VaultReplayState {
     topology: TopologyIndex,
+    idle_ledger: Option<IdleLockLedger>,
     through: BlockRef,
 }
 
@@ -158,7 +162,7 @@ pub struct CanonicalStateService<P> {
     last_exact_head: Option<BlockRef>,
 }
 
-impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
+impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateService<P> {
     /// Creates an uninitialized state owner; the first canonical update reconstructs replay state.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -266,6 +270,34 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
         for log in logs {
             apply_log_to_vaults(sources, &mut self.vaults, log)?;
         }
+        for vault in &self.config.app.vaults {
+            let ledger = self
+                .vaults
+                .get_mut(&vault.address)
+                .and_then(|state| state.idle_ledger.take());
+            let Some(mut ledger) = ledger else {
+                continue;
+            };
+            if apply_idle_logs(
+                self.provider.as_ref(),
+                &self.storage,
+                &self.sources,
+                vault,
+                &mut ledger,
+                logs,
+            )
+            .await
+            .is_ok()
+            {
+                if let Some(state) = self.vaults.get_mut(&vault.address) {
+                    state.idle_ledger = Some(ledger);
+                }
+            } else {
+                self.metrics
+                    .increment("reallocator_idle_ledger_replay_failure_total")
+                    .map_err(|_| StateServiceError::Metric)?;
+            }
+        }
         for state in self.vaults.values_mut() {
             state.through = block;
         }
@@ -300,6 +332,7 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
                 vault.address,
                 VaultReplayState {
                     topology,
+                    idle_ledger: None,
                     through: head,
                 },
             );
@@ -315,12 +348,13 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
                 all_exact_ready = false;
                 continue;
             }
-            let state = self
+            let (topology, cached_idle_ledger) = self
                 .vaults
                 .get(&vault.address)
+                .map(|state| (state.topology.clone(), state.idle_ledger.clone()))
                 .ok_or(StateServiceError::NonCanonicalUpdate)?;
             self.storage
-                .persist_topology(state.topology.clone(), head)
+                .persist_topology(topology.clone(), head)
                 .await?;
             let administrative_horizon_timestamp = head
                 .timestamp
@@ -341,7 +375,7 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
                 snapshot_policy: &self.config.app.snapshot,
                 strategy: &self.config.app.strategy,
                 vault,
-                topology: &state.topology,
+                topology: &topology,
                 code_hashes: self.identities.code_hashes(),
                 static_config_revision: self.config.revision,
                 event_cursor: head,
@@ -354,7 +388,44 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
                 expected_inclusion_timestamp,
                 rate_episode_state_verified: true,
             };
-            let snapshot = build_exact_snapshot(self.provider.as_ref(), &blueprint).await?;
+            let mut snapshot = build_exact_snapshot(self.provider.as_ref(), &blueprint).await?;
+            let exact_idle_assets = snapshot.parent.idle_assets;
+            let ledger_result = if exact_idle_assets.is_zero() {
+                Ok(IdleLockLedger::new(vault.address, U256::ZERO))
+            } else if cached_idle_ledger
+                .as_ref()
+                .is_some_and(|ledger| ledger.exact_idle_assets == exact_idle_assets)
+            {
+                cached_idle_ledger.ok_or(StateServiceError::NonCanonicalUpdate)
+            } else {
+                rebuild_idle_ledger(
+                    self.provider.as_ref(),
+                    &self.storage,
+                    &self.config,
+                    &self.sources,
+                    vault,
+                    head,
+                    exact_idle_assets,
+                )
+                .await
+                .map_err(|_| StateServiceError::NonCanonicalUpdate)
+            };
+            let (retained_ledger, idle_locks) = match ledger_result {
+                Ok(ledger) => match ledger.snapshot() {
+                    Ok(idle_locks) => (Some(ledger), idle_locks),
+                    Err(_) => (None, unverified_idle_ledger_snapshot(exact_idle_assets)),
+                },
+                Err(_) => {
+                    self.metrics
+                        .increment("reallocator_idle_ledger_replay_failure_total")
+                        .map_err(|_| StateServiceError::Metric)?;
+                    (None, unverified_idle_ledger_snapshot(exact_idle_assets))
+                }
+            };
+            bind_idle_lock_ledger(&mut snapshot, &blueprint, idle_locks)?;
+            if let Some(state) = self.vaults.get_mut(&vault.address) {
+                state.idle_ledger = retained_ledger;
+            }
             self.identities.validate_snapshot(&snapshot)?;
             self.storage
                 .persist_snapshot(snapshot.clone(), head.timestamp)
@@ -395,7 +466,7 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
             if self.config.app.node.mode != RuntimeMode::Observe
                 && snapshot.capabilities.can_project
             {
-                let _ = refresh_rate_plan(
+                let _ = refresh_priority_plan(
                     &self.config,
                     vault,
                     &snapshot,
@@ -609,6 +680,12 @@ fn desired_runtime_state(
         RuntimeMode::Shadow if snapshot.capabilities.can_project => RuntimeVaultState::Shadow,
         RuntimeMode::Shadow => RuntimeVaultState::PausedUnsupportedConfiguration,
         RuntimeMode::Execute if pending_transaction => RuntimeVaultState::PendingTransaction,
+        RuntimeMode::Execute if !snapshot.idle_locks.verified => {
+            RuntimeVaultState::LockAccountingUncertain
+        }
+        RuntimeMode::Execute if !snapshot.idle_locks.locks.is_empty() => {
+            RuntimeVaultState::IdleLocksActive
+        }
         RuntimeMode::Execute if snapshot.capabilities.can_allocate && signer_ready => {
             RuntimeVaultState::Automatic
         }
@@ -630,6 +707,12 @@ fn runtime_reason(
         RuntimeMode::Shadow if snapshot.capabilities.can_project => None,
         RuntimeMode::Execute if pending_transaction => {
             Some("durable transaction lifecycle is unresolved".to_owned())
+        }
+        RuntimeMode::Execute if !snapshot.idle_locks.verified => {
+            Some("idle-lock accounting is not verified through the canonical head".to_owned())
+        }
+        RuntimeMode::Execute if !snapshot.idle_locks.locks.is_empty() => {
+            Some("canonical idle locks prevent routine deployment of held assets".to_owned())
         }
         RuntimeMode::Execute if snapshot.capabilities.can_allocate && !signer_ready => {
             Some("restricted signer service is not composed".to_owned())
@@ -656,4 +739,12 @@ fn transient_snapshot_context(error: &StateServiceError) -> bool {
             MulticallError::CursorNotAtHead | MulticallError::ContextChanged
         ))
     )
+}
+
+fn unverified_idle_ledger_snapshot(exact_idle_assets: U256) -> IdleLockLedgerSnapshot {
+    IdleLockLedgerSnapshot {
+        locks: Vec::new(),
+        unattributed_idle_assets: exact_idle_assets,
+        verified: false,
+    }
 }
