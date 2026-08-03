@@ -18,7 +18,7 @@ use morpho_v2_reallocator::state::topology::{
 };
 use morpho_v2_reallocator::storage::actor::StorageService;
 use morpho_v2_reallocator::storage::models::CanonicalBlockRecord;
-use rusqlite::Connection;
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn block(number: u64, hash: u8, parent: u8) -> BlockRef {
@@ -226,7 +226,7 @@ fn direct_cap_ids_and_allocation_checks_match_pinned_rules() {
 async fn topology_persistence_rewinds_derived_indexes_atomically()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let path = directory.path().join("topology.sqlite");
+    let path = directory.path().join("topology.json");
     let service = StorageService::start(&path, 32, 1)?;
     let handle = service.handle();
     let vault = VaultAddress(Address::with_last_byte(1));
@@ -289,12 +289,15 @@ async fn topology_persistence_rewinds_derived_indexes_atomically()
     );
     service.shutdown().await?;
 
-    let connection = Connection::open(path)?;
-    let enabled: i64 = connection.query_row(
-        "SELECT currently_enabled FROM adapter_topology WHERE vault = ?1 AND adapter = ?2",
-        [vault.0.as_slice(), adapter.0.as_slice()],
-        |row| row.get(0),
-    )?;
-    assert_eq!(enabled, 1);
+    let state: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let history = state["topology_history"]
+        .as_array()
+        .ok_or("topology_history is not an array")?;
+    assert_eq!(history.len(), 1);
+    let adapters = history[0]["topology"]["adapters"]
+        .as_object()
+        .ok_or("adapters is not an object")?;
+    let persisted = adapters.values().next().ok_or("missing adapter")?;
+    assert_eq!(persisted["currently_enabled"], true);
     Ok(())
 }

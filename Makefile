@@ -1,4 +1,4 @@
-.PHONY: fmt clippy test nextest check deny release verify-spec verify-migrations ci
+.PHONY: fmt clippy test nextest check deny release verify-spec ci
 
 fmt:
 	cargo fmt --all -- --check
@@ -24,8 +24,4 @@ release:
 verify-spec:
 	./scripts/verify-spec-digests.sh
 
-verify-migrations:
-	./scripts/verify-migration-checksums.sh
-
-ci: fmt clippy test deny release verify-spec verify-migrations
-
+ci: fmt clippy test deny release verify-spec

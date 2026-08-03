@@ -1,35 +1,203 @@
-//! Single-writer SQLite actor with bounded commands and critical acknowledgments.
+//! Single-writer atomic JSON storage actor with bounded commands and acknowledgments.
 
-use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::thread::{self, JoinHandle};
+use std::{
+    collections::BTreeMap,
+    fs::{File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    thread::{self, JoinHandle},
+};
 
+use alloy::primitives::{Address, B256, Bytes, keccak256};
 use fs2::FileExt;
-use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::domain::{BlockRef, ExactVaultSnapshot, V2Plan};
-use crate::planner::episodes::RateSignalEpisode;
-use crate::state::topology::TopologyIndex;
-
-use super::StorageError;
-use super::backup::create_backup;
-use super::migrations::{apply_migrations, configure_connection, verify_sqlite_version};
-use super::models::{
-    CanonicalBlockRecord, CanonicalLogRecord, NonceReservation, RewindResult,
-    SignedTransactionRecord, TransactionTransition, UnresolvedTransaction,
+use crate::{
+    domain::{BlockRef, ExactVaultSnapshot, RateGroupId, V2Plan, VaultAddress},
+    planner::episodes::{RateEpisodeState, RateSignalEpisode},
+    state::topology::TopologyIndex,
 };
-use super::queries::{
-    apply_canonical_block, load_unresolved_transaction, persist_plan, persist_signed_transaction,
-    persist_snapshot, reserve_nonce, rewind_to_ancestor, transition_transaction,
+
+use super::{
+    StorageError,
+    models::{
+        CanonicalBlockRecord, CanonicalLogRecord, FinalPreflightRecord, NonceReservation,
+        RewindResult, SignedTransactionRecord, TransactionState, TransactionTransition,
+        UnresolvedTransaction,
+    },
 };
 
 /// Default bounded storage mailbox capacity.
 pub const DEFAULT_STORAGE_CHANNEL_CAPACITY: usize = 128;
+const JSON_FORMAT_VERSION: u32 = 1;
 
-/// Single-writer actor command. Every critical mutation has a one-shot acknowledgment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TimedSnapshot {
+    snapshot: ExactVaultSnapshot,
+    created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TimedPlan {
+    plan: V2Plan,
+    created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TopologyRevision {
+    topology: TopologyIndex,
+    block: BlockRef,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TimedEpisode {
+    episode: RateSignalEpisode,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TransactionRow {
+    reservation: NonceReservation,
+    state: TransactionState,
+    transaction_hash: Option<B256>,
+    raw_signed_transaction: Option<Bytes>,
+    submitted_at: Option<u64>,
+    included_block: Option<u64>,
+    included_block_hash: Option<B256>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonState {
+    format_version: u32,
+    revision: u64,
+    canonical_blocks: Vec<CanonicalBlockRecord>,
+    canonical_logs: Vec<CanonicalLogRecord>,
+    chain_cursors: BTreeMap<u64, BlockRef>,
+    exact_snapshots: Vec<TimedSnapshot>,
+    plans: Vec<TimedPlan>,
+    final_preflights: Vec<FinalPreflightRecord>,
+    transactions: Vec<TransactionRow>,
+    topology_history: Vec<TopologyRevision>,
+    rate_episodes: Vec<TimedEpisode>,
+}
+
+impl Default for JsonState {
+    fn default() -> Self {
+        Self {
+            format_version: JSON_FORMAT_VERSION,
+            revision: 0,
+            canonical_blocks: Vec::new(),
+            canonical_logs: Vec::new(),
+            chain_cursors: BTreeMap::new(),
+            exact_snapshots: Vec::new(),
+            plans: Vec::new(),
+            final_preflights: Vec::new(),
+            transactions: Vec::new(),
+            topology_history: Vec::new(),
+            rate_episodes: Vec::new(),
+        }
+    }
+}
+
+struct JsonStore {
+    path: PathBuf,
+    state: JsonState,
+}
+
+impl JsonStore {
+    fn open(path: PathBuf) -> Result<Self, StorageError> {
+        let state = if path.exists() {
+            let bytes = std::fs::read(&path)?;
+            let state: JsonState = serde_json::from_slice(&bytes)?;
+            if state.format_version != JSON_FORMAT_VERSION {
+                return Err(StorageError::FormatVersion {
+                    actual: state.format_version,
+                    expected: JSON_FORMAT_VERSION,
+                });
+            }
+            state
+        } else {
+            JsonState::default()
+        };
+        let store = Self { path, state };
+        if !store.path.exists() {
+            store.persist(&store.state)?;
+        }
+        Ok(store)
+    }
+
+    fn commit(
+        &mut self,
+        mutation: impl FnOnce(&mut JsonState) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        let mut next = self.state.clone();
+        mutation(&mut next)?;
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or(StorageError::Invariant("JSON state revision overflow"))?;
+        self.persist(&next)?;
+        self.state = next;
+        Ok(())
+    }
+
+    fn persist(&self, state: &JsonState) -> Result<(), StorageError> {
+        let parent = parent_directory(&self.path);
+        std::fs::create_dir_all(parent)?;
+        let filename = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(StorageError::Invariant("JSON state filename is invalid"))?;
+        let temporary = self
+            .path
+            .with_file_name(format!(".{filename}.{}.tmp", state.revision));
+        let bytes = serde_json::to_vec_pretty(state)?;
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        output.write_all(&bytes)?;
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(&temporary, &self.path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    fn backup(&self, destination: &Path, unique_suffix: u64) -> Result<(), StorageError> {
+        let parent = parent_directory(destination);
+        std::fs::create_dir_all(parent)?;
+        let filename = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(StorageError::Invariant("backup filename is invalid"))?;
+        let temporary = destination.with_file_name(format!(".{filename}.{unique_suffix}.tmp"));
+        if temporary.exists() {
+            return Err(StorageError::Invariant(
+                "backup temporary path already exists",
+            ));
+        }
+        let bytes = serde_json::to_vec_pretty(&self.state)?;
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        output.write_all(&bytes)?;
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(temporary, destination)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+}
+
+/// Single-writer actor command. Every critical mutation has an acknowledgment.
 pub enum StorageCommand {
-    /// Atomically apply a canonical block, its logs, and cursor.
+    /// Atomically apply a canonical block, logs, and cursor.
     ApplyCanonicalBlock {
         /// Block record.
         block: CanonicalBlockRecord,
@@ -40,32 +208,39 @@ pub enum StorageCommand {
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
-    /// Atomically rewind canonical and replay-sensitive state.
+    /// Atomically rewind replay-sensitive state.
     RewindToAncestor {
         /// EVM chain ID.
         chain_id: u64,
-        /// Common canonical ancestor.
+        /// Common ancestor.
         ancestor: BlockRef,
         /// Durable update timestamp.
         updated_at: u64,
-        /// Rewind summary acknowledgment.
+        /// Rewind result.
         reply: oneshot::Sender<Result<RewindResult, StorageError>>,
     },
     /// Persist one exact snapshot.
     PersistSnapshot {
         /// Exact snapshot.
         snapshot: Box<ExactVaultSnapshot>,
-        /// Durable creation timestamp.
+        /// Creation timestamp.
         created_at: u64,
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
-    /// Persist one semantic plan and child rows.
+    /// Persist one semantic plan.
     PersistPlan {
         /// Semantic plan.
         plan: Box<V2Plan>,
-        /// Durable creation timestamp.
+        /// Creation timestamp.
         created_at: u64,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Persist complete final-preflight evidence.
+    PersistFinalPreflight {
+        /// Exact record.
+        record: FinalPreflightRecord,
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
@@ -90,70 +265,70 @@ pub enum StorageCommand {
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
-    /// Load a signer's unresolved row for startup recovery.
+    /// Load the unique unresolved signer row.
     LoadUnresolved {
-        /// Signer address.
-        signer: alloy::primitives::Address,
+        /// Dedicated signer.
+        signer: Address,
         /// Recovery result.
         reply: oneshot::Sender<Result<Option<UnresolvedTransaction>, StorageError>>,
     },
-    /// Load the persisted canonical cursor for a chain.
+    /// Load a chain cursor.
     LoadCursor {
         /// EVM chain ID.
         chain_id: u64,
-        /// Persisted cursor.
+        /// Cursor result.
         reply: oneshot::Sender<Result<Option<BlockRef>, StorageError>>,
     },
-    /// Load one stored canonical block at a height.
+    /// Load a canonical block.
     LoadCanonicalBlock {
         /// EVM chain ID.
         chain_id: u64,
-        /// EVM block number.
+        /// Block number.
         number: u64,
-        /// Stored canonical block.
+        /// Block result.
         reply: oneshot::Sender<Result<Option<BlockRef>, StorageError>>,
     },
-    /// Persist one complete replayable topology revision and derived indexes.
+    /// Persist a topology revision.
     PersistTopology {
-        /// Canonical topology.
+        /// Topology.
         topology: Box<TopologyIndex>,
-        /// Canonical block containing the latest applied topology event.
+        /// Canonical block.
         block: BlockRef,
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
-    /// Load the latest canonical topology for one vault.
+    /// Load latest topology through a block.
     LoadTopology {
         /// Parent vault.
-        vault: crate::domain::VaultAddress,
-        /// Latest allowed canonical block.
+        vault: VaultAddress,
+        /// Latest allowed block.
         through_block: u64,
-        /// Canonical topology.
+        /// Topology result.
         reply: oneshot::Sender<Result<Option<TopologyIndex>, StorageError>>,
     },
-    /// Persist one complete rate-signal episode atomically.
+    /// Persist a rate episode.
     PersistRateEpisode {
-        /// Complete episode state.
+        /// Complete episode.
         episode: Box<RateSignalEpisode>,
-        /// Durable update timestamp.
+        /// Update timestamp.
         updated_at: u64,
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
-    /// Recover the unique active rate-signal episode for one vault/group.
+    /// Load the unique active rate episode.
     LoadActiveRateEpisode {
         /// Parent vault.
-        vault: crate::domain::VaultAddress,
-        /// Configured rate group.
-        rate_group: crate::domain::RateGroupId,
-        /// Recovery result.
+        vault: VaultAddress,
+        /// Rate group.
+        rate_group: RateGroupId,
+        /// Episode result.
         reply: oneshot::Sender<Result<Option<RateSignalEpisode>, StorageError>>,
     },
-    /// Produce an online SQLite backup.
+    /// Produce an atomic JSON backup.
     Backup {
-        /// Final destination path.
+        /// Destination.
         destination: PathBuf,
-        /// Unique temporary filename suffix.
+        /// Unique temporary suffix.
         unique_suffix: u64,
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
@@ -165,219 +340,210 @@ pub enum StorageCommand {
     },
 }
 
-/// Cloneable bounded command handle; it never exposes a SQLite connection.
+/// Cloneable bounded command handle; it never exposes mutable state.
 #[derive(Clone)]
 pub struct StorageHandle {
     sender: mpsc::Sender<StorageCommand>,
 }
 
 impl StorageHandle {
-    /// Applies one canonical block and waits for its transaction commit.
+    /// Applies one canonical block after an atomic JSON commit.
     pub async fn apply_canonical_block(
         &self,
         block: CanonicalBlockRecord,
         logs: Vec<CanonicalLogRecord>,
         updated_at: u64,
     ) -> Result<(), StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::ApplyCanonicalBlock {
+        self.request(|reply| StorageCommand::ApplyCanonicalBlock {
             block,
             logs,
             updated_at,
             reply,
         })
-        .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        .await
     }
 
-    /// Rewinds to a canonical ancestor and waits for commit.
+    /// Rewinds to one canonical ancestor.
     pub async fn rewind_to_ancestor(
         &self,
         chain_id: u64,
         ancestor: BlockRef,
         updated_at: u64,
     ) -> Result<RewindResult, StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::RewindToAncestor {
+        self.request(|reply| StorageCommand::RewindToAncestor {
             chain_id,
             ancestor,
             updated_at,
             reply,
         })
-        .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        .await
     }
 
-    /// Persists an exact snapshot and waits for commit.
+    /// Persists one exact snapshot.
     pub async fn persist_snapshot(
         &self,
         snapshot: ExactVaultSnapshot,
         created_at: u64,
     ) -> Result<(), StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::PersistSnapshot {
+        self.request(|reply| StorageCommand::PersistSnapshot {
             snapshot: Box::new(snapshot),
             created_at,
             reply,
         })
-        .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        .await
     }
 
-    /// Persists a semantic plan and waits for commit.
+    /// Persists one semantic plan.
     pub async fn persist_plan(&self, plan: V2Plan, created_at: u64) -> Result<(), StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::PersistPlan {
+        self.request(|reply| StorageCommand::PersistPlan {
             plan: Box::new(plan),
             created_at,
             reply,
         })
-        .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        .await
     }
 
-    /// Reserves a nonce and waits for durable acknowledgment before signing may begin.
+    /// Persists final-preflight evidence before nonce reservation.
+    pub async fn persist_final_preflight(
+        &self,
+        record: FinalPreflightRecord,
+    ) -> Result<(), StorageError> {
+        self.request(|reply| StorageCommand::PersistFinalPreflight { record, reply })
+            .await
+    }
+
+    /// Reserves a unique signer nonce lane.
     pub async fn reserve_nonce(&self, reservation: NonceReservation) -> Result<(), StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::ReserveNonce { reservation, reply })
-            .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        self.request(|reply| StorageCommand::ReserveNonce { reservation, reply })
+            .await
     }
 
-    /// Persists signed bytes and waits for durable acknowledgment before broadcast.
+    /// Persists signed bytes before any broadcast.
     pub async fn persist_signed_transaction(
         &self,
         transaction: SignedTransactionRecord,
     ) -> Result<(), StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::PersistSignedTransaction { transaction, reply })
-            .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        self.request(|reply| StorageCommand::PersistSignedTransaction { transaction, reply })
+            .await
     }
 
-    /// Applies a checked lifecycle transition and waits for commit.
+    /// Applies one compare-and-set lifecycle transition.
     pub async fn transition_transaction(
         &self,
         transition: TransactionTransition,
     ) -> Result<(), StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::TransitionTransaction { transition, reply })
-            .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        self.request(|reply| StorageCommand::TransitionTransaction { transition, reply })
+            .await
     }
 
-    /// Loads the signer's unique unresolved row through the actor.
+    /// Loads one signer's unresolved transaction.
     pub async fn load_unresolved(
         &self,
-        signer: alloy::primitives::Address,
+        signer: Address,
     ) -> Result<Option<UnresolvedTransaction>, StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::LoadUnresolved { signer, reply })
-            .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        self.request(|reply| StorageCommand::LoadUnresolved { signer, reply })
+            .await
     }
 
-    /// Loads the persisted chain cursor through the actor.
+    /// Loads a chain cursor.
     pub async fn load_cursor(&self, chain_id: u64) -> Result<Option<BlockRef>, StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::LoadCursor { chain_id, reply })
-            .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        self.request(|reply| StorageCommand::LoadCursor { chain_id, reply })
+            .await
     }
 
-    /// Loads a canonical block reference at one height through the actor.
+    /// Loads a canonical block.
     pub async fn load_canonical_block(
         &self,
         chain_id: u64,
         number: u64,
     ) -> Result<Option<BlockRef>, StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::LoadCanonicalBlock {
+        self.request(|reply| StorageCommand::LoadCanonicalBlock {
             chain_id,
             number,
             reply,
         })
-        .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        .await
     }
 
-    /// Persists a topology revision and all derived indexes atomically.
+    /// Persists one topology revision.
     pub async fn persist_topology(
         &self,
         topology: TopologyIndex,
         block: BlockRef,
     ) -> Result<(), StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::PersistTopology {
+        self.request(|reply| StorageCommand::PersistTopology {
             topology: Box::new(topology),
             block,
             reply,
         })
-        .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        .await
     }
 
-    /// Loads the latest canonical topology at or before `through_block`.
+    /// Loads latest topology at or before one block.
     pub async fn load_topology(
         &self,
-        vault: crate::domain::VaultAddress,
+        vault: VaultAddress,
         through_block: u64,
     ) -> Result<Option<TopologyIndex>, StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::LoadTopology {
+        self.request(|reply| StorageCommand::LoadTopology {
             vault,
             through_block,
             reply,
         })
-        .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        .await
     }
 
-    /// Persists one complete rate episode and waits for commit.
+    /// Persists one complete rate episode.
     pub async fn persist_rate_episode(
         &self,
         episode: RateSignalEpisode,
         updated_at: u64,
     ) -> Result<(), StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::PersistRateEpisode {
+        self.request(|reply| StorageCommand::PersistRateEpisode {
             episode: Box::new(episode),
             updated_at,
             reply,
         })
-        .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        .await
     }
 
-    /// Loads the unique nonterminal episode for deterministic startup recovery.
+    /// Loads the unique nonterminal rate episode.
     pub async fn load_active_rate_episode(
         &self,
-        vault: crate::domain::VaultAddress,
-        rate_group: crate::domain::RateGroupId,
+        vault: VaultAddress,
+        rate_group: RateGroupId,
     ) -> Result<Option<RateSignalEpisode>, StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::LoadActiveRateEpisode {
+        self.request(|reply| StorageCommand::LoadActiveRateEpisode {
             vault,
             rate_group,
             reply,
         })
-        .await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+        .await
     }
 
-    /// Produces an online backup and waits for the atomic rename.
+    /// Produces an atomic JSON backup.
     pub async fn backup(
         &self,
         destination: PathBuf,
         unique_suffix: u64,
     ) -> Result<(), StorageError> {
-        let (reply, receive) = oneshot::channel();
-        self.send(StorageCommand::Backup {
+        self.request(|reply| StorageCommand::Backup {
             destination,
             unique_suffix,
             reply,
         })
-        .await?;
+        .await
+    }
+
+    async fn request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, StorageError>>) -> StorageCommand,
+    ) -> Result<T, StorageError> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(command(reply))
+            .await
+            .map_err(|_| StorageError::ActorStopped)?;
         receive.await.map_err(|_| StorageError::ActorStopped)?
     }
 
@@ -389,45 +555,40 @@ impl StorageHandle {
     }
 }
 
-/// Owning storage service and its dedicated blocking thread.
+/// Owning atomic JSON storage service and dedicated blocking thread.
 pub struct StorageService {
     handle: StorageHandle,
     join: Option<JoinHandle<()>>,
 }
 
 impl StorageService {
-    /// Starts the only writable SQLite connection on a dedicated thread.
+    /// Starts the only writer for a versioned JSON state file.
     pub fn start(
-        database_path: &Path,
+        state_path: &Path,
         channel_capacity: usize,
-        migration_timestamp: u64,
+        _initialization_timestamp: u64,
     ) -> Result<Self, StorageError> {
         if channel_capacity == 0 {
             return Err(StorageError::Invariant(
                 "storage channel capacity must be positive",
             ));
         }
+        if let Some(parent) = state_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock_path = state_path.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        FileExt::try_lock_exclusive(&lock_file).map_err(|_| StorageError::DatabaseLocked)?;
+        let store = JsonStore::open(state_path.to_owned())?;
         let (sender, receiver) = mpsc::channel(channel_capacity);
-        let (startup_send, startup_receive) = std::sync::mpsc::sync_channel(1);
-        let path = database_path.to_owned();
         let join = thread::Builder::new()
-            .name("morpho-v2-storage".to_owned())
-            .spawn(move || {
-                let startup = open_storage(&path, migration_timestamp);
-                match startup {
-                    Ok((connection, lock_file)) => {
-                        if startup_send.send(Ok(())).is_ok() {
-                            run_actor(connection, lock_file, receiver);
-                        }
-                    }
-                    Err(error) => {
-                        let _ = startup_send.send(Err(error));
-                    }
-                }
-            })?;
-        startup_receive
-            .recv()
-            .map_err(|_| StorageError::ActorStopped)??;
+            .name("morpho-v2-json-storage".to_owned())
+            .spawn(move || run_actor(store, lock_file, receiver))?;
         Ok(Self {
             handle: StorageHandle { sender },
             join: Some(join),
@@ -440,7 +601,7 @@ impl StorageService {
         self.handle.clone()
     }
 
-    /// Flushes, closes, and joins the dedicated storage thread.
+    /// Flushes and joins the writer thread.
     pub async fn shutdown(mut self) -> Result<(), StorageError> {
         let (reply, receive) = oneshot::channel();
         self.handle.send(StorageCommand::Shutdown { reply }).await?;
@@ -451,161 +612,437 @@ impl StorageService {
     }
 }
 
-fn open_storage(path: &Path, migration_timestamp: u64) -> Result<(Connection, File), StorageError> {
-    verify_sqlite_version()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let lock_path = path.with_extension("lock");
-    let lock_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)?;
-    FileExt::try_lock_exclusive(&lock_file).map_err(|_| StorageError::DatabaseLocked)?;
-    let mut connection = Connection::open(path)?;
-    configure_connection(&connection)?;
-    apply_migrations(
-        &mut connection,
-        i64::try_from(migration_timestamp).map_err(|_| StorageError::NumericRange {
-            field: "migration_timestamp",
-        })?,
-    )?;
-    Ok((connection, lock_file))
-}
-
-fn run_actor(
-    mut connection: Connection,
-    _lock_file: File,
-    mut receiver: mpsc::Receiver<StorageCommand>,
-) {
+fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receiver<StorageCommand>) {
     while let Some(command) = receiver.blocking_recv() {
         match command {
             StorageCommand::ApplyCanonicalBlock {
                 block,
                 logs,
-                updated_at,
+                updated_at: _,
                 reply,
             } => {
-                let _ = reply.send(apply_canonical_block(
-                    &mut connection,
-                    &block,
-                    &logs,
-                    updated_at,
-                ));
+                let _ = reply.send(store.commit(|state| apply_block(state, block, logs)));
             }
             StorageCommand::RewindToAncestor {
                 chain_id,
                 ancestor,
-                updated_at,
+                updated_at: _,
                 reply,
             } => {
-                let _ = reply.send(rewind_to_ancestor(
-                    &mut connection,
-                    chain_id,
-                    ancestor,
-                    updated_at,
-                ));
+                let mut result = RewindResult::default();
+                let outcome = store.commit(|state| {
+                    result = rewind(state, chain_id, ancestor);
+                    Ok(())
+                });
+                let _ = reply.send(outcome.map(|()| result));
             }
             StorageCommand::PersistSnapshot {
                 snapshot,
                 created_at,
                 reply,
             } => {
-                let _ = reply.send(persist_snapshot(&mut connection, &snapshot, created_at));
+                let _ = reply.send(store.commit(|state| {
+                    if state
+                        .exact_snapshots
+                        .iter()
+                        .all(|entry| entry.snapshot.snapshot_hash != snapshot.snapshot_hash)
+                    {
+                        state.exact_snapshots.push(TimedSnapshot {
+                            snapshot: *snapshot,
+                            created_at,
+                        });
+                    }
+                    Ok(())
+                }));
             }
             StorageCommand::PersistPlan {
                 plan,
                 created_at,
                 reply,
             } => {
-                let _ = reply.send(persist_plan(&mut connection, &plan, created_at));
+                let _ = reply.send(store.commit(|state| persist_plan(state, *plan, created_at)));
+            }
+            StorageCommand::PersistFinalPreflight { record, reply } => {
+                let _ = reply.send(store.commit(|state| {
+                    if !state
+                        .plans
+                        .iter()
+                        .any(|entry| entry.plan.plan_id == record.plan_id)
+                    {
+                        return Err(StorageError::Invariant("preflight references unknown plan"));
+                    }
+                    if state
+                        .final_preflights
+                        .iter()
+                        .any(|entry| entry.preflight_id == record.preflight_id)
+                    {
+                        return Err(StorageError::Invariant("duplicate preflight identity"));
+                    }
+                    state.final_preflights.push(record);
+                    Ok(())
+                }));
             }
             StorageCommand::ReserveNonce { reservation, reply } => {
-                let _ = reply.send(reserve_nonce(&mut connection, &reservation));
+                let _ = reply.send(store.commit(|state| reserve_nonce(state, reservation)));
             }
             StorageCommand::PersistSignedTransaction { transaction, reply } => {
-                let _ = reply.send(persist_signed_transaction(&mut connection, &transaction));
+                let _ = reply.send(store.commit(|state| persist_signed(state, transaction)));
             }
             StorageCommand::TransitionTransaction { transition, reply } => {
-                let _ = reply.send(transition_transaction(&mut connection, &transition));
+                let _ = reply.send(store.commit(|state| transition_transaction(state, transition)));
             }
             StorageCommand::LoadUnresolved { signer, reply } => {
-                let _ = reply.send(load_unresolved_transaction(&connection, signer));
+                let _ = reply.send(load_unresolved(&store.state, signer));
             }
             StorageCommand::LoadCursor { chain_id, reply } => {
-                let _ = reply.send(super::queries::load_cursor(&connection, chain_id));
+                let _ = reply.send(Ok(store.state.chain_cursors.get(&chain_id).copied()));
             }
             StorageCommand::LoadCanonicalBlock {
                 chain_id,
                 number,
                 reply,
             } => {
-                let _ = reply.send(super::queries::load_canonical_block(
-                    &connection,
-                    chain_id,
-                    number,
-                ));
+                let block = store
+                    .state
+                    .canonical_blocks
+                    .iter()
+                    .find(|record| record.chain_id == chain_id && record.block.number == number)
+                    .map(|record| record.block);
+                let _ = reply.send(Ok(block));
             }
             StorageCommand::PersistTopology {
                 topology,
                 block,
                 reply,
             } => {
-                let _ = reply.send(super::queries::persist_topology(
-                    &mut connection,
-                    &topology,
-                    block,
-                ));
+                let _ = reply.send(store.commit(|state| {
+                    state.topology_history.retain(|entry| {
+                        entry.topology.vault != topology.vault || entry.block.hash != block.hash
+                    });
+                    state.topology_history.push(TopologyRevision {
+                        topology: *topology,
+                        block,
+                    });
+                    Ok(())
+                }));
             }
             StorageCommand::LoadTopology {
                 vault,
                 through_block,
                 reply,
             } => {
-                let _ = reply.send(super::queries::load_topology(
-                    &connection,
-                    vault,
-                    through_block,
-                ));
+                let topology = store
+                    .state
+                    .topology_history
+                    .iter()
+                    .filter(|entry| {
+                        entry.topology.vault == vault && entry.block.number <= through_block
+                    })
+                    .max_by_key(|entry| entry.block.number)
+                    .map(|entry| entry.topology.clone());
+                let _ = reply.send(Ok(topology));
             }
             StorageCommand::PersistRateEpisode {
                 episode,
                 updated_at,
                 reply,
             } => {
-                let _ = reply.send(super::queries::persist_rate_episode(
-                    &mut connection,
-                    &episode,
-                    updated_at,
-                ));
+                let _ =
+                    reply.send(store.commit(|state| persist_episode(state, *episode, updated_at)));
             }
             StorageCommand::LoadActiveRateEpisode {
                 vault,
                 rate_group,
                 reply,
             } => {
-                let _ = reply.send(super::queries::load_active_rate_episode(
-                    &connection,
-                    vault,
-                    rate_group,
-                ));
+                let rows = store
+                    .state
+                    .rate_episodes
+                    .iter()
+                    .filter(|entry| {
+                        entry.episode.vault == vault
+                            && entry.episode.rate_group == rate_group
+                            && entry.episode.state != RateEpisodeState::Complete
+                    })
+                    .collect::<Vec<_>>();
+                let result = if rows.len() > 1 {
+                    Err(StorageError::Invariant("multiple active rate episodes"))
+                } else {
+                    Ok(rows.first().map(|entry| entry.episode.clone()))
+                };
+                let _ = reply.send(result);
             }
             StorageCommand::Backup {
                 destination,
                 unique_suffix,
                 reply,
             } => {
-                let _ = reply.send(create_backup(&connection, &destination, unique_suffix));
+                let _ = reply.send(store.backup(&destination, unique_suffix));
             }
             StorageCommand::Shutdown { reply } => {
-                let result = connection
-                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                    .map_err(StorageError::Sql);
-                let _ = reply.send(result);
+                let _ = reply.send(store.persist(&store.state));
                 break;
             }
         }
     }
+}
+
+fn apply_block(
+    state: &mut JsonState,
+    block: CanonicalBlockRecord,
+    logs: Vec<CanonicalLogRecord>,
+) -> Result<(), StorageError> {
+    if logs.iter().any(|log| {
+        log.chain_id != block.chain_id
+            || log.block_number != block.block.number
+            || log.block_hash != block.block.hash
+    }) {
+        return Err(StorageError::Invariant(
+            "canonical log does not belong to block",
+        ));
+    }
+    state.canonical_blocks.retain(|existing| {
+        existing.chain_id != block.chain_id || existing.block.number != block.block.number
+    });
+    state.canonical_logs.retain(|existing| {
+        existing.chain_id != block.chain_id || existing.block_number != block.block.number
+    });
+    state.canonical_blocks.push(block);
+    state.canonical_logs.extend(logs);
+    state.chain_cursors.insert(block.chain_id, block.block);
+    Ok(())
+}
+
+fn rewind(state: &mut JsonState, chain_id: u64, ancestor: BlockRef) -> RewindResult {
+    let old_blocks = state.canonical_blocks.len();
+    let old_logs = state.canonical_logs.len();
+    state
+        .canonical_blocks
+        .retain(|record| record.chain_id != chain_id || record.block.number <= ancestor.number);
+    state
+        .canonical_logs
+        .retain(|record| record.chain_id != chain_id || record.block_number <= ancestor.number);
+    state
+        .topology_history
+        .retain(|entry| entry.block.number <= ancestor.number);
+    state.exact_snapshots.retain(|entry| {
+        entry.snapshot.context.chain_id != chain_id
+            || entry.snapshot.context.block.number <= ancestor.number
+    });
+    state.rate_episodes.retain(|entry| {
+        entry.episode.detection_block.number <= ancestor.number
+            && entry
+                .episode
+                .confirmation_block
+                .is_none_or(|block| block.number <= ancestor.number)
+    });
+    let mut transactions_orphaned = 0_u64;
+    for transaction in &mut state.transactions {
+        if transaction
+            .included_block
+            .is_some_and(|number| number > ancestor.number)
+            && matches!(
+                transaction.state,
+                TransactionState::Included
+                    | TransactionState::Confirmed
+                    | TransactionState::ConformanceValidated
+                    | TransactionState::Reconciled
+            )
+        {
+            transaction.state = TransactionState::Orphaned;
+            transactions_orphaned = transactions_orphaned.saturating_add(1);
+        }
+    }
+    state.chain_cursors.insert(chain_id, ancestor);
+    RewindResult {
+        blocks_orphaned: usize_to_u64_saturating(
+            old_blocks.saturating_sub(state.canonical_blocks.len()),
+        ),
+        logs_orphaned: usize_to_u64_saturating(old_logs.saturating_sub(state.canonical_logs.len())),
+        transactions_orphaned,
+    }
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).map_or(u64::MAX, |converted| converted)
+}
+
+fn persist_plan(state: &mut JsonState, plan: V2Plan, created_at: u64) -> Result<(), StorageError> {
+    let snapshot_exists = state.exact_snapshots.iter().any(|entry| {
+        entry.snapshot.parent.vault == plan.vault.0
+            && entry.snapshot.context.block.number == plan.snapshot.block.number
+            && entry.snapshot.context.block.hash == plan.snapshot.block.hash
+            && entry.snapshot.context.static_config_revision == plan.config_revision
+            && entry.snapshot.context.dynamic_topology_revision == plan.topology_revision
+    });
+    if !snapshot_exists {
+        return Err(StorageError::Invariant(
+            "plan references a snapshot that is not durable",
+        ));
+    }
+    if state
+        .plans
+        .iter()
+        .any(|entry| entry.plan.plan_id == plan.plan_id)
+    {
+        return Err(StorageError::Invariant("duplicate plan identity"));
+    }
+    state.plans.push(TimedPlan { plan, created_at });
+    Ok(())
+}
+
+fn reserve_nonce(state: &mut JsonState, reservation: NonceReservation) -> Result<(), StorageError> {
+    if reservation.calldata_hash != keccak256(&reservation.calldata) {
+        return Err(StorageError::Invariant(
+            "nonce reservation calldata hash mismatch",
+        ));
+    }
+    if state
+        .transactions
+        .iter()
+        .any(|row| row.reservation.signer == reservation.signer && row.state.is_unresolved())
+    {
+        return Err(StorageError::UnresolvedLane {
+            signer: reservation.signer,
+        });
+    }
+    if state
+        .transactions
+        .iter()
+        .any(|row| row.reservation.transaction_id == reservation.transaction_id)
+    {
+        return Err(StorageError::Invariant("duplicate transaction identity"));
+    }
+    let created_at = reservation.created_at;
+    state.transactions.push(TransactionRow {
+        reservation,
+        state: TransactionState::NonceReserved,
+        transaction_hash: None,
+        raw_signed_transaction: None,
+        submitted_at: None,
+        included_block: None,
+        included_block_hash: None,
+        updated_at: created_at,
+    });
+    Ok(())
+}
+
+fn persist_signed(
+    state: &mut JsonState,
+    signed: SignedTransactionRecord,
+) -> Result<(), StorageError> {
+    if signed.raw_signed_transaction.is_empty() {
+        return Err(StorageError::Invariant(
+            "signed transaction bytes are empty",
+        ));
+    }
+    let row = state
+        .transactions
+        .iter_mut()
+        .find(|row| row.reservation.transaction_id == signed.transaction_id)
+        .ok_or(StorageError::StaleTransition)?;
+    if row.state != TransactionState::NonceReserved {
+        return Err(StorageError::StaleTransition);
+    }
+    row.state = TransactionState::Signed;
+    row.transaction_hash = Some(signed.transaction_hash);
+    row.raw_signed_transaction = Some(signed.raw_signed_transaction);
+    row.updated_at = signed.updated_at;
+    Ok(())
+}
+
+fn transition_transaction(
+    state: &mut JsonState,
+    transition: TransactionTransition,
+) -> Result<(), StorageError> {
+    if !transition.expected_state.permits(transition.next_state) {
+        return Err(StorageError::InvalidTransition {
+            from: transition.expected_state,
+            to: transition.next_state,
+        });
+    }
+    let row = state
+        .transactions
+        .iter_mut()
+        .find(|row| row.reservation.transaction_id == transition.transaction_id)
+        .ok_or(StorageError::StaleTransition)?;
+    if row.state != transition.expected_state {
+        return Err(StorageError::StaleTransition);
+    }
+    row.state = transition.next_state;
+    if let Some(hash) = transition.transaction_hash {
+        row.transaction_hash = Some(hash);
+    }
+    if transition.submitted_at.is_some() {
+        row.submitted_at = transition.submitted_at;
+    }
+    if transition.included_block.is_some() {
+        row.included_block = transition.included_block;
+    }
+    if transition.included_block_hash.is_some() {
+        row.included_block_hash = transition.included_block_hash;
+    }
+    row.updated_at = transition.updated_at;
+    Ok(())
+}
+
+fn load_unresolved(
+    state: &JsonState,
+    signer: Address,
+) -> Result<Option<UnresolvedTransaction>, StorageError> {
+    let rows = state
+        .transactions
+        .iter()
+        .filter(|row| row.reservation.signer == signer && row.state.is_unresolved())
+        .collect::<Vec<_>>();
+    if rows.len() > 1 {
+        return Err(StorageError::MultipleUnresolved { signer });
+    }
+    Ok(rows.first().map(|row| UnresolvedTransaction {
+        transaction_id: row.reservation.transaction_id,
+        signer,
+        nonce: row.reservation.nonce,
+        state: row.state,
+        transaction_hash: row.transaction_hash,
+        raw_signed_transaction: row.raw_signed_transaction.clone(),
+        calldata: row.reservation.calldata.clone(),
+        calldata_hash: row.reservation.calldata_hash,
+    }))
+}
+
+fn persist_episode(
+    state: &mut JsonState,
+    episode: RateSignalEpisode,
+    updated_at: u64,
+) -> Result<(), StorageError> {
+    if episode.state != RateEpisodeState::Complete
+        && state.rate_episodes.iter().any(|entry| {
+            entry.episode.vault == episode.vault
+                && entry.episode.rate_group == episode.rate_group
+                && entry.episode.state != RateEpisodeState::Complete
+                && entry.episode.episode_id != episode.episode_id
+        })
+    {
+        return Err(StorageError::Invariant("multiple active rate episodes"));
+    }
+    if let Some(existing) = state
+        .rate_episodes
+        .iter_mut()
+        .find(|entry| entry.episode.episode_id == episode.episode_id)
+    {
+        existing.episode = episode;
+        existing.updated_at = updated_at;
+    } else {
+        state.rate_episodes.push(TimedEpisode {
+            episode,
+            updated_at,
+        });
+    }
+    Ok(())
 }

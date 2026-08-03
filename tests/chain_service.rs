@@ -216,7 +216,7 @@ async fn catch_up_persists_each_block_before_publication() -> Result<(), Box<dyn
     ));
     let checkpoint = Arc::new(FakeProvider::checkpoint(blocks));
     let directory = TempDir::new()?;
-    let service = StorageService::start(&directory.path().join("chain.sqlite"), 32, 1)?;
+    let service = StorageService::start(&directory.path().join("chain.json"), 32, 1)?;
     let handle = service.handle();
     let (send, mut receive) = mpsc::channel(16);
     let chain = ChainService::new(
@@ -266,7 +266,7 @@ async fn unsupported_block_receipts_uses_checked_log_fallback()
     ));
     provider.use_log_fallback().await;
     let directory = TempDir::new()?;
-    let service = StorageService::start(&directory.path().join("fallback.sqlite"), 32, 1)?;
+    let service = StorageService::start(&directory.path().join("fallback.json"), 32, 1)?;
     let (send, mut receive) = mpsc::channel(8);
     let chain = ChainService::new(provider, None, service.handle(), send, config(watched, 8))?;
     chain.poll_once().await?;
@@ -286,7 +286,7 @@ async fn bounded_reorg_rewinds_and_replays_new_canonical_branch()
     let original = vec![block(10, 10, 9), block(11, 11, 10), block(12, 12, 11)];
     let provider = Arc::new(FakeProvider::primary(original.clone(), vec![]));
     let directory = TempDir::new()?;
-    let service = StorageService::start(&directory.path().join("reorg.sqlite"), 32, 1)?;
+    let service = StorageService::start(&directory.path().join("reorg.json"), 32, 1)?;
     let handle = service.handle();
     let (send, mut receive) = mpsc::channel(32);
     let chain = ChainService::new(
@@ -339,7 +339,7 @@ async fn deep_reorg_stops_without_rewinding_cursor() -> Result<(), Box<dyn std::
     let original = vec![block(10, 10, 9), block(11, 11, 10), block(12, 12, 11)];
     let provider = Arc::new(FakeProvider::primary(original.clone(), vec![]));
     let directory = TempDir::new()?;
-    let service = StorageService::start(&directory.path().join("deep.sqlite"), 32, 1)?;
+    let service = StorageService::start(&directory.path().join("deep.json"), 32, 1)?;
     let handle = service.handle();
     let (send, _receive) = mpsc::channel(32);
     let chain = ChainService::new(
@@ -377,7 +377,7 @@ async fn checkpoint_disagreement_is_published_and_fails_closed()
     let primary = Arc::new(FakeProvider::primary(vec![head], vec![]));
     let checkpoint = Arc::new(FakeProvider::checkpoint(vec![block(10, 0xff, 9)]));
     let directory = TempDir::new()?;
-    let service = StorageService::start(&directory.path().join("checkpoint.sqlite"), 32, 1)?;
+    let service = StorageService::start(&directory.path().join("checkpoint.json"), 32, 1)?;
     let (send, mut receive) = mpsc::channel(8);
     let chain = ChainService::new(
         primary,
@@ -408,7 +408,7 @@ async fn wrong_receipt_block_hash_is_never_persisted_or_published()
     wrong.block_hash = B256::repeat_byte(0xee);
     let provider = Arc::new(FakeProvider::primary(vec![head], vec![(10, vec![wrong])]));
     let directory = TempDir::new()?;
-    let service = StorageService::start(&directory.path().join("invalid.sqlite"), 32, 1)?;
+    let service = StorageService::start(&directory.path().join("invalid.json"), 32, 1)?;
     let handle = service.handle();
     let (send, mut receive) = mpsc::channel(8);
     let chain = ChainService::new(provider, None, handle.clone(), send, config(watched, 8))?;

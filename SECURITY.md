@@ -6,6 +6,5 @@ suggested mitigation. Never include live signing keys, RPC credentials, or alert
 credentials in a report.
 
 Execute mode is not considered ready unless protocol identities, signer policy,
-chain identity, migration checksums, preflight, receipt conformance, and exact
-post-state reconciliation all pass.
-
+chain identity, JSON storage version/integrity checks, preflight, receipt
+conformance, and exact post-state reconciliation all pass.

@@ -14,6 +14,16 @@ SHA-256: 6731d92b86908a3e44f110170aceb86040ffb2771f28ddb7ee55162135184d10
 
 The implementation specification is the normal working document and already contains the architecture appendix. Do not repeatedly load both complete documents.
 
+## Repository-owner storage override
+
+The repository owner explicitly replaced the normative SQLite requirement with
+one versioned JSON state file on 2026-08-03. Preserve the normative durability
+and recovery invariants with a bounded single-writer actor, exclusive process
+lock, atomic temporary-file replacement, file and directory `fsync`, strict
+schema-version checks, compare-and-set transaction transitions, and durable
+signed bytes before broadcast. This override is recorded in
+`docs/spec-conflicts.md`.
+
 ## Working agreements
 
 - Implement milestones in the normative roadmap in order.

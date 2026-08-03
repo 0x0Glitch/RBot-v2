@@ -10,7 +10,7 @@
 
 ## Later milestones
 
-Milestones 9–13 remain pending in normative order. Execute remains disabled.
+Milestones 10–13 remain pending in normative order. Execute remains disabled.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 
@@ -27,17 +27,19 @@ Milestones 9–13 remain pending in normative order. Execute remains disabled.
 
 ## Milestone 2 — Storage
 
-- The initial three normative migrations, SHA-256 manifest, SQLite 3.51.3 runtime gate and
-  mandatory WAL/FULL/foreign-key/busy-timeout configuration implemented.
-- Dedicated blocking writer actor uses a bounded channel and one-shot durable
-  acknowledgments; the SQLite connection is never shared through a mutex.
+- Per the repository owner's explicit storage override, runtime state is one
+  strict, versioned JSON document rather than SQLite.
+- A dedicated blocking writer actor uses a bounded channel, one-shot durable
+  acknowledgments and an exclusive cross-process state-file lock.
 - Canonical block/log apply and reorg rewind are atomic.
 - Snapshot, plan/action/certificate, nonce, signed bytes and checked lifecycle
   transitions are durable; one unresolved signer lane is enforced by the actor.
-- Online backup uses SQLite backup, file `fsync`, atomic rename and directory `fsync`.
-- Reopen tests cover every implemented transaction durability boundary.
-- `make ci` passes with 31 positive/property tests and 6 compile-fail cases.
-- Migration and backup CLI smoke tests pass on a fresh database.
+- Every mutation clones and validates the complete state, writes a same-directory
+  temporary JSON file, calls file `fsync`, atomically renames it, then calls
+  directory `fsync`; failed commits do not mutate the actor's live state.
+- Atomic backup, corrupt/unknown-format rejection, cross-process exclusion and
+  reopen tests cover every implemented transaction durability boundary.
+- `storage-init` and `backup` bootstrap commands operate only on JSON files.
 
 ## Milestone 3 — Bindings And Events
 
@@ -90,7 +92,7 @@ Milestones 9–13 remain pending in normative order. Execute remains disabled.
   markets, IRM state, token liquidity, all cap levels and pending operations.
 - All-ever adapter/market topology, cap ID data, external-donation evidence,
   BurnShares synchronization and full-calldata delayed administration are
-  replayable and durable. A topology-history migration preserves recurring
+  replayable and durable. Versioned topology history preserves recurring
   revisions and restores derived indexes atomically on reorg.
 - Capability derivation enforces share mismatch, removed-adapter, cap, gate,
   dead-deposit, market seed, liquidity adapter, reward horizon, pending admin,

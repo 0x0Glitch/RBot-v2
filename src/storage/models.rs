@@ -40,7 +40,6 @@ pub struct CanonicalLogRecord {
 /// Durable transaction lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[repr(i64)]
 pub enum TransactionState {
     /// Nonce and validated calldata durably reserved.
     NonceReserved = 0,
@@ -71,26 +70,6 @@ pub enum TransactionState {
 }
 
 impl TransactionState {
-    /// Decodes the stable SQLite integer representation.
-    pub fn from_i64(value: i64) -> Option<Self> {
-        match value {
-            0 => Some(Self::NonceReserved),
-            1 => Some(Self::AbortedBeforeSigning),
-            2 => Some(Self::Signed),
-            3 => Some(Self::Submitted),
-            4 => Some(Self::Replaced),
-            5 => Some(Self::CancellationSubmitted),
-            6 => Some(Self::Included),
-            7 => Some(Self::Confirmed),
-            8 => Some(Self::Reverted),
-            9 => Some(Self::Orphaned),
-            10 => Some(Self::ConformanceValidated),
-            11 => Some(Self::Reconciled),
-            12 => Some(Self::Failed),
-            _ => None,
-        }
-    }
-
     /// Returns whether this state owns the signer's single unresolved lane.
     #[must_use]
     pub const fn is_unresolved(self) -> bool {
@@ -147,7 +126,7 @@ impl TransactionState {
 }
 
 /// Complete nonce reservation persisted before a signing request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NonceReservation {
     /// Stable transaction lifecycle ID.
     pub transaction_id: TransactionId,
@@ -173,8 +152,35 @@ pub struct NonceReservation {
     pub created_at: u64,
 }
 
+/// Durable same-head simulation and signing-gate evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FinalPreflightRecord {
+    /// Stable preflight identity.
+    pub preflight_id: B256,
+    /// Validated plan identity.
+    pub plan_id: PlanId,
+    /// Exact canonical head.
+    pub head: BlockRef,
+    /// Hash of state and calldata entering simulation.
+    pub simulation_before_hash: B256,
+    /// Hash of simulation output and signed gas result.
+    pub simulation_after_hash: B256,
+    /// Event cursor processed through the head.
+    pub event_cursor_number: u64,
+    /// Exact calldata hash.
+    pub calldata_hash: B256,
+    /// Raw provider gas estimate.
+    pub gas_estimate: u64,
+    /// Final ceil-headroom gas limit.
+    pub signed_gas_limit: u64,
+    /// Process-monotonic completion time.
+    pub completed_monotonic_nanos: u64,
+    /// Unix creation timestamp.
+    pub created_at: u64,
+}
+
 /// Signed bytes persisted before any broadcast attempt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignedTransactionRecord {
     /// Existing lifecycle ID.
     pub transaction_id: TransactionId,
@@ -187,7 +193,7 @@ pub struct SignedTransactionRecord {
 }
 
 /// Checked state transition with optional inclusion/submission facts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransactionTransition {
     /// Existing lifecycle ID.
     pub transaction_id: TransactionId,
@@ -208,7 +214,7 @@ pub struct TransactionTransition {
 }
 
 /// Recovery view for a signer's unique unresolved transaction.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UnresolvedTransaction {
     /// Stable lifecycle ID.
     pub transaction_id: TransactionId,
@@ -229,7 +235,7 @@ pub struct UnresolvedTransaction {
 }
 
 /// Result of an atomic canonical rewind.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RewindResult {
     /// Canonical blocks orphaned.
     pub blocks_orphaned: u64,

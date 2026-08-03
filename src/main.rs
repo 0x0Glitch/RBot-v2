@@ -53,30 +53,27 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Migrate { database } => match unix_timestamp().and_then(|timestamp| {
-            StorageService::start(&database, DEFAULT_STORAGE_CHANNEL_CAPACITY, timestamp)
+        Command::StorageInit { state } => match unix_timestamp().and_then(|timestamp| {
+            StorageService::start(&state, DEFAULT_STORAGE_CHANNEL_CAPACITY, timestamp)
                 .map(|service| (service, timestamp))
         }) {
             Ok((service, _)) => match service.shutdown().await {
                 Ok(()) => {
-                    println!("migrations=ok database={}", database.display());
+                    println!("storage=ok state={}", state.display());
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
-                    eprintln!("migration shutdown failed: {error}");
+                    eprintln!("storage shutdown failed: {error}");
                     ExitCode::FAILURE
                 }
             },
             Err(error) => {
-                eprintln!("migration failed: {error}");
+                eprintln!("storage initialization failed: {error}");
                 ExitCode::FAILURE
             }
         },
-        Command::Backup {
-            database,
-            destination,
-        } => match unix_timestamp().and_then(|timestamp| {
-            StorageService::start(&database, DEFAULT_STORAGE_CHANNEL_CAPACITY, timestamp)
+        Command::Backup { state, destination } => match unix_timestamp().and_then(|timestamp| {
+            StorageService::start(&state, DEFAULT_STORAGE_CHANNEL_CAPACITY, timestamp)
                 .map(|service| (service, timestamp))
         }) {
             Ok((service, timestamp)) => {

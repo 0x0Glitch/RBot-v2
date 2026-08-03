@@ -1,4 +1,4 @@
-//! SQLite migration, actor, durability, recovery, rewind, and backup tests.
+//! Atomic JSON actor, durability, recovery, rewind, and backup tests.
 #![allow(clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +18,7 @@ use morpho_v2_reallocator::storage::models::{
     CanonicalBlockRecord, CanonicalLogRecord, NonceReservation, SignedTransactionRecord,
     TransactionState, TransactionTransition,
 };
-use rusqlite::Connection;
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn block(number: u64, hash_byte: u8, parent_byte: u8) -> BlockRef {
@@ -51,6 +51,10 @@ async fn reopen(path: &Path) -> Result<StorageService, StorageError> {
     StorageService::start(path, 8, 1_800_000_000)
 }
 
+fn read_json(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
 fn rate_episode(vault: VaultAddress, detection: BlockRef, salt: u8) -> RateSignalEpisode {
     let source = MarketId(B256::repeat_byte(salt));
     let destination = MarketId(B256::repeat_byte(salt.saturating_add(1)));
@@ -79,7 +83,7 @@ fn rate_episode(vault: VaultAddress, detection: BlockRef, salt: u8) -> RateSigna
 async fn rate_episode_is_durable_unique_and_reorg_reversible()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let path = directory.path().join("episodes.sqlite");
+    let path = directory.path().join("episodes.json");
     let service = reopen(&path).await?;
     let handle = service.handle();
     let vault = VaultAddress(Address::with_last_byte(0x44));
@@ -129,59 +133,59 @@ async fn rate_episode_is_durable_unique_and_reorg_reversible()
 }
 
 #[tokio::test]
-async fn migrations_pragmas_and_reopen_are_stable() -> Result<(), Box<dyn std::error::Error>> {
+async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let path = directory.path().join("state.sqlite");
+    let path = directory.path().join("state.json");
     let service = reopen(&path).await?;
     service.shutdown().await?;
 
-    let connection = Connection::open(&path)?;
-    let migrations: i64 =
-        connection.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
-            row.get(0)
-        })?;
-    let journal: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-    let foreign_keys: i64 = connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
-    assert_eq!(migrations, 4);
-    assert_eq!(journal.to_ascii_lowercase(), "wal");
-    assert_eq!(foreign_keys, 1);
-    drop(connection);
+    let state = read_json(&path)?;
+    assert_eq!(state["format_version"], 1);
+    assert_eq!(state["revision"], 0);
+    assert_eq!(state["transactions"].as_array().map(Vec::len), Some(0));
 
     let service = reopen(&path).await?;
     service.shutdown().await?;
+    assert_eq!(read_json(&path)?, state);
     Ok(())
 }
 
 #[tokio::test]
-async fn migration_checksum_tampering_fails_reopen() -> Result<(), Box<dyn std::error::Error>> {
+async fn corrupt_and_unknown_json_formats_fail_reopen() -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let path = directory.path().join("tampered.sqlite");
+    let path = directory.path().join("tampered.json");
     reopen(&path).await?.shutdown().await?;
-    let connection = Connection::open(&path)?;
-    connection.execute(
-        "UPDATE schema_migrations SET checksum = zeroblob(32) WHERE version = 1",
-        [],
-    )?;
-    drop(connection);
+    let mut state = read_json(&path)?;
+    state["format_version"] = Value::from(999_u64);
+    std::fs::write(&path, serde_json::to_vec_pretty(&state)?)?;
 
     let error = match StorageService::start(&path, 8, 1_800_000_000) {
         Ok(service) => {
             service.shutdown().await?;
-            panic!("tampered migration must fail startup")
+            panic!("unknown JSON format must fail startup")
         }
         Err(error) => error,
     };
     assert!(matches!(
         error,
-        StorageError::MigrationChecksum { version: 1 }
+        StorageError::FormatVersion {
+            actual: 999,
+            expected: 1
+        }
+    ));
+
+    std::fs::write(&path, b"{not-json")?;
+    assert!(matches!(
+        StorageService::start(&path, 8, 1_800_000_000),
+        Err(StorageError::Json(_))
     ));
     Ok(())
 }
 
 #[tokio::test]
-async fn only_one_writer_process_owns_the_database() -> Result<(), Box<dyn std::error::Error>> {
+async fn only_one_writer_process_owns_the_state_file() -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let path = directory.path().join("locked.sqlite");
+    let path = directory.path().join("locked.json");
     let first = reopen(&path).await?;
     let second = StorageService::start(&path, 8, 1_800_000_000);
     assert!(matches!(second, Err(StorageError::DatabaseLocked)));
@@ -192,7 +196,7 @@ async fn only_one_writer_process_owns_the_database() -> Result<(), Box<dyn std::
 #[tokio::test]
 async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let path = directory.path().join("chain.sqlite");
+    let path = directory.path().join("chain.json");
     let service = reopen(&path).await?;
     let handle = service.handle();
     let first = block(10, 0x10, 0x09);
@@ -232,19 +236,14 @@ async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::erro
     assert_eq!(result.logs_orphaned, 1);
     service.shutdown().await?;
 
-    let connection = Connection::open(path)?;
-    let cursor: i64 = connection.query_row(
-        "SELECT block_number FROM chain_cursor WHERE chain_id = 999",
-        [],
-        |row| row.get(0),
-    )?;
-    let canonical_at_11: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM canonical_blocks WHERE number = 11 AND canonical = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(cursor, 10);
-    assert_eq!(canonical_at_11, 0);
+    let state = read_json(&path)?;
+    assert_eq!(state["chain_cursors"]["999"]["number"], 10);
+    let blocks = state["canonical_blocks"]
+        .as_array()
+        .ok_or("canonical_blocks is not an array")?;
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["block"]["number"], 10);
+    assert_eq!(state["canonical_logs"].as_array().map(Vec::len), Some(0));
     Ok(())
 }
 
@@ -252,7 +251,7 @@ async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::erro
 async fn transaction_boundaries_recover_after_every_reopen()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let path = directory.path().join("recovery.sqlite");
+    let path = directory.path().join("recovery.json");
     let signer = Address::with_last_byte(0x55);
 
     let service = reopen(&path).await?;
@@ -375,7 +374,7 @@ async fn transition_and_recover(
 #[tokio::test]
 async fn signer_lane_and_transition_graph_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let path = directory.path().join("lane.sqlite");
+    let path = directory.path().join("lane.json");
     let signer = Address::with_last_byte(0x66);
     let service = reopen(&path).await?;
     let handle = service.handle();
@@ -409,8 +408,8 @@ async fn signer_lane_and_transition_graph_fail_closed() -> Result<(), Box<dyn st
 #[tokio::test]
 async fn snapshot_plan_and_backup_are_durable() -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let path = directory.path().join("artifacts.sqlite");
-    let backup = directory.path().join("backup.sqlite");
+    let path = directory.path().join("artifacts.json");
+    let backup = directory.path().join("backup.json");
     let service = reopen(&path).await?;
     let handle = service.handle();
     let snapshot = sample_snapshot();
@@ -419,17 +418,13 @@ async fn snapshot_plan_and_backup_are_durable() -> Result<(), Box<dyn std::error
     handle.backup(backup.clone(), 1).await?;
     service.shutdown().await?;
 
-    let backup_connection = Connection::open(backup)?;
-    let snapshots: i64 =
-        backup_connection
-            .query_row("SELECT COUNT(*) FROM exact_snapshots", [], |row| row.get(0))?;
-    let plans: i64 =
-        backup_connection.query_row("SELECT COUNT(*) FROM plans", [], |row| row.get(0))?;
-    let certificates: i64 =
-        backup_connection.query_row("SELECT COUNT(*) FROM solver_certificates", [], |row| {
-            row.get(0)
-        })?;
-    assert_eq!((snapshots, plans, certificates), (1, 1, 1));
+    let backed_up = read_json(&backup)?;
+    assert_eq!(
+        backed_up["exact_snapshots"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(backed_up["plans"].as_array().map(Vec::len), Some(1));
+    assert!(backed_up["plans"][0]["plan"]["solver_certificate"].is_object());
     Ok(())
 }
 

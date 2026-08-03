@@ -32,17 +32,17 @@ pub enum Command {
         #[arg(long, default_value = "protocol-lock.toml")]
         protocol_lock: PathBuf,
     },
-    /// Apply and verify embedded SQLite migrations, then exit cleanly.
-    Migrate {
-        /// SQLite database path.
+    /// Initialize or validate a versioned atomic JSON state file.
+    StorageInit {
+        /// JSON state path.
         #[arg(long)]
-        database: PathBuf,
+        state: PathBuf,
     },
-    /// Create a durable online SQLite backup, then exit cleanly.
+    /// Create a durable atomic JSON backup, then exit cleanly.
     Backup {
-        /// SQLite database path.
+        /// JSON state path.
         #[arg(long)]
-        database: PathBuf,
+        state: PathBuf,
         /// Final backup destination.
         #[arg(long)]
         destination: PathBuf,
