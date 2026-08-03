@@ -126,21 +126,29 @@ struct JsonStore {
 
 impl JsonStore {
     fn open(path: PathBuf) -> Result<Self, StorageError> {
+        let mut migrated = false;
         let state = if path.exists() {
             let bytes = std::fs::read(&path)?;
-            let state: JsonState = serde_json::from_slice(&bytes)?;
-            if state.format_version != JSON_FORMAT_VERSION {
-                return Err(StorageError::FormatVersion {
-                    actual: state.format_version,
-                    expected: JSON_FORMAT_VERSION,
-                });
+            let mut state: JsonState = serde_json::from_slice(&bytes)?;
+            match state.format_version {
+                JSON_FORMAT_VERSION => {}
+                1 => {
+                    migrate_v1_to_v2(&mut state)?;
+                    migrated = true;
+                }
+                actual => {
+                    return Err(StorageError::FormatVersion {
+                        actual,
+                        expected: JSON_FORMAT_VERSION,
+                    });
+                }
             }
             state
         } else {
             JsonState::default()
         };
         let store = Self { path, state };
-        if !store.path.exists() {
+        if !store.path.exists() || migrated {
             store.persist(&store.state)?;
         }
         Ok(store)
@@ -210,6 +218,40 @@ impl JsonStore {
         File::open(parent)?.sync_all()?;
         Ok(())
     }
+}
+
+fn migrate_v1_to_v2(state: &mut JsonState) -> Result<(), StorageError> {
+    if state
+        .transactions
+        .iter()
+        .any(|transaction| transaction.state.is_unresolved())
+    {
+        return Err(StorageError::Invariant(
+            "format-1 state with an unresolved nonce cannot be migrated safely",
+        ));
+    }
+    for row in &mut state.transactions {
+        row.reservation.created_block = row
+            .reservation
+            .plan_id
+            .and_then(|plan_id| {
+                state
+                    .plans
+                    .iter()
+                    .find(|entry| entry.plan.plan_id == plan_id)
+                    .map(|entry| entry.plan.snapshot.block.number)
+            })
+            .unwrap_or_default();
+    }
+    for attempt in &mut state.transaction_attempts {
+        attempt.signed_block = state
+            .transactions
+            .iter()
+            .find(|row| row.reservation.transaction_id == attempt.transaction_id)
+            .map_or(0, |row| row.reservation.created_block);
+    }
+    state.format_version = JSON_FORMAT_VERSION;
+    Ok(())
 }
 
 /// Single-writer actor command. Every critical mutation has an acknowledgment.

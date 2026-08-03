@@ -10,7 +10,7 @@
 | 7.1 | Pinned source/runtime identity model and lock digest | `src/protocol_lock.rs`, `protocol-lock.toml` | `tests/protocol_lock.rs` | Implemented; deployment values pending |
 | 7.5 | Static doctor and lock validation commands | `src/cli.rs`, `src/main.rs` | CLI smoke at milestone gate | Static phase implemented |
 | 8.1–8.7 | Owner override: strict versioned JSON document, exclusive single-writer actor and bounded commands | `src/storage/actor.rs`, `src/serde_helpers.rs`, `docs/spec-conflicts.md` | format/reopen, cap-rich topology round-trip, corruption and writer-lock tests | Implemented by explicit owner override |
-| 8.8, 23.2–23.4 | Acknowledged atomic writes, nonce lane and compare-and-set recovery transitions | `src/storage/{actor,models}.rs` | boundary reopen and invalid-transition tests | Implemented |
+| 8.8, 23.2–23.4 | Acknowledged atomic writes, nonce lane, version migration and compare-and-set recovery transitions | `src/storage/{actor,models}.rs` | boundary reopen, terminal v1→v2 migration and invalid-transition tests | Implemented |
 | 8.9 | Same-directory temporary file, file/directory fsync, atomic rename and backup | `src/storage/actor.rs` | state and backup parse/reopen tests | Implemented by explicit owner override |
 | 7.2–7.3 | Checked-in minimal official ABIs and generated selectors | `abi/*.sol`, `src/contracts/bindings.rs`, `src/contracts/selectors.rs` | selector/signature tests | Implemented |
 | 7.4 | Canonical full-consumption adapter data validation | `src/domain.rs` | adapter data rejection matrix | Implemented |
@@ -62,7 +62,7 @@
 | 27.1 | Loopback-default GET-only health, metrics, vault, artifact, transaction and alert API | `src/api/{dto,routes}.rs` | live HTTP test including POST rejection | Implemented |
 | 27.3, 24.4 | Complete bounded-name Prometheus registration with no high-cardinality identifiers | `src/telemetry/metrics.rs` | registry text assertion for every metric name | Implemented; SQLite metric superseded by JSON format metric per SC-001 |
 | 27.4, 24.3 | Typed deduplicated alert history and redacted Telegram/PagerDuty transports | `src/telemetry/{alerts,telegram,pagerduty}.rs` | real local HTTP transport tests | Implemented |
-| Milestone 12 | Deterministic local-chain vertical slice through terminal reconciliation | `tests/fixtures/e2e`, `tests/local_e2e.rs`, `deployments/base-sepolia-*` | Local deployment and three Base Sepolia autonomous transactions through exact conformance/reconciliation; cap refresh; adapter removal hard pause/re-add replanning; JSON restart | Main rate, pending-policy and administration-invalidation paths implemented; broader crash/reorg/canary matrix pending |
+| Milestone 12 | Deterministic local-chain vertical slice through terminal reconciliation | `tests/fixtures/e2e`, `tests/local_e2e.rs`, `deployments/base-sepolia-*` | Local deployment and five Base Sepolia autonomous transactions through exact conformance/reconciliation, including two original-vs-cancellation races; cap refresh; adapter removal hard pause/re-add replanning; JSON restart/migration | Main rate, pending-policy and administration-invalidation paths implemented; broader crash/reorg/canary matrix pending |
 
 ## Dependency policy notes
 

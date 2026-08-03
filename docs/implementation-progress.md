@@ -334,11 +334,18 @@ independent-event persistent-unlock path still gate production Execute.
   and produces a fresh improving plan. The supervised state owner then confirms
   a new live episode on the next direct-parent block and publishes a durable,
   firewalled improving Shadow plan.
-- Base Sepolia subsequently completed three autonomous two-action rebalances
+- Base Sepolia subsequently completed five autonomous two-action rebalances
   against the pinned exact-accrual fixture. Transactions
   `0x7a76bf553fa00236e38daf4920333fac45357715421a5e9b77884eb5805fb431`,
   `0xa92f8795db6c8acc4dd6038d310ef76d0c250857d5bd057920b74ed27dcde17a`
-  and `0x73f23c53a5f815afdcd21cfc35e58f7bd48b5e951df0b7b103f70523a1539f96`
+  `0x73f23c53a5f815afdcd21cfc35e58f7bd48b5e951df0b7b103f70523a1539f96`,
+  `0x22f62eda48dac5219ca9e9b90b4c32d0f09ff290f9e0bae31a75ad72f273a4a8`
+  and `0x04186977f23292335aa808fb0927f070ea884874a23079acbb130f8465f5a9fb`
   all reached canonical receipt conformance and exact post-state reconciliation.
+  The final two runs also exercised material pending-horizon cancellation: a
+  higher-fee same-nonce cancellation was durably signed and broadcast, the
+  original reallocation won each race, and receipt selection correctly
+  conformed and reconciled the winning original rather than misclassifying the
+  cancellation.
   The test fixture and runtime identities are pinned in `deployments/` and are
   not presented as production Morpho deployments.

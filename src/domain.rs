@@ -109,6 +109,7 @@ pub struct BlockRef {
     /// Block timestamp in Unix seconds.
     pub timestamp: u64,
     /// Canonical EVM block gas limit used by chain-profile classification.
+    #[serde(default)]
     pub gas_limit: u64,
 }
 

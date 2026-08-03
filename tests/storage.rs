@@ -58,6 +58,23 @@ fn read_json(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 
+fn remove_json_key(value: &mut Value, key: &str) {
+    match value {
+        Value::Object(object) => {
+            object.remove(key);
+            for child in object.values_mut() {
+                remove_json_key(child, key);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                remove_json_key(child, key);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn rate_episode(vault: VaultAddress, detection: BlockRef, salt: u8) -> RateSignalEpisode {
     let source = MarketId(B256::repeat_byte(salt));
     let destination = MarketId(B256::repeat_byte(salt.saturating_add(1)));
@@ -175,6 +192,40 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
     std::fs::write(&path, serde_json::to_vec_pretty(&additive_upgrade)?)?;
     reopen(&path).await?.shutdown().await?;
     assert!(read_json(&path)?["transaction_attempts"].is_array());
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_format_one_state_migrates_atomically_to_format_two()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("format-one.json");
+    let service = reopen(&path).await?;
+    let canonical = block(10, 0x10, 0x09);
+    service
+        .handle()
+        .apply_canonical_block(
+            CanonicalBlockRecord {
+                chain_id: 84532,
+                block: canonical,
+            },
+            Vec::new(),
+            canonical.timestamp,
+        )
+        .await?;
+    service.shutdown().await?;
+
+    let mut legacy = read_json(&path)?;
+    legacy["format_version"] = Value::from(1_u64);
+    remove_json_key(&mut legacy, "gas_limit");
+    remove_json_key(&mut legacy, "created_block");
+    remove_json_key(&mut legacy, "signed_block");
+    std::fs::write(&path, serde_json::to_vec_pretty(&legacy)?)?;
+
+    reopen(&path).await?.shutdown().await?;
+    let migrated = read_json(&path)?;
+    assert_eq!(migrated["format_version"], 2);
+    assert_eq!(migrated["canonical_blocks"][0]["block"]["gas_limit"], 0);
     Ok(())
 }
 

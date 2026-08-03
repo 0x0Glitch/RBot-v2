@@ -296,6 +296,7 @@ pub struct NonceReservation {
     /// Signed gas limit.
     pub gas_limit: u64,
     /// Canonical head number at which this nonce was reserved.
+    #[serde(default)]
     pub created_block: u64,
     /// Unix creation timestamp.
     pub created_at: u64,
@@ -407,6 +408,7 @@ pub struct SignedAttemptRecord {
     /// Durable signing timestamp.
     pub signed_at: u64,
     /// Canonical head number used for this signing decision.
+    #[serde(default)]
     pub signed_block: u64,
     /// Durable broadcast timestamp, populated only after submission returns.
     pub broadcast_at: Option<u64>,

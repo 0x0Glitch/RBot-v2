@@ -28,6 +28,11 @@ history grows. Release sizing must demonstrate acceptable state-file size and
 commit latency; exceeding those bounds disables Execute rather than weakening
 durability.
 
+Format 2 adds canonical block gas limits and pending-attempt block clocks.
+Terminal format-1 files migrate atomically in place. A format-1 file containing
+an unresolved signer nonce is rejected because reconstructing replacement
+timing from missing historical fields would require guessing.
+
 ## SC-002 — Operator configuration format
 
 - Date: 2026-08-03
