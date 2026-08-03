@@ -1,6 +1,7 @@
 //! Command-line interface.
 
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Morpho Vault V2 direct-adapter reallocator.
@@ -17,6 +18,18 @@ pub struct Cli {
 pub enum Command {
     /// Print build identity and fail-closed Execute readiness.
     Status,
+    /// Run the supervised process and read-only operator API.
+    Run {
+        /// Application configuration path.
+        #[arg(long)]
+        config: PathBuf,
+        /// Protocol lock path.
+        #[arg(long, default_value = "protocol-lock.toml")]
+        protocol_lock: PathBuf,
+        /// Read-only HTTP bind address; loopback is the safe default.
+        #[arg(long, default_value = "127.0.0.1:9090")]
+        bind: SocketAddr,
+    },
     /// Parse and statically validate a protocol identity lock.
     ProtocolLockCheck {
         /// Protocol lock path.
@@ -32,6 +45,12 @@ pub enum Command {
         #[arg(long, default_value = "protocol-lock.toml")]
         protocol_lock: PathBuf,
     },
+    /// Validate configuration and print its canonical secret-free form.
+    Config {
+        /// Configuration operation.
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Initialize or validate a versioned atomic JSON state file.
     StorageInit {
         /// JSON state path.
@@ -46,5 +65,28 @@ pub enum Command {
         /// Final backup destination.
         #[arg(long)]
         destination: PathBuf,
+    },
+    /// Deliver one typed test event through enabled alert transports.
+    AlertsTest {
+        /// Application configuration path.
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+/// Secret-free configuration operations.
+#[derive(Clone, Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Parse and validate configuration.
+    Check {
+        /// Application configuration path.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Print canonical validated configuration with secret references only.
+    Effective {
+        /// Application configuration path.
+        #[arg(long)]
+        config: PathBuf,
     },
 }

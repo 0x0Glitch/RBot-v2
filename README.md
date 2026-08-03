@@ -15,7 +15,15 @@ atomic rename preserve transaction and reorg recovery boundaries.
 ```bash
 make ci
 cargo run -- status
+cargo run -- config check --config config.example.toml
+cargo run -- config effective --config config.example.toml
+cargo run -- doctor --config config.example.toml --protocol-lock protocol-lock.toml
 ```
+
+`run` binds the GET-only health/metrics/operator API to `127.0.0.1:9090` by
+default. It deliberately reports not-ready until dynamic provider, canonical
+catch-up, exact-state and (for Execute) signer gates complete. `alerts-test`
+sends only a typed P2 delivery test; it cannot construct or sign a transaction.
 
 The normative architecture and implementation roadmap live under
 `docs/normative/` and are protected by digest checks.

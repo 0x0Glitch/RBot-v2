@@ -249,5 +249,15 @@ in normative order. Execute remains disabled.
   commit.
 - Revert disposition autonomously refreshes only proven stale/read-disagreement
   failures. Model, gas, dependency, role, liquidity and unknown failures pause.
-- The supervised receipt consumer, operational runtime/API/alerts, full shadow
-  E2E and deployment identities remain pending. Execute remains disabled.
+- Explicit per-vault runtime states and mode-aware readiness gates fail closed;
+  only `Automatic` can begin a transaction and Execute requires protocol,
+  provider, cursor, storage, exact-state, signer and nonce-lane readiness.
+- A bounded fail-fast supervisor, cancellation signal and shutdown deadline own
+  service lifecycles. Health state, all GET-only normative API routes and the
+  complete release-one Prometheus metric-name set are implemented. HTTP tests
+  prove health/metrics reads and reject POST mutations.
+- Typed P0/P1/P2 alerts have bounded history and deterministic deduplication.
+  Real redacted Telegram and PagerDuty transports pass local HTTP delivery
+  tests; neither transport accepts calldata or transaction objects.
+- The supervised chain→state→planner→executor composition, full shadow E2E and
+  deployment identities remain pending. Execute remains disabled.

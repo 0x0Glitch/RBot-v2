@@ -57,6 +57,11 @@
 | 25.2–25.3, 20.1–20.2 | Exact bot-transaction sender/target/calldata and ordered Vault/adapter/Morpho/transfer conformance, isolated from later same-block activity | `src/reconciliation/conformance.rs`, `src/transaction/final_preflight.rs` | allocation/deallocation and corruption fixtures in `tests/reconciliation.rs` | Implemented; supervised consumer pending |
 | 25.4–25.5, 20.3 | Exact current snapshot, adapter/share accounting, current spread/service decision and atomic episode/reconciliation advancement | `src/reconciliation/current_state.rs`, `src/storage/{actor,models}.rs` | JSON terminal-boundary recovery and accounting validation | Core implemented; live state-source integration pending |
 | 25.6 | Conservative revert classification; only stale/read disagreement may autonomously replan | `src/reconciliation/classification.rs` | failure-disposition unit test | Implemented |
+| 26, 21 | Explicit per-vault runtime state graph and mode-aware fail-closed readiness | `src/runtime/{controller,readiness}.rs` | runtime transition/readiness tests in `tests/operations.rs` | Implemented; live service composition pending |
+| 26.4, 21 | Bounded fail-fast supervision and graceful shutdown deadline | `src/runtime/{supervisor,shutdown}.rs` | sibling cancellation test | Implemented |
+| 27.1 | Loopback-default GET-only health, metrics, vault, artifact, transaction and alert API | `src/api/{dto,routes}.rs` | live HTTP test including POST rejection | Implemented |
+| 27.3, 24.4 | Complete bounded-name Prometheus registration with no high-cardinality identifiers | `src/telemetry/metrics.rs` | registry text assertion for every metric name | Implemented; SQLite metric superseded by JSON format metric per SC-001 |
+| 27.4, 24.3 | Typed deduplicated alert history and redacted Telegram/PagerDuty transports | `src/telemetry/{alerts,telegram,pagerduty}.rs` | real local HTTP transport tests | Implemented |
 
 ## Dependency policy notes
 
