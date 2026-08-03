@@ -372,3 +372,34 @@ independent-event persistent-unlock path still gate production Execute.
   cancellation.
   The test fixture and runtime identities are pinned in `deployments/` and are
   not presented as production Morpho deployments.
+- A corrected fixture pinned to source commit `0f5d98f` was deployed separately
+  at Base Sepolia block `45009950`; its vault is
+  `0x65b7e2f06DC16928A4385C8104702475aCa6996E`. The strict JSON Execute
+  configuration, public deployment manifest and seven independently read
+  runtime hashes are retained as `deployments/base-sepolia-v2-*`.
+- The corrected fixture completed four autonomous canonical transactions:
+  initial rate rebalance
+  `0x7a087d9940a37a227f8973d00f5bf78ddfd5d547274420da68fc39fef51551e5`,
+  first 1,500,000-unit deposit deployment
+  `0xe3dfe3a311547a35b9c01666ea8a1559e873752a6e227e393c53b017448274b7`,
+  follow-up rate rebalance
+  `0xf7b277eff711080b72409ad8fcfde8de2df9b19b8c5d0d9beef6d0d70dfeafa5`,
+  and second 1,200,000-unit deposit deployment
+  `0xdc286f17e782dacd71dff1fb480a60468902c320834bd57c899fa9d62ac52bc5`.
+  Every transaction reached canonical receipt conformance, exact post-state
+  reconciliation and service-constraint success. Both capital records set
+  `pending_deployment_resolved=true` and reported zero positive loss.
+- Live deposit testing exposed two cache/lifecycle races that both failed before
+  signing. Final preflight now binds a verified durable idle ledger for the
+  exact same block and exact fresh token balance, with full canonical replay as
+  fallback. Current-state reconciliation now loads the immutable transaction
+  plan class and its exact transaction-bound rate reservation; a later rate
+  episode can no longer be incorrectly confirmed for a capital transaction.
+  Only the cursor-before-topology publication window is retryable; named
+  semantic failures terminate the supervised service.
+- Twenty-five attempts during the second rapid-block test moved their head
+  before the signing gate and were durably marked `aborted_before_signing`.
+  None was signed or broadcast and all reused the still-unconsumed chain nonce.
+  Exact-block durable ledger reuse shortened later attempts without weakening
+  the same-head gate; the eventual capital transaction used nonce `195` and
+  reconciled at block `45010632`.

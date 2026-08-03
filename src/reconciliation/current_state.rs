@@ -44,9 +44,12 @@ pub trait ExactCurrentStateSource: Send + Sync {
 /// Exact current-state source failed closed.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CurrentStateSourceError {
-    /// Exact refresh or independent recalculation failed.
-    #[error("exact current-state source failed")]
-    Failed,
+    /// The acknowledged cursor is visible before its matching topology/state publication.
+    #[error("exact current-state context is not published yet")]
+    ContextNotReady,
+    /// Exact refresh or independent recalculation failed at a non-secret semantic stage.
+    #[error("exact current-state source failed at `{0}`")]
+    FailedAt(&'static str),
 }
 
 /// Canonically hashable current-state reconciliation proof.

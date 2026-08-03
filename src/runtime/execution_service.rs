@@ -26,7 +26,7 @@ use crate::{
         conformance::{
             ConformanceReport, ReceiptReconciliationError, reconcile_confirmed_transaction,
         },
-        current_state::{CurrentStateError, reconcile_current_state},
+        current_state::{CurrentStateError, CurrentStateSourceError, reconcile_current_state},
     },
     runtime::{
         controller::{ControllerError, RuntimeRegistry, RuntimeVaultState},
@@ -213,20 +213,25 @@ where
             let ready = status
                 .as_ref()
                 .is_some_and(|status| status.state.can_start_transaction());
-            let plan_ready = self.api.plan(vault.address).await.is_some_and(|plan| {
+            let plan_reason = self.api.plan(vault.address).await.and_then(|plan| {
                 status
                     .as_ref()
                     .and_then(|status| status.canonical_head)
-                    .is_some_and(|head| plan.snapshot.block == head)
+                    .filter(|head| plan.snapshot.block == *head)
+                    .map(|_| plan.reason)
             });
-            if ready && plan_ready {
-                self.execute(vault.address).await?;
+            if ready && let Some(reason) = plan_reason {
+                self.execute(vault.address, reason).await?;
             }
         }
         Ok(())
     }
 
-    async fn execute(&self, vault_address: VaultAddress) -> Result<(), ExecutionServiceError> {
+    async fn execute(
+        &self,
+        vault_address: VaultAddress,
+        reason: PlanReason,
+    ) -> Result<(), ExecutionServiceError> {
         let vault = self
             .config
             .app
@@ -252,6 +257,7 @@ where
         let source = LiveRatePreflightSource::new(
             Arc::clone(&self.config),
             vault.address,
+            reason,
             self.identities.clone(),
             Arc::clone(&self.provider),
             self.storage.clone(),
@@ -410,7 +416,9 @@ where
                     // The chain cursor is committed before the state owner publishes the
                     // matching exact topology/snapshot checkpoint. That normal bounded race is
                     // retried on the next controller tick; no lifecycle state is advanced.
-                    Err(CurrentStateError::Source(_)) => return Ok(()),
+                    Err(CurrentStateError::Source(CurrentStateSourceError::ContextNotReady)) => {
+                        return Ok(());
+                    }
                     Err(error) => return Err(error.into()),
                 }
                 self.runtime

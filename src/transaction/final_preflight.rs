@@ -231,6 +231,9 @@ pub enum PreflightSourceError {
     /// Exact refresh or plan construction failed.
     #[error("exact preflight source failed")]
     Failed,
+    /// Exact refresh or plan construction failed at a non-secret semantic stage.
+    #[error("exact preflight source failed at `{0}`")]
+    FailedAt(&'static str),
 }
 
 /// One-head final preflight or submission failure.

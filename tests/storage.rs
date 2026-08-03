@@ -240,6 +240,12 @@ async fn rate_movement_and_nonce_are_reserved_and_released_atomically()
     let handle = service.handle();
     let snapshot = sample_snapshot();
     handle.persist_snapshot(snapshot.clone(), 100).await?;
+    assert_eq!(
+        handle
+            .load_exact_snapshot(VaultAddress(snapshot.parent.vault), snapshot.context.block,)
+            .await?,
+        Some(snapshot.clone())
+    );
     let mut episode = rate_episode(vault, snapshot.context.block, 0x41);
     episode.confirm_short(snapshot.context.block)?;
     handle.persist_rate_episode(episode.clone(), 101).await?;
@@ -526,7 +532,19 @@ async fn transaction_boundaries_recover_after_every_reopen()
     let signer = Address::with_last_byte(0x55);
 
     let service = reopen(&path).await?;
-    service.handle().reserve_nonce(reservation(signer)).await?;
+    let snapshot = sample_snapshot();
+    service
+        .handle()
+        .persist_snapshot(snapshot.clone(), 1_800_000_000)
+        .await?;
+    let plan = sample_plan(&snapshot);
+    service
+        .handle()
+        .persist_plan(plan.clone(), 1_800_000_000)
+        .await?;
+    let mut nonce_reservation = reservation(signer);
+    nonce_reservation.plan_id = Some(plan.plan_id);
+    service.handle().reserve_nonce(nonce_reservation).await?;
     service.shutdown().await?;
     assert_recovered(&path, signer, TransactionState::NonceReserved).await?;
 
@@ -604,6 +622,17 @@ async fn transaction_boundaries_recover_after_every_reopen()
             .map(|record| record.report_hash),
         Some(B256::repeat_byte(0xc1))
     );
+    let reconciliation_context = service
+        .handle()
+        .load_pending_reconciliation_context(TransactionId(B256::repeat_byte(0x71)))
+        .await?
+        .ok_or("capital transaction omitted reconciliation context")?;
+    assert_eq!(
+        reconciliation_context.plan_reason,
+        PlanReason::CapitalDeployment
+    );
+    assert!(reconciliation_context.rate_movement.is_none());
+    assert!(reconciliation_context.rate_episode.is_none());
     service.shutdown().await?;
     assert_recovered(&path, signer, TransactionState::ConformanceValidated).await?;
 

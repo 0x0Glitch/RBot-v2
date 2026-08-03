@@ -23,10 +23,10 @@ use super::{
     StorageError,
     models::{
         CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
-        FinalPreflightRecord, NonceReservation, PendingConformance, PersistedTopology,
-        RateMovementReservationRecord, RateMovementReservationState, ReconciliationRecord,
-        RewindResult, SignedAttemptRecord, SignedTransactionRecord, TransactionAttemptKind,
-        TransactionState, TransactionTransition, UnresolvedTransaction,
+        FinalPreflightRecord, NonceReservation, PendingConformance, PendingReconciliationContext,
+        PersistedTopology, RateMovementReservationRecord, RateMovementReservationState,
+        ReconciliationRecord, RewindResult, SignedAttemptRecord, SignedTransactionRecord,
+        TransactionAttemptKind, TransactionState, TransactionTransition, UnresolvedTransaction,
     },
 };
 
@@ -375,6 +375,22 @@ pub enum StorageCommand {
         transaction_id: crate::domain::TransactionId,
         /// Pending conformance data.
         reply: oneshot::Sender<Result<Option<PendingConformance>, StorageError>>,
+    },
+    /// Load the immutable plan class and exact transaction-bound rate context for reconciliation.
+    LoadPendingReconciliationContext {
+        /// Stable transaction identity.
+        transaction_id: crate::domain::TransactionId,
+        /// Reconciliation context.
+        reply: oneshot::Sender<Result<Option<PendingReconciliationContext>, StorageError>>,
+    },
+    /// Load one exact snapshot for a vault and complete canonical block identity.
+    LoadExactSnapshot {
+        /// Parent vault.
+        vault: VaultAddress,
+        /// Exact canonical block.
+        block: BlockRef,
+        /// Snapshot result.
+        reply: oneshot::Sender<Result<Option<ExactVaultSnapshot>, StorageError>>,
     },
     /// Load the unique unresolved signer row.
     LoadUnresolved {
@@ -763,6 +779,32 @@ impl StorageHandle {
         .await
     }
 
+    /// Loads the exact plan class and optional rate reservation for post-state reconciliation.
+    pub async fn load_pending_reconciliation_context(
+        &self,
+        transaction_id: crate::domain::TransactionId,
+    ) -> Result<Option<PendingReconciliationContext>, StorageError> {
+        self.request(|reply| StorageCommand::LoadPendingReconciliationContext {
+            transaction_id,
+            reply,
+        })
+        .await
+    }
+
+    /// Loads a snapshot bound to the exact canonical block, preferring verified idle evidence.
+    pub async fn load_exact_snapshot(
+        &self,
+        vault: VaultAddress,
+        block: BlockRef,
+    ) -> Result<Option<ExactVaultSnapshot>, StorageError> {
+        self.request(|reply| StorageCommand::LoadExactSnapshot {
+            vault,
+            block,
+            reply,
+        })
+        .await
+    }
+
     /// Loads complete canonical receipts for one block in transaction order.
     pub async fn load_canonical_receipts(
         &self,
@@ -1127,6 +1169,37 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                 reply,
             } => {
                 let _ = reply.send(load_pending_conformance(&store.state, transaction_id));
+            }
+            StorageCommand::LoadPendingReconciliationContext {
+                transaction_id,
+                reply,
+            } => {
+                let _ = reply.send(load_pending_reconciliation_context(
+                    &store.state,
+                    transaction_id,
+                ));
+            }
+            StorageCommand::LoadExactSnapshot {
+                vault,
+                block,
+                reply,
+            } => {
+                let matching = store
+                    .state
+                    .exact_snapshots
+                    .iter()
+                    .rev()
+                    .filter(|entry| {
+                        entry.snapshot.parent.vault == vault.0
+                            && entry.snapshot.context.block == block
+                    })
+                    .collect::<Vec<_>>();
+                let snapshot = matching
+                    .iter()
+                    .find(|entry| entry.snapshot.idle_locks.verified)
+                    .or_else(|| matching.first())
+                    .map(|entry| entry.snapshot.clone());
+                let _ = reply.send(Ok(snapshot));
             }
             StorageCommand::LoadUnresolved { signer, reply } => {
                 let _ = reply.send(load_unresolved(&store.state, signer));
@@ -1997,6 +2070,71 @@ fn load_pending_conformance(
         snapshot,
         plan,
         expected_actions: preflight.expected_actions.clone(),
+    }))
+}
+
+fn load_pending_reconciliation_context(
+    state: &JsonState,
+    transaction_id: crate::domain::TransactionId,
+) -> Result<Option<PendingReconciliationContext>, StorageError> {
+    let Some(row) = state
+        .transactions
+        .iter()
+        .find(|row| row.reservation.transaction_id == transaction_id)
+    else {
+        return Ok(None);
+    };
+    if row.state != TransactionState::ConformanceValidated {
+        return Ok(None);
+    }
+    let plan_id = row
+        .reservation
+        .plan_id
+        .ok_or(StorageError::Invariant("routine transaction has no plan"))?;
+    let plan = state
+        .plans
+        .iter()
+        .find(|entry| entry.plan.plan_id == plan_id)
+        .map(|entry| &entry.plan)
+        .ok_or(StorageError::Invariant(
+            "conformance-validated transaction has no durable plan",
+        ))?;
+    let movements = state
+        .rate_movement_reservations
+        .iter()
+        .filter(|reservation| {
+            reservation.transaction_id == transaction_id
+                && reservation.state == RateMovementReservationState::Pending
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if movements.len() > 1 {
+        return Err(StorageError::Invariant(
+            "transaction owns multiple pending rate movements",
+        ));
+    }
+    let rate_movement = movements.into_iter().next();
+    let rate_episode = rate_movement
+        .as_ref()
+        .map(|reservation| {
+            state
+                .rate_episodes
+                .iter()
+                .find(|entry| entry.episode.episode_id == reservation.episode_id)
+                .map(|entry| entry.episode.clone())
+                .ok_or(StorageError::Invariant("reserved rate episode disappeared"))
+        })
+        .transpose()?;
+    let rate_plan = plan.reason == crate::domain::PlanReason::RateRebalance;
+    if rate_plan != rate_movement.is_some() || rate_movement.is_some() != rate_episode.is_some() {
+        return Err(StorageError::Invariant(
+            "reconciliation plan and rate movement disagree",
+        ));
+    }
+    Ok(Some(PendingReconciliationContext {
+        plan_reason: plan.reason,
+        rate_movement,
+        rate_episode,
     }))
 }
 

@@ -4,8 +4,10 @@ use alloy::primitives::{Address, B256, Bytes, I256, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    AdapterAddress, BlockRef, EpisodeId, MarketId, PlanId, PositionKey, TransactionId, VaultAddress,
+    AdapterAddress, BlockRef, EpisodeId, MarketId, PlanId, PlanReason, PositionKey, TransactionId,
+    VaultAddress,
 };
+use crate::planner::episodes::RateSignalEpisode;
 use crate::state::topology::TopologyIndex;
 
 /// One durable topology revision and the exact canonical block it covers.
@@ -147,6 +149,17 @@ pub struct PendingConformance {
     pub plan: crate::domain::V2Plan,
     /// Exact ordered simulator effects retained before signing.
     pub expected_actions: Vec<ExpectedActionRecord>,
+}
+
+/// Exact durable context required to reconcile a conformance-validated transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingReconciliationContext {
+    /// Semantic class of the transaction's immutable plan.
+    pub plan_reason: PlanReason,
+    /// Transaction-bound rate movement, present only for a rate reallocation.
+    pub rate_movement: Option<RateMovementReservationRecord>,
+    /// Exact episode owned by `rate_movement`, present as the same pair.
+    pub rate_episode: Option<RateSignalEpisode>,
 }
 
 /// Exact current-state reconciliation result written atomically with terminal advancement.
