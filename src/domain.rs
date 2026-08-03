@@ -182,6 +182,70 @@ pub fn derive_position_key(adapter: AdapterAddress, params: &MarketParams) -> Po
     PositionKey(alloy::primitives::keccak256(input))
 }
 
+/// Canonical direct-adapter data validation failure.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AdapterDataError {
+    /// Solidity ABI decoding failed.
+    #[error("adapter data is not an ABI-encoded MarketParams struct")]
+    Decode,
+    /// Re-encoding does not reproduce the complete original byte string.
+    #[error("adapter data contains noncanonical or trailing bytes")]
+    NonCanonical,
+    /// Derived market ID differs from the configured market ID.
+    #[error("adapter data market ID mismatch")]
+    MarketIdMismatch,
+    /// Market loan token differs from the parent vault asset.
+    #[error("adapter data loan token differs from vault asset")]
+    LoanTokenMismatch,
+    /// Market IRM differs from the adapter immutable Adaptive Curve IRM.
+    #[error("adapter data IRM differs from adapter immutable")]
+    IrmMismatch,
+}
+
+/// Encodes exact direct-adapter data as `abi.encode(MarketParams)`.
+#[must_use]
+pub fn encode_adapter_data(params: &MarketParams) -> Bytes {
+    MarketParamsSol {
+        loanToken: params.loan_token,
+        collateralToken: params.collateral_token,
+        oracle: params.oracle,
+        irm: params.irm,
+        lltv: params.lltv,
+    }
+    .abi_encode()
+    .into()
+}
+
+/// Fully decodes and validates canonical direct-adapter market data.
+pub fn decode_adapter_data(
+    data: &Bytes,
+    configured_market_id: MarketId,
+    vault_asset: Address,
+    adaptive_curve_irm: Address,
+) -> Result<MarketParams, AdapterDataError> {
+    let decoded = MarketParamsSol::abi_decode(data).map_err(|_| AdapterDataError::Decode)?;
+    if decoded.abi_encode().as_slice() != data.as_ref() {
+        return Err(AdapterDataError::NonCanonical);
+    }
+    let params = MarketParams {
+        loan_token: decoded.loanToken,
+        collateral_token: decoded.collateralToken,
+        oracle: decoded.oracle,
+        irm: decoded.irm,
+        lltv: decoded.lltv,
+    };
+    if derive_market_id(&params) != configured_market_id {
+        return Err(AdapterDataError::MarketIdMismatch);
+    }
+    if params.loan_token != vault_asset {
+        return Err(AdapterDataError::LoanTokenMismatch);
+    }
+    if params.irm != adaptive_curve_irm {
+        return Err(AdapterDataError::IrmMismatch);
+    }
+    Ok(params)
+}
+
 /// Configured movement mode for a direct market position.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -397,28 +461,150 @@ pub struct CapState {
     pub recorded_allocation: U256,
 }
 
-/// Decoded planning-relevant effect of a pending administration call.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Cap dimension changed by a pending operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum CapKind {
+    /// Absolute asset-denominated cap.
+    Absolute,
+    /// Relative WAD-denominated cap.
+    Relative,
+}
+
+/// Vault V2 gate changed by a pending operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    /// Receive-shares gate.
+    ReceiveShares,
+    /// Send-shares gate.
+    SendShares,
+    /// Receive-assets gate.
+    ReceiveAssets,
+    /// Send-assets gate.
+    SendAssets,
+}
+
+/// Vault V2 fee changed by a pending operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeKind {
+    /// Performance fee.
+    Performance,
+    /// Management fee.
+    Management,
+}
+
+/// Decoded planning-relevant effect of exact pending administration calldata.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AdminEffect {
-    /// Cap configuration may change.
-    CapChange,
-    /// Adapter membership may change.
-    AdapterMembership,
-    /// Allocator membership may change.
-    AllocatorMembership,
-    /// Gate configuration may change.
-    GateChange,
-    /// Liquidity adapter may change.
-    LiquidityAdapterChange,
-    /// Parent max rate may change.
-    MaxRateChange,
-    /// Fee configuration may change.
-    FeeChange,
-    /// Force-deallocation penalty may change.
-    ForceDeallocationPenaltyChange,
-    /// Adapter burn-shares or timelock may change.
-    AdapterAccountingChange,
+    /// Cap value will change after the delay.
+    CapChange {
+        /// Cap dimension.
+        cap_kind: CapKind,
+        /// Whether this is the permissionless decrease path or delayed increase path.
+        increase: bool,
+        /// Canonical cap ID data.
+        id_data: Bytes,
+        /// New cap value.
+        new_value: U256,
+    },
+    /// Adapter membership will change.
+    AdapterMembership {
+        /// Adapter address.
+        adapter: Address,
+        /// New membership value.
+        enabled: bool,
+    },
+    /// Allocator membership will change.
+    AllocatorMembership {
+        /// Allocator address.
+        account: Address,
+        /// New role value.
+        enabled: bool,
+    },
+    /// Sentinel membership will change.
+    SentinelMembership {
+        /// Sentinel address.
+        account: Address,
+        /// New role value.
+        enabled: bool,
+    },
+    /// One gate address will change.
+    GateChange {
+        /// Gate dimension.
+        gate_kind: GateKind,
+        /// New gate address.
+        gate: Address,
+    },
+    /// Adapter registry will change.
+    AdapterRegistryChange {
+        /// New registry address.
+        registry: Address,
+    },
+    /// Liquidity adapter and canonical data will change.
+    LiquidityAdapterChange {
+        /// New adapter address.
+        adapter: Address,
+        /// New adapter data.
+        data: Bytes,
+    },
+    /// Parent max rate will change.
+    MaxRateChange {
+        /// New rate in the contract's exact fixed-point unit.
+        max_rate: U256,
+    },
+    /// Fee value will change.
+    FeeChange {
+        /// Fee dimension.
+        fee_kind: FeeKind,
+        /// New fee WAD.
+        new_fee: U256,
+    },
+    /// Fee recipient will change.
+    FeeRecipientChange {
+        /// Fee dimension.
+        fee_kind: FeeKind,
+        /// New recipient.
+        recipient: Address,
+    },
+    /// Force-deallocation penalty will change.
+    ForceDeallocationPenaltyChange {
+        /// Adapter address.
+        adapter: Address,
+        /// New penalty value.
+        penalty: U256,
+    },
+    /// Adapter tracked shares will be irreversibly burned.
+    AdapterBurnShares {
+        /// Morpho market ID.
+        market_id: MarketId,
+    },
+    /// Adapter skim recipient will change.
+    AdapterSkimRecipientChange {
+        /// New skim recipient.
+        recipient: Address,
+    },
+    /// Timelock duration will change.
+    TimelockChange {
+        /// Affected function selector.
+        selector: [u8; 4],
+        /// New duration in seconds.
+        duration: U256,
+        /// Whether the duration increases.
+        increase: bool,
+    },
+    /// Timelock execution for a selector will be permanently abdicated.
+    Abdicate {
+        /// Affected selector.
+        selector: [u8; 4],
+    },
+    /// Curator address will change.
+    CuratorChange {
+        /// New curator.
+        curator: Address,
+    },
     /// Unknown effect retained fail-closed.
     Unknown,
 }

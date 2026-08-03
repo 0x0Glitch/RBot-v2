@@ -14,6 +14,11 @@
 | 8.4–8.7 | Normative durable schema and immutable checksums | `migrations/0001_initial.sql` through `0003_idle_lock_ledger.sql` | checksum script, migration/reopen tests | Implemented |
 | 8.8, 23.2–23.4 | Acknowledged critical writes, nonce lane and recovery transitions | `src/storage/models.rs`, `src/storage/queries.rs` | boundary reopen and invalid-transition tests | Implemented |
 | 8.9 | Online backup, fsync and atomic rename | `src/storage/backup.rs` | backup restore test | Implemented |
+| 7.2–7.3 | Checked-in minimal official ABIs and generated selectors | `abi/*.sol`, `src/contracts/bindings.rs`, `src/contracts/selectors.rs` | selector/signature tests | Implemented |
+| 7.4 | Canonical full-consumption adapter data validation | `src/domain.rs` | adapter data rejection matrix | Implemented |
+| 7.1, 11.1 | Runtime bytecode identity and watched-address categories | `src/contracts/code_identity.rs`, `src/chain/logs.rs` | runtime mismatch tests | Implemented; dynamic RPC checks later |
+| 11.2–11.4 | Strict watched event decoding, invalidations and transaction attribution | `src/chain/logs.rs` | 53 official event fixtures plus malformed/unknown tests | Implemented |
+| 11.5–11.6 | Exact pending calldata effect decoder | `src/state/pending_admin.rs` | cap/gate/adapter/unknown tests | Decoder implemented; durable index in milestone 5 |
 
 ## Dependency policy notes
 
@@ -22,3 +27,10 @@
   reported vulnerability or compatible upstream release removing it, so
   `cargo-deny` carries only that narrow exception until the normative Alloy pin
   is reviewed.
+
+## Pinned interface note
+
+- The implementation uses the exact `Caps` layout at Vault V2 commit
+  `b1e9005c5d7a1c99eaa909dde02a365886faac07`: `allocation` is `uint256` and
+  precedes the two `uint128` cap fields. Section 7.2 explicitly directs the
+  pinned interface to supersede its illustrative layout when they differ.

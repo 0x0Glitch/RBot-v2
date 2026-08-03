@@ -38,3 +38,18 @@ Pending in normative order. Execute remains disabled.
 - Reopen tests cover every implemented transaction durability boundary.
 - `make ci` passes with 31 positive/property tests and 6 compile-fail cases.
 - Migration and backup CLI smoke tests pass on a fresh database.
+
+## Milestone 3 — Bindings And Events
+
+- Eight minimal Solidity interfaces are checked in and compiled through Alloy `sol!`.
+- Vault V2 routine selector allowlist is generated from bindings and proven
+  against Solidity signature hashes.
+- All 53 watched Vault V2, direct adapter, Morpho, IRM and ERC-20 event fixtures
+  strictly decode and re-encode; malformed, unknown and trailing data fail safely.
+- Events produce typed exact-state invalidations only; no event-derived balance
+  enters authoritative state.
+- Transaction-level origin classification, exact watched-address categories,
+  runtime code-hash checking and typed pending-admin effect decoding are implemented.
+- Canonical direct-adapter data validates full consumption, re-encoding, market
+  ID, loan token and immutable IRM.
+- `make ci` passes with 40 positive/property/event tests and 6 compile-fail cases.

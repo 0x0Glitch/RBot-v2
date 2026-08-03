@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use alloy::primitives::Bytes;
+use morpho_v2_reallocator::contracts::code_identity::{CodeIdentityError, verify_runtime_code};
 use morpho_v2_reallocator::protocol_lock::{
     ContractIdentity, IdentityKind, ProtocolLock, ProtocolLockError, ProxyPolicy,
     RemoteSignerIdentity,
@@ -99,4 +101,28 @@ fn unpinned_commit_and_zero_runtime_hash_fail_closed() {
         Err(error) => error,
     };
     assert_eq!(validation_field(error), "contract.runtime_code_hash");
+}
+
+#[test]
+fn runtime_bytecode_must_match_the_locked_hash() {
+    let runtime = Bytes::from_static(&[0x60, 0x00, 0x60, 0x00]);
+    let mut lock = valid_lock();
+    lock.contract[0].runtime_code_hash = alloy::primitives::keccak256(&runtime).to_string();
+    let validated = match lock.validate() {
+        Ok(lock) => lock,
+        Err(error) => panic!("test lock must validate: {error}"),
+    };
+    let identity = match validated.contracts.iter().find(|item| item.name == "vault") {
+        Some(identity) => identity,
+        None => panic!("vault identity missing"),
+    };
+    assert_eq!(verify_runtime_code(identity, &runtime), Ok(()));
+    assert!(matches!(
+        verify_runtime_code(identity, &Bytes::new()),
+        Err(CodeIdentityError::EmptyCode { .. })
+    ));
+    assert!(matches!(
+        verify_runtime_code(identity, &Bytes::from_static(&[0x60, 0x01])),
+        Err(CodeIdentityError::HashMismatch { .. })
+    ));
 }
