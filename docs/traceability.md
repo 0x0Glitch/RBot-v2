@@ -32,6 +32,11 @@
 | 15.5 | Exact direct-adapter cap ID data and Vault V2 cap admission | `src/state/caps.rs` | pinned ID formula and cap-bound tests | Implemented |
 | 15.6–15.10, 17.6–17.9 | Pending administration, strict gates, parent/market seeding, liquidity path and reward readiness | `src/state/topology.rs`, `src/state/capability.rs`, `src/state/snapshot.rs` | full snapshot and capability tests | Implemented |
 | 8.4, 10.5, 15.1 | Recurring topology revisions and atomic reorg restoration | `migrations/0004_topology_history.sql`, `src/storage/queries.rs` | recurrence/rewind integration test | Implemented |
+| 13.1–13.2 | Checked fixed-point helpers and pinned Morpho virtual-share conversions | `src/morpho/blue_math.rs` | property/boundary suite and deployed Solidity differential harness | Implemented |
+| 13.3–13.4 | Exact Morpho accrual, fee-share mint and Adaptive Curve average/ending/spot rates | `src/morpho/fees.rs`, `src/morpho/adaptive_curve.rs` | below/at/above-target and elapsed-time Solidity differential vectors | Implemented |
+| 13.5 | Vault V2 max-rate growth, loss realization and gated performance/management fee shares | `src/morpho/vault_v2.rs` | deployed Solidity differential plus loss/gate regression tests | Implemented |
+| 13.6–13.8 | Internal-share expected assets and direct-adapter allocation/deallocation transitions | `src/morpho/market_adapter.rs` | deployed Solidity differential, signed catch-up and liquidity tests | Implemented |
+| 13.9 | Exact cross-language protocol-math comparison | `tests/fixtures/protocol_math`, `tests/math_differential.rs` | test compiles/deploys the source-locked harness to Anvil and requires unit equality | Implemented |
 
 ## Dependency policy notes
 

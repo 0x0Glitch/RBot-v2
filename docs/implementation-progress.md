@@ -99,3 +99,23 @@ Pending in normative order. Execute remains disabled.
   same canonical hash; partial returns and malformed identities are rejected.
 - `make ci` passes with 58 positive/property/integration tests and six
   compile-fail semantic-boundary cases.
+
+## Milestone 6 — Exact Protocol Math
+
+- Checked fixed-point helpers preserve the pinned Solidity overflow behavior,
+  rounding directions, Morpho virtual assets/shares and Taylor compounding.
+- Adaptive Curve projection reproduces signed toward-zero math, the pinned
+  exponential approximation, target-rate bounds, elapsed-period average rate
+  and separate immediate spot rate without floating point.
+- Morpho accrual follows contract order through interest, uint128 bounds and
+  fee-share minting. Parent accrual reproduces max-rate distribution, losses,
+  fee-recipient gates and both Vault V2 fee-share calculations.
+- Direct-adapter transitions use only internal shares, enforce the source share
+  price check and both accounting/token withdrawal liquidity constraints, and
+  calculate signed cap catch-up against the recorded pre-action allocation.
+- The differential test compiles a source-locked Solidity harness, deploys it
+  to Anvil, and requires exact equality for share, IRM, market, parent and
+  adapter vectors. Boundary and property tests cover rounding, loss, gates,
+  signed catch-up and fail-closed arithmetic.
+- `make ci` passes with 63 positive/property/integration/differential tests and
+  six compile-fail semantic-boundary cases.

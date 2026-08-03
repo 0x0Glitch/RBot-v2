@@ -7,4 +7,5 @@
 *.sqlite3
 *.bak
 .DS_Store
-
+/tests/fixtures/protocol_math/cache/
+/tests/fixtures/protocol_math/out/
