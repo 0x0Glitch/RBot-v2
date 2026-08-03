@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/requested_vs_recorded.rs:7:21
+  |
+7 |     update_recorded(RequestedAssets(U256::from(1)));
+  |     --------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `RecordedAllocation`, found `RequestedAssets`
+  |     |
+  |     arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/requested_vs_recorded.rs:4:4
+  |
+4 | fn update_recorded(_: RecordedAllocation) {}
+  |    ^^^^^^^^^^^^^^^ ---------------------

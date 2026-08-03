@@ -1,6 +1,7 @@
 //! Command-line interface.
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 /// Morpho Vault V2 direct-adapter reallocator.
 #[derive(Debug, Parser)]
@@ -12,8 +13,23 @@ pub struct Cli {
 }
 
 /// Supported bootstrap commands. Write commands are introduced only after the firewall milestone.
-#[derive(Clone, Copy, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum Command {
     /// Print build identity and fail-closed Execute readiness.
     Status,
+    /// Parse and statically validate a protocol identity lock.
+    ProtocolLockCheck {
+        /// Protocol lock path.
+        #[arg(long, default_value = "protocol-lock.toml")]
+        file: PathBuf,
+    },
+    /// Validate static configuration and protocol lock before dynamic RPC checks.
+    Doctor {
+        /// Application configuration path.
+        #[arg(long)]
+        config: PathBuf,
+        /// Protocol lock path.
+        #[arg(long, default_value = "protocol-lock.toml")]
+        protocol_lock: PathBuf,
+    },
 }

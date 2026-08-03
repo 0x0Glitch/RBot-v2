@@ -11,6 +11,10 @@ provided and verified:
 - fee, confirmation, reconciliation and operational alert configuration;
 - fork RPC credentials for deployment-specific differential and integration tests.
 
+The checked-in `protocol-lock.toml` pins the official source commits observed on
+2026-08-03, while all deployment-specific address, bytecode, compiler, optimizer,
+immutable and signer identity values remain visibly `UNSET`. Static validation
+rejects the template until they are supplied; no placeholder can enable Execute.
+
 Local deterministic fixtures will substitute for these values in tests. Missing
 or mismatched production values disable only Execute capability.
-

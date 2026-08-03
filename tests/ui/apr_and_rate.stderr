@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/ui/apr_and_rate.rs:5:33
+  |
+5 |     let _invalid = AprBps(30) < RatePerSecond(U256::from(1));
+  |                    ----------   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `AprBps`, found `RatePerSecond`
+  |                    |
+  |                    expected because this is `AprBps`

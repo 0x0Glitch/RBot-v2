@@ -1,0 +1,116 @@
+schema_version = 1
+chain_id = 999
+
+# Official source commits are pinned. Address, runtime hash, compiler, optimizer,
+# and immutable values remain explicit UNSET deployment inputs; this checked-in
+# template therefore cannot pass Execute readiness.
+[[contract]]
+name = "vault-v2"
+kind = "vault_v2"
+address = "UNSET"
+runtime_code_hash = "UNSET"
+repository = "https://github.com/morpho-org/vault-v2"
+git_commit = "b1e9005c5d7a1c99eaa909dde02a365886faac07"
+source_path = "src/VaultV2.sol"
+compiler_version = "UNSET"
+optimizer_enabled = true
+optimizer_runs = 0
+constructor_immutables = {}
+proxy_policy = "reject_proxy"
+behavior_profile = "vault-v2-direct-adapter-release-one"
+
+[[contract]]
+name = "morpho-blue"
+kind = "morpho_singleton"
+address = "UNSET"
+runtime_code_hash = "UNSET"
+repository = "https://github.com/morpho-org/morpho-blue"
+git_commit = "d09dd1c4b9c7d9d05f976faa7ebfdc424dae5e8c"
+source_path = "src/Morpho.sol"
+compiler_version = "UNSET"
+optimizer_enabled = true
+optimizer_runs = 0
+constructor_immutables = {}
+proxy_policy = "reject_proxy"
+behavior_profile = "morpho-blue-release-one"
+
+[[contract]]
+name = "adaptive-curve-irm"
+kind = "adaptive_curve_irm"
+address = "UNSET"
+runtime_code_hash = "UNSET"
+repository = "https://github.com/morpho-org/morpho-blue-irm"
+git_commit = "a1a87fd5a7ee13873ea9d2bbd87e9c7b2cdbbef3"
+source_path = "src/adaptive-curve-irm/AdaptiveCurveIrm.sol"
+compiler_version = "UNSET"
+optimizer_enabled = true
+optimizer_runs = 0
+constructor_immutables = {}
+proxy_policy = "reject_proxy"
+behavior_profile = "adaptive-curve-irm-release-one"
+
+[[contract]]
+name = "direct-adapter-0"
+kind = "direct_adapter"
+address = "UNSET"
+runtime_code_hash = "UNSET"
+repository = "https://github.com/morpho-org/vault-v2"
+git_commit = "b1e9005c5d7a1c99eaa909dde02a365886faac07"
+source_path = "src/adapters/MorphoMarketV1AdapterV2.sol"
+compiler_version = "UNSET"
+optimizer_enabled = true
+optimizer_runs = 0
+constructor_immutables = { parentVault = "UNSET", morpho = "UNSET", adaptiveCurveIrm = "UNSET" }
+proxy_policy = "reject_proxy"
+behavior_profile = "morpho-market-v1-adapter-v2-direct"
+
+[[contract]]
+name = "multicall3"
+kind = "multicall3"
+address = "UNSET"
+runtime_code_hash = "UNSET"
+repository = "https://github.com/mds1/multicall"
+git_commit = "b667d67ecfa5361a81e8f110234ce242613b0012"
+source_path = "src/Multicall3.sol"
+compiler_version = "UNSET"
+optimizer_enabled = true
+optimizer_runs = 0
+constructor_immutables = {}
+proxy_policy = "reject_proxy"
+behavior_profile = "multicall3-aggregate3"
+
+[[contract]]
+name = "vault-asset"
+kind = "asset_token"
+address = "UNSET"
+runtime_code_hash = "UNSET"
+repository = "https://github.com/morpho-org/vault-v2"
+git_commit = "b1e9005c5d7a1c99eaa909dde02a365886faac07"
+source_path = "deployment-specific"
+compiler_version = "UNSET"
+optimizer_enabled = true
+optimizer_runs = 0
+constructor_immutables = {}
+proxy_policy = "reject_proxy"
+behavior_profile = "erc20-vault-asset"
+
+[[contract]]
+name = "adapter-registry"
+kind = "adapter_registry"
+address = "UNSET"
+runtime_code_hash = "UNSET"
+repository = "https://github.com/morpho-org/vault-v2"
+git_commit = "b1e9005c5d7a1c99eaa909dde02a365886faac07"
+source_path = "deployment-specific"
+compiler_version = "UNSET"
+optimizer_enabled = true
+optimizer_runs = 0
+constructor_immutables = {}
+proxy_policy = "reject_proxy"
+behavior_profile = "vault-v2-adapter-registry"
+
+[remote_signer]
+service_identity = "UNSET"
+client_identity_env = "MORPHO_V2_SIGNER_CLIENT_IDENTITY"
+authentication_secret_env = "MORPHO_V2_SIGNER_AUTH_SECRET"
+

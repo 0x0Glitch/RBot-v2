@@ -1,0 +1,17 @@
+error[E0369]: cannot add `Shares` to `Assets`
+ --> tests/ui/assets_and_shares.rs:5:42
+  |
+5 |     let _invalid = Assets(U256::from(1)) + Shares(U256::from(1));
+  |                    --------------------- ^ --------------------- Shares
+  |                    |
+  |                    Assets
+  |
+note: `Assets` does not implement `Add<Shares>`
+ --> src/domain.rs
+  |
+  |         pub struct $name(pub $inner);
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Assets` is defined in another crate
+...
+  | id_newtype!(Assets, U256);
+  | ------------------------- in this macro invocation
+  = note: this error originates in the macro `id_newtype` (in Nightly builds, run with -Z macro-backtrace for more info)

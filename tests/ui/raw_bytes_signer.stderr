@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/raw_bytes_signer.rs:8:10
+  |
+8 |     sign(&Bytes::new());
+  |     ---- ^^^^^^^^^^^^^ expected `&ValidatedSignerPayload`, found `&Bytes`
+  |     |
+  |     arguments to this function are incorrect
+  |
+  = note: expected reference `&ValidatedSignerPayload`
+             found reference `&alloy::alloy_primitives::Bytes`
+note: function defined here
+ --> tests/ui/raw_bytes_signer.rs:5:4
+  |
+5 | fn sign(_: &ValidatedSignerPayload) {}
+  |    ^^^^ --------------------------
