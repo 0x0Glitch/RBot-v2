@@ -173,6 +173,10 @@ remain before production Execute can be enabled.
   immediate budget that cannot be rearmed. Complete episode JSON is stored by
   the single-writer actor, one active vault/group row is enforced, and canonical
   rewind discards episode state requiring replay.
+- Live short confirmation now persists every exact direct-parent observation;
+  skipped blocks or a parent mismatch terminate the episode instead of allowing
+  elapsed height alone to authorize a plan. Entry/exit position relevance uses
+  the configured hysteresis thresholds.
 - Terminal-value comparison projects Morpho, Adaptive Curve, adapter internal
   shares, parent max-rate and fee-share dilution to one benefit horizon.
   Release-one accepts exactly zero rewards only under live reviewed evidence or
@@ -277,7 +281,13 @@ remain before production Execute can be enabled.
   live state owner is exercised inside the signed Anvil E2E.
 - Idle-lock attribution is deliberately unverified in the live service until its
   receipt-origin consumer is composed, so Execute cannot become ready or invoke
-  a signer. Live planner/executor/receipt-reconciliation composition remains.
+  a signer whenever nonzero idle cannot be classified. Exact zero idle safely
+  proves an empty lock balance.
+- Observe publishes no plans. Shadow and fail-closed Execute operation now own
+  durable rate detection, consecutive short confirmation, bounded exact solving,
+  semantic-plan hashing, independent firewall validation, JSON persistence and
+  `/plan` publication. Persistent independent-event unlocking, live execution
+  and receipt-reconciliation consumers remain.
 
 ## Milestone 12 — Hardening (In Progress)
 
@@ -297,5 +307,7 @@ remain before production Execute can be enabled.
   its exact spot-rate spread improves from `20833333333` to `18065268066`
   per-second WAD units. A later cap event forces an exact refreshed cap value;
   adapter removal hard-pauses projection, and re-addition restores capability
-  and produces a fresh improving plan. Base Sepolia remains blocked on the live
-  planning/execution owner and deployment-specific protocol identities.
+  and produces a fresh improving plan. The supervised state owner then confirms
+  a new live episode on the next direct-parent block and publishes a durable,
+  firewalled improving Shadow plan. Base Sepolia remains blocked on the live
+  execution owner and deployment-specific protocol identities.

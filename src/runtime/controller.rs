@@ -218,6 +218,21 @@ impl VaultRuntimeStatus {
             .ok_or(ControllerError::RevisionOverflow)?;
         Ok(())
     }
+
+    /// Replaces planner artifacts without changing the automation state.
+    pub fn record_planning(
+        &mut self,
+        plan_id: Option<PlanId>,
+        episode_id: Option<EpisodeId>,
+    ) -> Result<(), ControllerError> {
+        self.plan_id = plan_id;
+        self.episode_id = episode_id;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(ControllerError::RevisionOverflow)?;
+        Ok(())
+    }
 }
 
 /// Concurrent read-mostly registry; each vault remains one logical controller owner.

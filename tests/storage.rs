@@ -640,7 +640,9 @@ async fn snapshot_plan_and_backup_are_durable() -> Result<(), Box<dyn std::error
     let handle = service.handle();
     let snapshot = sample_snapshot();
     handle.persist_snapshot(snapshot.clone(), 100).await?;
-    handle.persist_plan(sample_plan(&snapshot), 101).await?;
+    let plan = sample_plan(&snapshot);
+    handle.persist_plan(plan.clone(), 101).await?;
+    handle.persist_plan(plan, 102).await?;
     handle.backup(backup.clone(), 1).await?;
     service.shutdown().await?;
 

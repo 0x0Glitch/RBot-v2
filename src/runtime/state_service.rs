@@ -18,6 +18,7 @@ use crate::{
         controller::{ControllerError, RuntimeRegistry, RuntimeVaultState},
         identity::{RuntimeIdentities, RuntimeIdentityError},
         messages::ChainUpdate,
+        planning_service::{PlanningServiceError, refresh_rate_plan},
         readiness::{ReadinessInputs, evaluate_readiness},
     },
     state::{
@@ -66,6 +67,9 @@ pub enum StateServiceError {
     /// A registered operational metric could not be updated.
     #[error("operational metric registry is incomplete")]
     Metric,
+    /// Durable live Shadow planning failed.
+    #[error(transparent)]
+    Planning(#[from] PlanningServiceError),
 }
 
 /// Exact watched-address roles derived exclusively from validated configuration.
@@ -383,6 +387,25 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
                     status.transition(desired, reason)
                 })
                 .await?;
+            if self.config.app.node.mode != RuntimeMode::Observe
+                && snapshot.capabilities.can_project
+            {
+                let _ = refresh_rate_plan(
+                    &self.config,
+                    vault,
+                    &snapshot,
+                    &projection,
+                    &self.storage,
+                    &self.api,
+                    &self.runtime,
+                )
+                .await?;
+            } else {
+                self.api.clear_plan(vault.address).await;
+                self.runtime
+                    .update(vault.address, |status| status.record_planning(None, None))
+                    .await?;
+            }
             all_exact_ready &= exact_ready_for_mode(self.config.app.node.mode, &snapshot);
         }
         self.health.record_processed_block(head.number);

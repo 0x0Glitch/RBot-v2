@@ -1472,6 +1472,15 @@ fn assemble_snapshot(
         .values()
         .cloned()
         .collect::<Vec<PendingAdminOperation>>();
+    let mut idle_locks = blueprint.idle_locks.clone();
+    if parent.idle_assets.is_zero()
+        && idle_locks.locks.is_empty()
+        && idle_locks.unattributed_idle_assets.is_zero()
+    {
+        // A zero exact token balance proves there is no economic amount left to
+        // attribute or lock, even when no prior lock-ledger checkpoint exists.
+        idle_locks.verified = true;
+    }
     let report = classify_capabilities(CapabilityInputs {
         config: blueprint.vault,
         strategy: blueprint.strategy,
@@ -1484,8 +1493,8 @@ fn assemble_snapshot(
         pending_admin: &pending_admin,
         administrative_horizon_timestamp: blueprint.administrative_horizon_timestamp,
         expected_inclusion_timestamp: blueprint.expected_inclusion_timestamp,
-        lock_ledger_verified: blueprint.idle_locks.verified,
-        unattributed_idle_assets: blueprint.idle_locks.unattributed_idle_assets,
+        lock_ledger_verified: idle_locks.verified,
+        unattributed_idle_assets: idle_locks.unattributed_idle_assets,
         rate_episode_state_verified: blueprint.rate_episode_state_verified,
     })?;
     let mut snapshot = ExactVaultSnapshot {
@@ -1503,7 +1512,7 @@ fn assemble_snapshot(
         caps,
         pending_admin,
         capabilities: report.capabilities,
-        idle_locks: blueprint.idle_locks.clone(),
+        idle_locks,
         snapshot_hash: B256::ZERO,
     };
     snapshot.snapshot_hash = hash_exact_snapshot(&snapshot)?;

@@ -1187,12 +1187,16 @@ fn persist_plan(state: &mut JsonState, plan: V2Plan, created_at: u64) -> Result<
             "plan references a snapshot that is not durable",
         ));
     }
-    if state
+    if let Some(existing) = state
         .plans
         .iter()
-        .any(|entry| entry.plan.plan_id == plan.plan_id)
+        .find(|entry| entry.plan.plan_id == plan.plan_id)
     {
-        return Err(StorageError::Invariant("duplicate plan identity"));
+        return if existing.plan == plan {
+            Ok(())
+        } else {
+            Err(StorageError::Invariant("conflicting plan identity"))
+        };
     }
     state.plans.push(TimedPlan { plan, created_at });
     Ok(())

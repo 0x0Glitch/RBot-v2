@@ -45,6 +45,12 @@ pub struct RateSignalEpisode {
     pub detection_block: BlockRef,
     /// Block satisfying short confirmation.
     pub confirmation_block: Option<BlockRef>,
+    /// Last consecutively observed canonical head while short-confirming.
+    #[serde(default)]
+    pub last_observation_block: Option<BlockRef>,
+    /// Number of consecutive exact observations including detection.
+    #[serde(default)]
+    pub consecutive_observations: u64,
     /// Frozen static configuration revision.
     pub config_revision: B256,
     /// Frozen topology revision.
@@ -91,6 +97,12 @@ pub enum EpisodeError {
     /// A terminal episode cannot transition.
     #[error("rate episode is already complete")]
     Complete,
+    /// Short-confirmation observations skipped a block or changed parent.
+    #[error("rate episode confirmation observations are not consecutive")]
+    NonConsecutiveObservation,
+    /// Short-confirmation observation count overflowed.
+    #[error("rate episode observation count overflow")]
+    ObservationOverflow,
 }
 
 impl RateSignalEpisode {
@@ -151,6 +163,8 @@ impl RateSignalEpisode {
             objective_branch,
             detection_block,
             confirmation_block: None,
+            last_observation_block: Some(detection_block),
+            consecutive_observations: 1,
             config_revision,
             topology_revision,
             evaluation_markets,
@@ -173,8 +187,41 @@ impl RateSignalEpisode {
             return Err(EpisodeError::Complete);
         }
         self.confirmation_block = Some(block);
+        self.last_observation_block = Some(block);
         self.state = RateEpisodeState::Immediate;
         Ok(())
+    }
+
+    /// Records one direct-descendant exact observation and confirms after the required blocks.
+    pub fn observe_short_confirmation(
+        &mut self,
+        block: BlockRef,
+        required_fast_blocks: u64,
+    ) -> Result<bool, EpisodeError> {
+        if self.state == RateEpisodeState::Complete {
+            return Err(EpisodeError::Complete);
+        }
+        if self.state != RateEpisodeState::Detecting {
+            return Ok(true);
+        }
+        let previous = self.last_observation_block.unwrap_or(self.detection_block);
+        if block == previous {
+            return Ok(false);
+        }
+        if block.number != previous.number.saturating_add(1) || block.parent_hash != previous.hash {
+            return Err(EpisodeError::NonConsecutiveObservation);
+        }
+        self.last_observation_block = Some(block);
+        self.consecutive_observations = self
+            .consecutive_observations
+            .checked_add(1)
+            .ok_or(EpisodeError::ObservationOverflow)?;
+        if block.number.saturating_sub(self.detection_block.number) >= required_fast_blocks {
+            self.confirmation_block = Some(block);
+            self.state = RateEpisodeState::Immediate;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Returns the remaining currently unlocked movement in asset units.

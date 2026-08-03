@@ -54,6 +54,11 @@ impl ApiDataStore {
         self.plans.read().await.get(&vault).cloned()
     }
 
+    /// Removes a stale plan after its exact context or episode becomes ineligible.
+    pub async fn clear_plan(&self, vault: VaultAddress) {
+        self.plans.write().await.remove(&vault);
+    }
+
     /// Replaces the latest rate episode for one vault.
     pub async fn record_episode(&self, episode: RateSignalEpisode) {
         self.episodes.write().await.insert(episode.vault, episode);

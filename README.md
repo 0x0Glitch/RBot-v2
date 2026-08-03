@@ -23,8 +23,11 @@ cargo run -- doctor --config config.example.toml --protocol-lock protocol-lock.t
 `run` validates configured deployment identities against live runtime bytecode,
 catches up and replays canonical events into the JSON state file, builds atomic
 exact snapshots, and serves the GET-only health/metrics/operator API on
-`127.0.0.1:9090` by default. Execute remains not-ready because live idle-lock
-attribution and the restricted signer/executor services are not yet composed.
+`127.0.0.1:9090` by default. Shadow mode also persists rate episodes, requires
+direct-parent confirmation, runs the bounded solver, firewalls plans, and serves
+the current candidate at `/v1/vaults/{address}/plan`. Execute remains not-ready
+because live nonzero-idle attribution and the restricted signer/executor services
+are not yet composed.
 `alerts-test` sends only a typed P2 delivery test; it cannot construct or sign a
 transaction.
 
