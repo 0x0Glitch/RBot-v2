@@ -4,7 +4,7 @@
 | --- | --- | --- | --- | --- |
 | 3, 4, 30.1 | Pinned single-crate Rust 2024 workspace and CI | `Cargo.toml`, toolchain/lint files, `Makefile`, CI workflow | `make ci` | Implemented |
 | Milestone 0 | Build identity and fail-closed bootstrap binary | `src/lib.rs`, `src/main.rs`, `src/telemetry/metrics.rs` | unit test and CLI smoke | Implemented |
-| Milestones 10–13 | Final preflight through canary implementation | milestone modules and tests | milestone gates | Milestones 10–11 and operations implemented; real local E2E reaches exact improving plan, signed execution/reconciliation pending |
+| Milestones 10–13 | Final preflight through canary implementation | milestone modules and tests | milestone gates | Milestones 10–11 and operations implemented; real local E2E reaches terminal signed execution/reconciliation, invalidation/crash matrix and live composition pending |
 | 5 | Semantic quantities, contexts, exact snapshot and plan types | `src/domain.rs` | unit and compile-fail tests | Implemented |
 | 6 | Strict TOML parsing, validation, APR conversion, canonical revision | `src/config.rs`, `config.example.toml` | `tests/config.rs` | Implemented |
 | 7.1 | Pinned source/runtime identity model and lock digest | `src/protocol_lock.rs`, `protocol-lock.toml` | `tests/protocol_lock.rs` | Implemented; deployment values pending |
@@ -62,7 +62,7 @@
 | 27.1 | Loopback-default GET-only health, metrics, vault, artifact, transaction and alert API | `src/api/{dto,routes}.rs` | live HTTP test including POST rejection | Implemented |
 | 27.3, 24.4 | Complete bounded-name Prometheus registration with no high-cardinality identifiers | `src/telemetry/metrics.rs` | registry text assertion for every metric name | Implemented; SQLite metric superseded by JSON format metric per SC-001 |
 | 27.4, 24.3 | Typed deduplicated alert history and redacted Telegram/PagerDuty transports | `src/telemetry/{alerts,telegram,pagerduty}.rs` | real local HTTP transport tests | Implemented |
-| Milestone 12 | Deterministic local-chain vertical slice through exact planning | `tests/fixtures/e2e`, `tests/local_e2e.rs` | Forge deploy, deposit/allocate, canonical replay, JSON restart, atomic snapshot and improving bounded rate-plan assertion | Implemented through planning; signing, receipt and post-state phases pending |
+| Milestone 12 | Deterministic local-chain vertical slice through terminal reconciliation | `tests/fixtures/e2e`, `tests/local_e2e.rs` | Forge deployment; deposit/allocation; canonical replay; atomic snapshots; bounded rate solve; firewall, real-EOA call, signing and submission; confirmation; exact event conformance; improved rate; current-state reconciliation; JSON restart | Implemented for the main rate path; cap/queue replanning and crash matrix pending |
 
 ## Dependency policy notes
 

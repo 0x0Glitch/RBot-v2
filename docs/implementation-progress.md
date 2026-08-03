@@ -12,11 +12,11 @@
 
 Milestone 11's receipt/conformance/current-state core and the operations surface
 are implemented. Milestone 12 hardening is in progress: a real Anvil/Forge
-fixture now deploys Vault V2, a direct adapter, Morpho, IRM, token and
-Multicall3, reconstructs topology from canonical logs, persists it to JSON,
-builds one atomic exact snapshot and produces a bounded improving rate plan.
-Signed submission, receipt conformance, post-state reconciliation and supervised
-runtime composition remain before Execute can be enabled.
+fixture deploys Vault V2, a direct adapter, Morpho, IRM, token and Multicall3,
+reconstructs topology, builds an improving rate plan, signs and broadcasts it,
+confirms and validates the receipt, reconciles exact post-state, and restarts
+from terminal JSON state. Supervised live runtime composition and the remaining
+invalidation/crash matrix remain before production Execute can be enabled.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 
@@ -272,12 +272,17 @@ runtime composition remain before Execute can be enabled.
 
 - A deterministic Solidity fixture exercises real EVM behavior for the vault,
   direct adapter, Morpho, Adaptive Curve IRM, ERC-20 and Multicall3 read surface.
-- The first live slice proves empty JSON startup, deployment, deposit and initial
+- The live slice proves empty JSON startup, deployment, deposit and initial
   allocation, canonical backfill, strict event decoding, all-ever topology,
-  cap-data persistence/reopen, atomic exact state and an improving two-action
-  bounded rate solution.
+  cap-data persistence, atomic exact state, an improving two-action bounded rate
+  solution, independent firewall validation, real-EOA `eth_call`, restricted
+  signing, raw submission, confirmation, exact event conformance, current-state
+  reconciliation and terminal restart recovery.
 - The live fixture exposed and fixed dynamic cap-ID ABI encoding: Solidity
   `abi.encode` argument sequences require Alloy `abi_encode_params`, not a
   dynamically nested tuple encoding.
-- Transaction signing/submission, canonical confirmation and exact post-state
-  reconciliation are the next E2E gate; Base Sepolia remains blocked on it.
+- The deterministic local transaction is
+  `0x86b9ba8cfeb3781eec926b54847aad291ba036920734207c6f62b68f172fb325`;
+  its exact spot-rate spread improves from `20833333333` to `18065268066`
+  per-second WAD units. Base Sepolia remains blocked on the remaining local
+  invalidation/crash gates and production deployment identities.
