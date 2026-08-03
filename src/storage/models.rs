@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     AdapterAddress, BlockRef, MarketId, PlanId, PositionKey, TransactionId, VaultAddress,
 };
+use crate::state::topology::TopologyIndex;
+
+/// One durable topology revision and the exact canonical block it covers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedTopology {
+    /// Reconstructed all-ever topology.
+    pub topology: TopologyIndex,
+    /// Last canonical block incorporated into the topology.
+    pub block: BlockRef,
+}
 
 /// Canonical block persisted with its parent relationship.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

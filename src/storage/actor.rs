@@ -23,9 +23,9 @@ use super::{
     StorageError,
     models::{
         CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
-        FinalPreflightRecord, NonceReservation, PendingConformance, ReconciliationRecord,
-        RewindResult, SignedAttemptRecord, SignedTransactionRecord, TransactionAttemptKind,
-        TransactionState, TransactionTransition, UnresolvedTransaction,
+        FinalPreflightRecord, NonceReservation, PendingConformance, PersistedTopology,
+        ReconciliationRecord, RewindResult, SignedAttemptRecord, SignedTransactionRecord,
+        TransactionAttemptKind, TransactionState, TransactionTransition, UnresolvedTransaction,
     },
 };
 
@@ -344,6 +344,17 @@ pub enum StorageCommand {
         /// Ordered receipts.
         reply: oneshot::Sender<Result<Vec<CanonicalReceiptRecord>, StorageError>>,
     },
+    /// Load canonical logs over one inclusive block interval.
+    LoadCanonicalLogs {
+        /// EVM chain ID.
+        chain_id: u64,
+        /// Inclusive first block.
+        from_block: u64,
+        /// Inclusive last block.
+        to_block: u64,
+        /// Canonically ordered logs.
+        reply: oneshot::Sender<Result<Vec<CanonicalLogRecord>, StorageError>>,
+    },
     /// Persist a topology revision.
     PersistTopology {
         /// Topology.
@@ -361,6 +372,15 @@ pub enum StorageCommand {
         through_block: u64,
         /// Topology result.
         reply: oneshot::Sender<Result<Option<TopologyIndex>, StorageError>>,
+    },
+    /// Load the latest topology and its exact covered block.
+    LoadTopologyRevision {
+        /// Parent vault.
+        vault: VaultAddress,
+        /// Latest allowed block.
+        through_block: u64,
+        /// Topology and canonical block result.
+        reply: oneshot::Sender<Result<Option<PersistedTopology>, StorageError>>,
     },
     /// Persist a rate episode.
     PersistRateEpisode {
@@ -591,6 +611,25 @@ impl StorageHandle {
         .await
     }
 
+    /// Loads canonical logs over an inclusive range in block/transaction/log order.
+    pub async fn load_canonical_logs(
+        &self,
+        chain_id: u64,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<CanonicalLogRecord>, StorageError> {
+        if from_block > to_block {
+            return Err(StorageError::Invariant("canonical log range is reversed"));
+        }
+        self.request(|reply| StorageCommand::LoadCanonicalLogs {
+            chain_id,
+            from_block,
+            to_block,
+            reply,
+        })
+        .await
+    }
+
     /// Persists one topology revision.
     pub async fn persist_topology(
         &self,
@@ -612,6 +651,20 @@ impl StorageHandle {
         through_block: u64,
     ) -> Result<Option<TopologyIndex>, StorageError> {
         self.request(|reply| StorageCommand::LoadTopology {
+            vault,
+            through_block,
+            reply,
+        })
+        .await
+    }
+
+    /// Loads the latest topology revision and its canonical coverage block.
+    pub async fn load_topology_revision(
+        &self,
+        vault: VaultAddress,
+        through_block: u64,
+    ) -> Result<Option<PersistedTopology>, StorageError> {
+        self.request(|reply| StorageCommand::LoadTopologyRevision {
             vault,
             through_block,
             reply,
@@ -881,6 +934,26 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                 receipts.sort_by_key(|receipt| receipt.transaction_index);
                 let _ = reply.send(Ok(receipts));
             }
+            StorageCommand::LoadCanonicalLogs {
+                chain_id,
+                from_block,
+                to_block,
+                reply,
+            } => {
+                let mut logs = store
+                    .state
+                    .canonical_logs
+                    .iter()
+                    .filter(|log| {
+                        log.chain_id == chain_id
+                            && log.block_number >= from_block
+                            && log.block_number <= to_block
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+                let _ = reply.send(Ok(logs));
+            }
             StorageCommand::PersistTopology {
                 topology,
                 block,
@@ -911,6 +984,25 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                     })
                     .max_by_key(|entry| entry.block.number)
                     .map(|entry| entry.topology.clone());
+                let _ = reply.send(Ok(topology));
+            }
+            StorageCommand::LoadTopologyRevision {
+                vault,
+                through_block,
+                reply,
+            } => {
+                let topology = store
+                    .state
+                    .topology_history
+                    .iter()
+                    .filter(|entry| {
+                        entry.topology.vault == vault && entry.block.number <= through_block
+                    })
+                    .max_by_key(|entry| entry.block.number)
+                    .map(|entry| PersistedTopology {
+                        topology: entry.topology.clone(),
+                        block: entry.block,
+                    });
                 let _ = reply.send(Ok(topology));
             }
             StorageCommand::PersistRateEpisode {

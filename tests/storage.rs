@@ -265,9 +265,14 @@ async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::erro
         )
         .await?;
     assert_eq!(handle.load_canonical_receipts(999, 11).await?.len(), 1);
+    let replay_logs = handle.load_canonical_logs(999, 10, 11).await?;
+    assert_eq!(replay_logs.len(), 1);
+    assert_eq!(replay_logs[0].transaction_hash, B256::repeat_byte(0x22));
+    assert!(handle.load_canonical_logs(999, 11, 10).await.is_err());
     let result = handle.rewind_to_ancestor(999, first, 102).await?;
     assert_eq!(result.blocks_orphaned, 1);
     assert_eq!(result.logs_orphaned, 1);
+    assert!(handle.load_canonical_logs(999, 10, 11).await?.is_empty());
     service.shutdown().await?;
 
     let state = read_json(&path)?;

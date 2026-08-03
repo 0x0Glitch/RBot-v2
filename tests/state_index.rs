@@ -263,6 +263,12 @@ async fn topology_persistence_rewinds_derived_indexes_atomically()
             .adapters[&adapter]
             .currently_enabled
     );
+    let restored_revision = handle
+        .load_topology_revision(vault, 12)
+        .await?
+        .ok_or("missing revision")?;
+    assert_eq!(restored_revision.block, third);
+    assert_eq!(restored_revision.topology, topology(vault, adapter, true));
 
     handle
         .rewind_to_ancestor(999, second, third.timestamp + 1)
