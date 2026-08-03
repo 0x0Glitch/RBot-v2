@@ -17,11 +17,12 @@ use crate::{
         episodes::{EpisodeError, RateEpisodeState, RateSignalEpisode},
         objective::rate_spread,
         rate::solve_rate_rebalance,
+        simulator::ActionProjection,
     },
     runtime::controller::{ControllerError, RuntimeRegistry},
     state::projection::ProjectedVaultView,
     storage::{StorageError, actor::StorageHandle},
-    transaction::firewall::{FirewallError, canonical_plan_hash, validate_plan},
+    transaction::firewall::{FirewallError, ValidatedPlan, canonical_plan_hash, validate_plan},
 };
 
 /// Live Shadow planner failure. No failure opens an execution path.
@@ -55,6 +56,15 @@ struct RateSignal {
     destination_markets: BTreeSet<MarketId>,
     spread: U256,
     desired_movement: U256,
+}
+
+/// One exact rate plan with independent firewall proof and sequential action effects.
+#[derive(Clone, Debug)]
+pub struct PreparedRatePlan {
+    /// Independently validated semantic plan.
+    pub plan: ValidatedPlan,
+    /// Exact expected action effects in transaction order.
+    pub action_projections: Vec<ActionProjection>,
 }
 
 /// Updates the durable episode state and publishes one fully firewalled Shadow rate plan.
@@ -169,22 +179,47 @@ pub async fn refresh_rate_plan(
         return Ok(None);
     }
 
+    let Some(prepared) = build_validated_rate_plan(config, vault, snapshot, projection, &episode)?
+    else {
+        clear_plan(vault, api, runtime, Some(episode.episode_id)).await?;
+        return Ok(None);
+    };
+    let plan = prepared.plan.plan().clone();
+    storage
+        .persist_plan(plan.clone(), projection.head.timestamp)
+        .await?;
+    api.record_plan(plan.clone()).await;
+    runtime
+        .update(vault.address, |status| {
+            status.record_planning(Some(plan.plan_id), Some(episode.episode_id))
+        })
+        .await?;
+    Ok(Some(plan))
+}
+
+/// Rebuilds one exact rate plan from a frozen, already-confirmed episode.
+pub fn build_validated_rate_plan(
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    episode: &RateSignalEpisode,
+) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
     let solved = solve_rate_rebalance(
         snapshot,
         projection,
         vault,
         &config.app.strategy,
         &config.app.solver,
-        &episode,
+        episode,
     );
-    let Some(best) = solved.best else {
-        clear_plan(vault, api, runtime, Some(episode.episode_id)).await?;
-        return Ok(None);
-    };
     if !solved.certificate.executable_rate_search() {
-        clear_plan(vault, api, runtime, Some(episode.episode_id)).await?;
         return Ok(None);
     }
+    let Some(best) = solved.best else {
+        return Ok(None);
+    };
+    let action_projections = best.state.actions.clone();
     let plan_id = derive_plan_id(
         snapshot.snapshot_hash,
         episode.episode_id.0,
@@ -221,17 +256,11 @@ pub async fn refresh_rate_plan(
         plan_hash: B256::ZERO,
     };
     plan.plan_hash = canonical_plan_hash(&plan)?;
-    let _firewalled = validate_plan(plan.clone(), config)?;
-    storage
-        .persist_plan(plan.clone(), projection.head.timestamp)
-        .await?;
-    api.record_plan(plan.clone()).await;
-    runtime
-        .update(vault.address, |status| {
-            status.record_planning(Some(plan.plan_id), Some(episode.episode_id))
-        })
-        .await?;
-    Ok(Some(plan))
+    let plan = validate_plan(plan, config)?;
+    Ok(Some(PreparedRatePlan {
+        plan,
+        action_projections,
+    }))
 }
 
 fn detect_rate_signal(

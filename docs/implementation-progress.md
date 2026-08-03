@@ -20,9 +20,13 @@ canonical ingestion, durable topology replay and exact snapshots. The live
 Shadow planner publishes only independently firewalled, durable plans after
 direct-parent confirmation. A local-development signer now uses the same
 capability-limited interface and signed-envelope verification as the remote
-signer, without exposing generic transaction signing. Live executor and
-reconciliation service composition plus the remaining crash matrix remain
-before production Execute can be enabled.
+signer, without exposing generic transaction signing. The real one-head
+preflight source now reloads exact topology/state, requires the durable cursor
+at that head, rebuilds the rate plan, and validates its hard constraints at the
+earliest, expected and latest accepted inclusion scenarios. The local E2E uses
+this source rather than a fixed preflight mock. Live executor and reconciliation
+service composition plus the remaining crash matrix remain before production
+Execute can be enabled.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 
