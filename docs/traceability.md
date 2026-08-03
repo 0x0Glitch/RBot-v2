@@ -4,12 +4,12 @@
 | --- | --- | --- | --- | --- |
 | 3, 4, 30.1 | Pinned single-crate Rust 2024 workspace and CI | `Cargo.toml`, toolchain/lint files, `Makefile`, CI workflow | `make ci` | Implemented |
 | Milestone 0 | Build identity and fail-closed bootstrap binary | `src/lib.rs`, `src/main.rs`, `src/telemetry/metrics.rs` | unit test and CLI smoke | Implemented |
-| Milestones 10–13 | Final preflight through canary implementation | milestone modules and tests | milestone gates | Milestones 10 and reconciliation core implemented; supervised operations/E2E pending |
+| Milestones 10–13 | Final preflight through canary implementation | milestone modules and tests | milestone gates | Milestones 10–11 and operations implemented; real local E2E reaches exact improving plan, signed execution/reconciliation pending |
 | 5 | Semantic quantities, contexts, exact snapshot and plan types | `src/domain.rs` | unit and compile-fail tests | Implemented |
 | 6 | Strict TOML parsing, validation, APR conversion, canonical revision | `src/config.rs`, `config.example.toml` | `tests/config.rs` | Implemented |
 | 7.1 | Pinned source/runtime identity model and lock digest | `src/protocol_lock.rs`, `protocol-lock.toml` | `tests/protocol_lock.rs` | Implemented; deployment values pending |
 | 7.5 | Static doctor and lock validation commands | `src/cli.rs`, `src/main.rs` | CLI smoke at milestone gate | Static phase implemented |
-| 8.1–8.7 | Owner override: strict versioned JSON document, exclusive single-writer actor and bounded commands | `src/storage/actor.rs`, `docs/spec-conflicts.md` | format/reopen, corruption and writer-lock tests | Implemented by explicit owner override |
+| 8.1–8.7 | Owner override: strict versioned JSON document, exclusive single-writer actor and bounded commands | `src/storage/actor.rs`, `src/serde_helpers.rs`, `docs/spec-conflicts.md` | format/reopen, cap-rich topology round-trip, corruption and writer-lock tests | Implemented by explicit owner override |
 | 8.8, 23.2–23.4 | Acknowledged atomic writes, nonce lane and compare-and-set recovery transitions | `src/storage/{actor,models}.rs` | boundary reopen and invalid-transition tests | Implemented |
 | 8.9 | Same-directory temporary file, file/directory fsync, atomic rename and backup | `src/storage/actor.rs` | state and backup parse/reopen tests | Implemented by explicit owner override |
 | 7.2–7.3 | Checked-in minimal official ABIs and generated selectors | `abi/*.sol`, `src/contracts/bindings.rs`, `src/contracts/selectors.rs` | selector/signature tests | Implemented |
@@ -27,7 +27,7 @@
 | 12.5 | Complete parent, adapter, position, cap, market, role, gate, seed and pending-operation read set | `src/state/snapshot.rs` | complete configured-vault fixture | Implemented for strict direct-adapter release-one profile |
 | 12.6 | Canonical sorted snapshot hash independent of map iteration | `src/state/snapshot.rs` | repeated full-snapshot equality/hash test | Implemented |
 | 15.1–15.4, 17.1–17.5 | All-ever adapter/market topology, donation evidence, share mismatch, BurnShares and removed-adapter rules | `src/state/topology.rs`, `src/state/capability.rs` | event replay and hard-pause tests | Implemented |
-| 15.5 | Exact direct-adapter cap ID data and Vault V2 cap admission | `src/state/caps.rs` | pinned ID formula and cap-bound tests | Implemented |
+| 15.5 | Exact direct-adapter cap ID data and Vault V2 cap admission | `src/state/caps.rs` | pinned ID formula, deployed Solidity ID equality and cap-bound tests | Implemented |
 | 15.6–15.10, 17.6–17.9 | Pending administration, strict gates, parent/market seeding, liquidity path and reward readiness | `src/state/topology.rs`, `src/state/capability.rs`, `src/state/snapshot.rs` | full snapshot and capability tests | Implemented |
 | 8.4, 10.5, 15.1 | Recurring topology revisions and atomic reorg restoration | `src/storage/actor.rs` | recurrence/rewind integration test | Implemented |
 | 13.1–13.2 | Checked fixed-point helpers and pinned Morpho virtual-share conversions | `src/morpho/blue_math.rs` | property/boundary suite and deployed Solidity differential harness | Implemented |
@@ -62,6 +62,7 @@
 | 27.1 | Loopback-default GET-only health, metrics, vault, artifact, transaction and alert API | `src/api/{dto,routes}.rs` | live HTTP test including POST rejection | Implemented |
 | 27.3, 24.4 | Complete bounded-name Prometheus registration with no high-cardinality identifiers | `src/telemetry/metrics.rs` | registry text assertion for every metric name | Implemented; SQLite metric superseded by JSON format metric per SC-001 |
 | 27.4, 24.3 | Typed deduplicated alert history and redacted Telegram/PagerDuty transports | `src/telemetry/{alerts,telegram,pagerduty}.rs` | real local HTTP transport tests | Implemented |
+| Milestone 12 | Deterministic local-chain vertical slice through exact planning | `tests/fixtures/e2e`, `tests/local_e2e.rs` | Forge deploy, deposit/allocate, canonical replay, JSON restart, atomic snapshot and improving bounded rate-plan assertion | Implemented through planning; signing, receipt and post-state phases pending |
 
 ## Dependency policy notes
 

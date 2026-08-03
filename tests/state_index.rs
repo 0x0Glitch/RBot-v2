@@ -295,9 +295,13 @@ async fn topology_persistence_rewinds_derived_indexes_atomically()
         .ok_or("topology_history is not an array")?;
     assert_eq!(history.len(), 1);
     let adapters = history[0]["topology"]["adapters"]
-        .as_object()
-        .ok_or("adapters is not an object")?;
-    let persisted = adapters.values().next().ok_or("missing adapter")?;
+        .as_array()
+        .ok_or("adapters is not an ordered entry array")?;
+    let persisted = adapters
+        .first()
+        .and_then(Value::as_array)
+        .and_then(|entry| entry.get(1))
+        .ok_or("missing adapter")?;
     assert_eq!(persisted["currently_enabled"], true);
     Ok(())
 }

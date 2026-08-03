@@ -64,12 +64,12 @@ pub fn direct_position_cap_data(
         params.lltv,
     );
     DirectPositionCapData {
-        adapter: ("this", adapter.0).abi_encode().into(),
+        adapter: ("this", adapter.0).abi_encode_params().into(),
         collateral: ("collateralToken", params.collateral_token)
-            .abi_encode()
+            .abi_encode_params()
             .into(),
         market: ("this/marketParams", adapter.0, market_params)
-            .abi_encode()
+            .abi_encode_params()
             .into(),
     }
 }
@@ -108,5 +108,5 @@ pub fn validate_allocation_cap(
 /// Returns the cap ID used by `keccak256(abi.encode("this", address))`.
 #[must_use]
 pub fn adapter_cap_id(adapter: Address) -> CapId {
-    CapId(keccak256(("this", adapter).abi_encode()))
+    CapId(keccak256(("this", adapter).abi_encode_params()))
 }

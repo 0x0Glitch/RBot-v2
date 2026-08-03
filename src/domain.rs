@@ -337,6 +337,7 @@ pub struct ParentVaultState {
     /// Canonical liquidity-adapter data.
     pub liquidity_data: Bytes,
     /// Force-deallocation penalties by adapter.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub force_deallocate_penalties: BTreeMap<AdapterAddress, U256>,
     /// Allocators approved by static policy.
     pub approved_allocators: BTreeSet<Address>,
@@ -687,12 +688,16 @@ pub struct ExactVaultSnapshot {
     /// Parent state.
     pub parent: ParentVaultState,
     /// Direct adapters.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub adapters: BTreeMap<AdapterAddress, DirectAdapterState>,
     /// Direct positions.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub positions: BTreeMap<PositionKey, DirectMarketPositionState>,
     /// Morpho markets.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub markets: BTreeMap<MarketId, StoredMarketState>,
     /// Vault-scoped caps.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub caps: BTreeMap<CapRef, CapState>,
     /// Pending parent and adapter operations.
     pub pending_admin: Vec<PendingAdminOperation>,

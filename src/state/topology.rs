@@ -40,6 +40,7 @@ pub struct AdapterTopology {
     /// Markets made `SyncRequired` by an observed `BurnShares`.
     pub sync_required_market_ids: BTreeSet<MarketId>,
     /// Cumulative canonical external-supply share evidence by market.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub observed_external_donation_shares: BTreeMap<MarketId, U256>,
 }
 
@@ -69,12 +70,16 @@ pub struct TopologyIndex {
     /// Parent vault.
     pub vault: VaultAddress,
     /// Every adapter ever configured or emitted by the parent.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub adapters: BTreeMap<AdapterAddress, AdapterTopology>,
     /// Canonical cap ID to exact ID data.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub cap_id_data: BTreeMap<CapId, CapIdDataEntry>,
     /// Submitted operations keyed by a deterministic vault-local operation ID.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub pending_operations: BTreeMap<B256, PendingAdminOperation>,
     /// Configured position lookup for exact market attribution.
+    #[serde(with = "crate::serde_helpers::btree_map")]
     pub configured_positions: BTreeMap<PositionKey, ConfiguredPositionTopology>,
     /// Event-replayed receive-shares gate used to prebuild the atomic manifest.
     pub receive_shares_gate: Address,

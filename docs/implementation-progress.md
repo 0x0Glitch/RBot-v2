@@ -10,9 +10,13 @@
 
 ## Later milestones
 
-Milestone 11's receipt/conformance/current-state core is implemented. Its
-supervised runtime and operations surface plus Milestones 12–13 remain pending
-in normative order. Execute remains disabled.
+Milestone 11's receipt/conformance/current-state core and the operations surface
+are implemented. Milestone 12 hardening is in progress: a real Anvil/Forge
+fixture now deploys Vault V2, a direct adapter, Morpho, IRM, token and
+Multicall3, reconstructs topology from canonical logs, persists it to JSON,
+builds one atomic exact snapshot and produces a bounded improving rate plan.
+Signed submission, receipt conformance, post-state reconciliation and supervised
+runtime composition remain before Execute can be enabled.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 
@@ -42,6 +46,8 @@ in normative order. Execute remains disabled.
 - Atomic backup, corrupt/unknown-format rejection, cross-process exclusion and
   reopen tests cover every implemented transaction durability boundary.
 - `storage-init` and `backup` bootstrap commands operate only on JSON files.
+- Typed-key maps are encoded as deterministic ordered entry arrays, so cap-rich
+  topology and exact snapshots round-trip without relying on JSON object keys.
 
 ## Milestone 3 — Bindings And Events
 
@@ -261,3 +267,17 @@ in normative order. Execute remains disabled.
   tests; neither transport accepts calldata or transaction objects.
 - The supervised chain→state→planner→executor composition, full shadow E2E and
   deployment identities remain pending. Execute remains disabled.
+
+## Milestone 12 — Hardening (In Progress)
+
+- A deterministic Solidity fixture exercises real EVM behavior for the vault,
+  direct adapter, Morpho, Adaptive Curve IRM, ERC-20 and Multicall3 read surface.
+- The first live slice proves empty JSON startup, deployment, deposit and initial
+  allocation, canonical backfill, strict event decoding, all-ever topology,
+  cap-data persistence/reopen, atomic exact state and an improving two-action
+  bounded rate solution.
+- The live fixture exposed and fixed dynamic cap-ID ABI encoding: Solidity
+  `abi.encode` argument sequences require Alloy `abi_encode_params`, not a
+  dynamically nested tuple encoding.
+- Transaction signing/submission, canonical confirmation and exact post-state
+  reconciliation are the next E2E gate; Base Sepolia remains blocked on it.
