@@ -9,7 +9,8 @@ use crate::{
         StorageError,
         actor::StorageHandle,
         models::{
-            NonceReservation, SignedTransactionRecord, TransactionState, TransactionTransition,
+            NonceReservation, RateMovementReservationRecord, SignedTransactionRecord,
+            TransactionState, TransactionTransition,
         },
     },
     transaction::{
@@ -38,6 +39,7 @@ pub struct DurableSigningRequest {
     transaction_id: TransactionId,
     transaction: ValidatedRoutineTransaction,
     created_at: u64,
+    movement_reservation: Option<RateMovementReservationRecord>,
 }
 
 impl DurableSigningRequest {
@@ -51,6 +53,12 @@ impl DurableSigningRequest {
     #[must_use]
     pub fn transaction_id(&self) -> TransactionId {
         self.transaction_id
+    }
+
+    /// Returns the durable episode movement bound atomically to this nonce, when applicable.
+    #[must_use]
+    pub fn movement_reservation(&self) -> Option<&RateMovementReservationRecord> {
+        self.movement_reservation.as_ref()
     }
 }
 
@@ -83,25 +91,38 @@ pub async fn reserve_durable_rebalance(
         return Err(SigningBoundaryError::Identity);
     }
     let fields = transaction.fields();
-    storage
-        .reserve_nonce(NonceReservation {
-            transaction_id,
-            plan_id: Some(plan.plan().plan_id),
-            vault: plan.plan().vault,
-            signer: fields.from,
-            nonce: fields.nonce,
-            calldata: fields.calldata.clone(),
-            calldata_hash: alloy::primitives::keccak256(&fields.calldata),
-            max_fee_per_gas: U256::from(fields.max_fee_per_gas),
-            max_priority_fee_per_gas: U256::from(fields.max_priority_fee_per_gas),
-            gas_limit: fields.gas_limit,
-            created_at,
-        })
-        .await?;
+    let reservation = NonceReservation {
+        transaction_id,
+        plan_id: Some(plan.plan().plan_id),
+        vault: plan.plan().vault,
+        signer: fields.from,
+        nonce: fields.nonce,
+        calldata: fields.calldata.clone(),
+        calldata_hash: alloy::primitives::keccak256(&fields.calldata),
+        max_fee_per_gas: U256::from(fields.max_fee_per_gas),
+        max_priority_fee_per_gas: U256::from(fields.max_priority_fee_per_gas),
+        gas_limit: fields.gas_limit,
+        created_at,
+    };
+    let movement_reservation = if let Some(episode_id) = plan.plan().episode_id {
+        Some(
+            storage
+                .reserve_rate_movement_and_nonce(
+                    reservation,
+                    episode_id,
+                    plan.plan().projection.movement_assets,
+                )
+                .await?,
+        )
+    } else {
+        storage.reserve_nonce(reservation).await?;
+        None
+    };
     Ok(DurableSigningRequest {
         transaction_id,
         transaction,
         created_at,
+        movement_reservation,
     })
 }
 

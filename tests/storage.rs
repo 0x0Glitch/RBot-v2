@@ -166,9 +166,74 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
         .as_object_mut()
         .ok_or("state is not an object")?
         .remove("reconciliation_records");
+    additive_upgrade
+        .as_object_mut()
+        .ok_or("state is not an object")?
+        .remove("rate_movement_reservations");
     std::fs::write(&path, serde_json::to_vec_pretty(&additive_upgrade)?)?;
     reopen(&path).await?.shutdown().await?;
     assert!(read_json(&path)?["transaction_attempts"].is_array());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rate_movement_and_nonce_are_reserved_and_released_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("rate-movement.json");
+    let signer = Address::with_last_byte(0x72);
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let snapshot = sample_snapshot();
+    handle.persist_snapshot(snapshot.clone(), 100).await?;
+    let mut episode = rate_episode(vault, snapshot.context.block, 0x41);
+    episode.confirm_short(snapshot.context.block)?;
+    handle.persist_rate_episode(episode.clone(), 101).await?;
+    let mut plan = sample_plan(&snapshot);
+    plan.reason = PlanReason::RateRebalance;
+    plan.plan_id = PlanId(B256::repeat_byte(0xbc));
+    plan.episode_id = Some(episode.episode_id);
+    plan.solver_certificate.rate_episode_id = Some(episode.episode_id.0);
+    plan.solver_certificate.objective_branch = Some(episode.objective_branch);
+    plan.projection.movement_assets = U256::from(100_u64);
+    handle.persist_plan(plan.clone(), 102).await?;
+    let mut nonce = reservation(signer);
+    nonce.plan_id = Some(plan.plan_id);
+    let movement = handle
+        .reserve_rate_movement_and_nonce(nonce, episode.episode_id, plan.projection.movement_assets)
+        .await?;
+    assert_eq!(movement.budget_before, U256::from(250_u64));
+    assert_eq!(movement.budget_after, U256::from(150_u64));
+    let active = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("rate episode disappeared")?;
+    assert_eq!(active.pending_movement.0, U256::from(100_u64));
+
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::NonceReserved,
+            next_state: TransactionState::AbortedBeforeSigning,
+            transaction_hash: None,
+            submitted_at: None,
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 103,
+        })
+        .await?;
+    let active = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("rate episode disappeared after release")?;
+    assert_eq!(active.pending_movement.0, U256::ZERO);
+    assert_eq!(active.available_budget()?, U256::from(250_u64));
+    service.shutdown().await?;
+
+    let state = read_json(&path)?;
+    assert_eq!(state["rate_movement_reservations"][0]["state"], "released");
+    reopen(&path).await?.shutdown().await?;
     Ok(())
 }
 

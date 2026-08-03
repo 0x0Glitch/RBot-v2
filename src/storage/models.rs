@@ -4,7 +4,7 @@ use alloy::primitives::{Address, B256, Bytes, I256, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    AdapterAddress, BlockRef, MarketId, PlanId, PositionKey, TransactionId, VaultAddress,
+    AdapterAddress, BlockRef, EpisodeId, MarketId, PlanId, PositionKey, TransactionId, VaultAddress,
 };
 use crate::state::topology::TopologyIndex;
 
@@ -291,6 +291,39 @@ pub struct NonceReservation {
     pub gas_limit: u64,
     /// Unix creation timestamp.
     pub created_at: u64,
+}
+
+/// Lifecycle of one transaction-bound rate-episode movement reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateMovementReservationState {
+    /// Movement is owned by an unresolved routine transaction.
+    Pending,
+    /// Movement was returned after a terminal pre-confirmation outcome.
+    Released,
+    /// Movement was converted from pending to confirmed during reconciliation.
+    Confirmed,
+}
+
+/// Durable rate budget ownership tied to exactly one transaction and plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RateMovementReservationRecord {
+    /// Stable reservation identity.
+    pub reservation_id: B256,
+    /// Transaction owning the movement.
+    pub transaction_id: TransactionId,
+    /// Exact originating plan.
+    pub plan_id: PlanId,
+    /// Active rate episode.
+    pub episode_id: EpisodeId,
+    /// Reserved asset units.
+    pub movement_assets: U256,
+    /// Episode available budget before reservation.
+    pub budget_before: U256,
+    /// Episode available budget after reservation.
+    pub budget_after: U256,
+    /// Reservation lifecycle.
+    pub state: RateMovementReservationState,
 }
 
 /// Durable same-head simulation and signing-gate evidence.

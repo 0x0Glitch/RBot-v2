@@ -150,27 +150,6 @@ pub trait ExactPreflightSource: Send + Sync {
     ) -> Result<PreparedPreflightPlan, PreflightSourceError>;
     /// Returns whether a planning-relevant invalidation is queued locally.
     async fn invalidation_queued(&self) -> Result<bool, PreflightSourceError>;
-    /// Durably reserves plan movement after the unsigned plan is persisted.
-    async fn reserve_plan_movement(
-        &self,
-        plan: &ValidatedPlan,
-    ) -> Result<PlanMovementReservation, PreflightSourceError>;
-    /// Releases one exact unsigned movement reservation after a pre-sign abort.
-    async fn release_plan_movement(
-        &self,
-        reservation: PlanMovementReservation,
-    ) -> Result<(), PreflightSourceError>;
-}
-
-/// Durable movement reservation made immediately before nonce ownership.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PlanMovementReservation {
-    /// Stable reservation identity.
-    pub reservation_id: B256,
-    /// Episode budget before reservation, when applicable.
-    pub episode_budget_before: Option<U256>,
-    /// Episode budget after reservation, when applicable.
-    pub episode_budget_after: Option<U256>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -433,22 +412,23 @@ pub async fn execute_one_head_preflight(
             created_at: request.created_at,
         })
         .await?;
-    let movement_reservation = source.reserve_plan_movement(&plan).await?;
-    let durable = match reserve_durable_rebalance(
+    let durable = reserve_durable_rebalance(
         storage,
         &plan,
         transaction,
         request.transaction_id,
         request.created_at,
     )
-    .await
-    {
-        Ok(durable) => durable,
-        Err(error) => {
-            source.release_plan_movement(movement_reservation).await?;
-            return Err(PreflightError::Signing(error));
-        }
-    };
+    .await?;
+    let movement_reservation_id = durable
+        .movement_reservation()
+        .map_or(B256::ZERO, |reservation| reservation.reservation_id);
+    let episode_budget_before = durable
+        .movement_reservation()
+        .map(|reservation| reservation.budget_before);
+    let episode_budget_after = durable
+        .movement_reservation()
+        .map(|reservation| reservation.budget_after);
 
     let gate_head = head_provider.latest_header().await?;
     let gate_cursor = source.event_cursor().await?;
@@ -460,7 +440,6 @@ pub async fn execute_one_head_preflight(
         || u128::from(elapsed_millis) > config.app.snapshot.maximum_snapshot_to_sign_latency_millis
     {
         abort_unsigned_rebalance(storage, &durable, request.created_at).await?;
-        source.release_plan_movement(movement_reservation).await?;
         return Err(
             if elapsed_millis as u128 > config.app.snapshot.maximum_snapshot_to_sign_latency_millis
             {
@@ -480,7 +459,6 @@ pub async fn execute_one_head_preflight(
         match sign_durable_rebalance(storage, signer, durable, request.signer_request_id).await {
             Ok(signed) => signed,
             Err(SigningBoundaryError::Signer(error)) => {
-                source.release_plan_movement(movement_reservation).await?;
                 return Err(PreflightError::Signing(SigningBoundaryError::Signer(error)));
             }
             Err(error) => return Err(PreflightError::Signing(error)),
@@ -526,9 +504,9 @@ pub async fn execute_one_head_preflight(
             snapshot_to_sign_latency_ms: elapsed_millis,
             rate_episode_id: plan.plan().episode_id.map(|episode| episode.0),
             rate_objective_branch: plan.plan().solver_certificate.objective_branch,
-            episode_budget_before: movement_reservation.episode_budget_before,
-            episode_budget_after_reservation: movement_reservation.episode_budget_after,
-            movement_reservation_id: movement_reservation.reservation_id,
+            episode_budget_before,
+            episode_budget_after_reservation: episode_budget_after,
+            movement_reservation_id,
         },
         scenarios,
         submitted_hash,

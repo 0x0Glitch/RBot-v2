@@ -46,6 +46,10 @@ before production Execute can be enabled.
 - Canonical block/log apply and reorg rewind are atomic.
 - Snapshot, plan/action/certificate, nonce, signed bytes and checked lifecycle
   transitions are durable; one unresolved signer lane is enforced by the actor.
+- A rate episode's pending movement and signer nonce are reserved in one atomic
+  JSON commit. Pre-sign abort, revert and cancellation release exactly that
+  transaction-bound movement; confirmed reconciliation converts it to confirmed
+  movement with checked before/after episode state.
 - Every mutation clones and validates the complete state, writes a same-directory
   temporary JSON file, calls file `fsync`, atomically renames it, then calls
   directory `fsync`; failed commits do not mutate the actor's live state.

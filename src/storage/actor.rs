@@ -8,13 +8,13 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use alloy::primitives::{Address, B256, Bytes, keccak256};
+use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    domain::{BlockRef, ExactVaultSnapshot, RateGroupId, V2Plan, VaultAddress},
+    domain::{BlockRef, EpisodeId, ExactVaultSnapshot, RateGroupId, V2Plan, VaultAddress},
     planner::episodes::{RateEpisodeState, RateSignalEpisode},
     state::topology::TopologyIndex,
 };
@@ -24,8 +24,9 @@ use super::{
     models::{
         CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
         FinalPreflightRecord, NonceReservation, PendingConformance, PersistedTopology,
-        ReconciliationRecord, RewindResult, SignedAttemptRecord, SignedTransactionRecord,
-        TransactionAttemptKind, TransactionState, TransactionTransition, UnresolvedTransaction,
+        RateMovementReservationRecord, RateMovementReservationState, ReconciliationRecord,
+        RewindResult, SignedAttemptRecord, SignedTransactionRecord, TransactionAttemptKind,
+        TransactionState, TransactionTransition, UnresolvedTransaction,
     },
 };
 
@@ -84,6 +85,8 @@ struct JsonState {
     final_preflights: Vec<FinalPreflightRecord>,
     transactions: Vec<TransactionRow>,
     #[serde(default)]
+    rate_movement_reservations: Vec<RateMovementReservationRecord>,
+    #[serde(default)]
     transaction_attempts: Vec<SignedAttemptRecord>,
     #[serde(default)]
     conformance_records: Vec<ConformanceRecord>,
@@ -106,6 +109,7 @@ impl Default for JsonState {
             plans: Vec::new(),
             final_preflights: Vec::new(),
             transactions: Vec::new(),
+            rate_movement_reservations: Vec::new(),
             transaction_attempts: Vec::new(),
             conformance_records: Vec::new(),
             reconciliation_records: Vec::new(),
@@ -265,6 +269,17 @@ pub enum StorageCommand {
         reservation: NonceReservation,
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Atomically reserve one rate-episode movement and its signer nonce lane.
+    ReserveRateMovementAndNonce {
+        /// Complete signer nonce reservation.
+        reservation: NonceReservation,
+        /// Active rate episode identity.
+        episode_id: EpisodeId,
+        /// Exact planned movement in asset units.
+        movement_assets: U256,
+        /// Completion result with durable movement evidence.
+        reply: oneshot::Sender<Result<RateMovementReservationRecord, StorageError>>,
     },
     /// Persist signed bytes before broadcast.
     PersistSignedTransaction {
@@ -505,6 +520,22 @@ impl StorageHandle {
     pub async fn reserve_nonce(&self, reservation: NonceReservation) -> Result<(), StorageError> {
         self.request(|reply| StorageCommand::ReserveNonce { reservation, reply })
             .await
+    }
+
+    /// Atomically reserves a rate episode's pending movement and the signer nonce lane.
+    pub async fn reserve_rate_movement_and_nonce(
+        &self,
+        reservation: NonceReservation,
+        episode_id: EpisodeId,
+        movement_assets: U256,
+    ) -> Result<RateMovementReservationRecord, StorageError> {
+        self.request(|reply| StorageCommand::ReserveRateMovementAndNonce {
+            reservation,
+            episode_id,
+            movement_assets,
+            reply,
+        })
+        .await
     }
 
     /// Persists signed bytes before any broadcast.
@@ -864,6 +895,29 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
             }
             StorageCommand::ReserveNonce { reservation, reply } => {
                 let _ = reply.send(store.commit(|state| reserve_nonce(state, reservation)));
+            }
+            StorageCommand::ReserveRateMovementAndNonce {
+                reservation,
+                episode_id,
+                movement_assets,
+                reply,
+            } => {
+                let mut movement = None;
+                let outcome = store.commit(|state| {
+                    movement = Some(reserve_rate_movement_and_nonce(
+                        state,
+                        reservation,
+                        episode_id,
+                        movement_assets,
+                    )?);
+                    Ok(())
+                });
+                let result = outcome.and_then(|()| {
+                    movement.ok_or(StorageError::Invariant(
+                        "movement reservation result disappeared",
+                    ))
+                });
+                let _ = reply.send(result);
             }
             StorageCommand::PersistSignedTransaction { transaction, reply } => {
                 let _ = reply.send(store.commit(|state| persist_signed(state, transaction)));
@@ -1238,6 +1292,74 @@ fn reserve_nonce(state: &mut JsonState, reservation: NonceReservation) -> Result
     Ok(())
 }
 
+fn reserve_rate_movement_and_nonce(
+    state: &mut JsonState,
+    reservation: NonceReservation,
+    episode_id: EpisodeId,
+    movement_assets: U256,
+) -> Result<RateMovementReservationRecord, StorageError> {
+    let plan_id = reservation
+        .plan_id
+        .ok_or(StorageError::Invariant("rate reservation has no plan"))?;
+    let plan = state
+        .plans
+        .iter()
+        .find(|entry| entry.plan.plan_id == plan_id)
+        .ok_or(StorageError::Invariant(
+            "rate reservation plan is not durable",
+        ))?;
+    if plan.plan.episode_id != Some(episode_id)
+        || plan.plan.projection.movement_assets != movement_assets
+        || movement_assets.is_zero()
+    {
+        return Err(StorageError::Invariant(
+            "rate reservation differs from durable plan",
+        ));
+    }
+    if state.rate_movement_reservations.iter().any(|existing| {
+        existing.transaction_id == reservation.transaction_id
+            || existing.plan_id == plan_id
+            || existing.state == RateMovementReservationState::Pending
+                && existing.episode_id == episode_id
+    }) {
+        return Err(StorageError::Invariant("rate movement is already reserved"));
+    }
+    let episode = state
+        .rate_episodes
+        .iter_mut()
+        .find(|entry| entry.episode.episode_id == episode_id)
+        .ok_or(StorageError::Invariant("rate episode is not durable"))?;
+    let budget_before = episode
+        .episode
+        .available_budget()
+        .map_err(|_| StorageError::Invariant("rate episode budget is invalid"))?;
+    episode
+        .episode
+        .reserve_pending(movement_assets)
+        .map_err(|_| StorageError::Invariant("rate episode budget is insufficient"))?;
+    let budget_after = episode
+        .episode
+        .available_budget()
+        .map_err(|_| StorageError::Invariant("rate episode budget is invalid"))?;
+    let mut identity = Vec::with_capacity(96);
+    identity.extend_from_slice(reservation.transaction_id.0.as_slice());
+    identity.extend_from_slice(plan_id.0.as_slice());
+    identity.extend_from_slice(episode_id.0.as_slice());
+    let record = RateMovementReservationRecord {
+        reservation_id: keccak256(identity),
+        transaction_id: reservation.transaction_id,
+        plan_id,
+        episode_id,
+        movement_assets,
+        budget_before,
+        budget_after,
+        state: RateMovementReservationState::Pending,
+    };
+    reserve_nonce(state, reservation)?;
+    state.rate_movement_reservations.push(record.clone());
+    Ok(record)
+}
+
 fn persist_signed(
     state: &mut JsonState,
     signed: SignedTransactionRecord,
@@ -1336,12 +1458,18 @@ fn transition_transaction(
             to: transition.next_state,
         });
     }
-    let row = state
+    let releases_movement = matches!(
+        transition.next_state,
+        TransactionState::AbortedBeforeSigning
+            | TransactionState::Reverted
+            | TransactionState::Failed
+    );
+    let row_index = state
         .transactions
-        .iter_mut()
-        .find(|row| row.reservation.transaction_id == transition.transaction_id)
+        .iter()
+        .position(|row| row.reservation.transaction_id == transition.transaction_id)
         .ok_or(StorageError::StaleTransition)?;
-    if row.state != transition.expected_state {
+    if state.transactions[row_index].state != transition.expected_state {
         return Err(StorageError::StaleTransition);
     }
     if matches!(
@@ -1368,6 +1496,7 @@ fn transition_transaction(
             ))?;
         attempt.broadcast_at = Some(submitted_at);
     }
+    let row = &mut state.transactions[row_index];
     row.state = transition.next_state;
     if let Some(hash) = transition.transaction_hash {
         row.transaction_hash = Some(hash);
@@ -1382,6 +1511,46 @@ fn transition_transaction(
         row.included_block_hash = transition.included_block_hash;
     }
     row.updated_at = transition.updated_at;
+    if releases_movement {
+        release_rate_movement(state, transition.transaction_id)?;
+    }
+    Ok(())
+}
+
+fn release_rate_movement(
+    state: &mut JsonState,
+    transaction_id: crate::domain::TransactionId,
+) -> Result<(), StorageError> {
+    let matching = state
+        .rate_movement_reservations
+        .iter()
+        .enumerate()
+        .filter(|(_, reservation)| {
+            reservation.transaction_id == transaction_id
+                && reservation.state == RateMovementReservationState::Pending
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
+        return Err(StorageError::Invariant(
+            "transaction owns multiple pending rate movements",
+        ));
+    }
+    let Some(index) = matching.first().copied() else {
+        return Ok(());
+    };
+    let episode_id = state.rate_movement_reservations[index].episode_id;
+    let movement_assets = state.rate_movement_reservations[index].movement_assets;
+    let episode = state
+        .rate_episodes
+        .iter_mut()
+        .find(|entry| entry.episode.episode_id == episode_id)
+        .ok_or(StorageError::Invariant("reserved rate episode disappeared"))?;
+    episode
+        .episode
+        .release_pending(movement_assets)
+        .map_err(|_| StorageError::Invariant("pending rate movement cannot be released"))?;
+    state.rate_movement_reservations[index].state = RateMovementReservationState::Released;
     Ok(())
 }
 
@@ -1493,6 +1662,54 @@ fn persist_reconciliation(
             "invalid or duplicate reconciliation record",
         ));
     }
+    let movement_indexes = state
+        .rate_movement_reservations
+        .iter()
+        .enumerate()
+        .filter(|(_, reservation)| {
+            reservation.transaction_id == record.transaction_id
+                && reservation.state == RateMovementReservationState::Pending
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if movement_indexes.len() > 1 {
+        return Err(StorageError::Invariant(
+            "transaction owns multiple pending rate movements",
+        ));
+    }
+    match (
+        movement_indexes.first().copied(),
+        confirmed_episode.as_ref(),
+    ) {
+        (Some(index), Some(confirmed)) => {
+            let reservation = &state.rate_movement_reservations[index];
+            if confirmed.episode_id != reservation.episode_id {
+                return Err(StorageError::Invariant(
+                    "reconciliation confirms the wrong rate episode",
+                ));
+            }
+            let mut expected = state
+                .rate_episodes
+                .iter()
+                .find(|entry| entry.episode.episode_id == reservation.episode_id)
+                .map(|entry| entry.episode.clone())
+                .ok_or(StorageError::Invariant("reserved rate episode disappeared"))?;
+            expected
+                .confirm_pending(reservation.movement_assets)
+                .map_err(|_| StorageError::Invariant("rate movement cannot be confirmed"))?;
+            if &expected != confirmed {
+                return Err(StorageError::Invariant(
+                    "confirmed rate episode does not match reserved movement",
+                ));
+            }
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(StorageError::Invariant(
+                "reconciliation rate movement evidence is incomplete",
+            ));
+        }
+    }
     let row = state
         .transactions
         .iter_mut()
@@ -1519,6 +1736,9 @@ fn persist_reconciliation(
     }
     if let Some(episode) = confirmed_episode {
         persist_episode(state, episode, record.reconciled_at)?;
+    }
+    if let Some(index) = movement_indexes.first().copied() {
+        state.rate_movement_reservations[index].state = RateMovementReservationState::Confirmed;
     }
     state.reconciliation_records.push(record);
     Ok(())

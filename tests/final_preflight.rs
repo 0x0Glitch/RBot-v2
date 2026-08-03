@@ -30,7 +30,7 @@ use morpho_v2_reallocator::{
     transaction::{
         final_preflight::{
             ExactPreflightSource, ExecutePreflightRequest, ExecutionReservationManager,
-            PlanMovementReservation, PreflightError, PreflightSourceError, PreparedPreflightPlan,
+            PreflightError, PreflightSourceError, PreparedPreflightPlan,
             execute_one_head_preflight,
         },
         firewall::{ValidatedPlan, canonical_plan_hash, validate_plan},
@@ -278,8 +278,6 @@ struct Source {
     plan: ValidatedPlan,
     snapshot: ExactVaultSnapshot,
     storage: morpho_v2_reallocator::storage::actor::StorageHandle,
-    reserved: AtomicUsize,
-    released: AtomicUsize,
 }
 
 #[async_trait]
@@ -323,24 +321,6 @@ impl ExactPreflightSource for Source {
     }
     async fn invalidation_queued(&self) -> Result<bool, PreflightSourceError> {
         Ok(false)
-    }
-    async fn reserve_plan_movement(
-        &self,
-        _plan: &ValidatedPlan,
-    ) -> Result<PlanMovementReservation, PreflightSourceError> {
-        self.reserved.fetch_add(1, Ordering::SeqCst);
-        Ok(PlanMovementReservation {
-            reservation_id: B256::repeat_byte(0xa1),
-            episode_budget_before: None,
-            episode_budget_after: None,
-        })
-    }
-    async fn release_plan_movement(
-        &self,
-        _reservation: PlanMovementReservation,
-    ) -> Result<(), PreflightSourceError> {
-        self.released.fetch_add(1, Ordering::SeqCst);
-        Ok(())
     }
 }
 
@@ -403,8 +383,6 @@ async fn successful_preflight_persists_signed_bytes_before_one_broadcast()
         plan: validated_plan(&config, head),
         snapshot: exact_snapshot(&config, head),
         storage: service.handle(),
-        reserved: AtomicUsize::new(0),
-        released: AtomicUsize::new(0),
     };
     let signer = LocalSigner {
         signer: signer_key,
@@ -427,8 +405,7 @@ async fn successful_preflight_persists_signed_bytes_before_one_broadcast()
     )
     .await?;
     assert_eq!(result.submitted_hash, result.signed.transaction_hash);
-    assert_eq!(source.reserved.load(Ordering::SeqCst), 1);
-    assert_eq!(source.released.load(Ordering::SeqCst), 0);
+    assert_eq!(result.context.movement_reservation_id, B256::ZERO);
     assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
     let unresolved = service
@@ -459,8 +436,6 @@ async fn head_change_after_unsigned_persistence_aborts_without_signing()
         plan: validated_plan(&config, head),
         snapshot: exact_snapshot(&config, head),
         storage: service.handle(),
-        reserved: AtomicUsize::new(0),
-        released: AtomicUsize::new(0),
     };
     let signer = LocalSigner {
         signer: signer_key,
@@ -483,8 +458,6 @@ async fn head_change_after_unsigned_persistence_aborts_without_signing()
     )
     .await;
     assert!(matches!(error, Err(PreflightError::HeadChanged)));
-    assert_eq!(source.reserved.load(Ordering::SeqCst), 1);
-    assert_eq!(source.released.load(Ordering::SeqCst), 1);
     assert_eq!(signer.calls.load(Ordering::SeqCst), 0);
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
     assert!(

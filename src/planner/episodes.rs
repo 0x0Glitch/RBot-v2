@@ -250,6 +250,16 @@ impl RateSignalEpisode {
         Ok(())
     }
 
+    /// Releases one exact unresolved movement after a terminal pre-confirmation outcome.
+    pub fn release_pending(&mut self, movement: U256) -> Result<(), EpisodeError> {
+        self.pending_movement.0 = self
+            .pending_movement
+            .0
+            .checked_sub(movement)
+            .ok_or(EpisodeError::BudgetExceeded)?;
+        Ok(())
+    }
+
     /// Moves resolved pending assets to confirmed cumulative movement.
     pub fn confirm_pending(&mut self, movement: U256) -> Result<(), EpisodeError> {
         self.pending_movement.0 = self
