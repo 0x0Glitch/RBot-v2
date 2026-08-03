@@ -37,6 +37,11 @@
 | 13.5 | Vault V2 max-rate growth, loss realization and gated performance/management fee shares | `src/morpho/vault_v2.rs` | deployed Solidity differential plus loss/gate regression tests | Implemented |
 | 13.6–13.8 | Internal-share expected assets and direct-adapter allocation/deallocation transitions | `src/morpho/market_adapter.rs` | deployed Solidity differential, signed catch-up and liquidity tests | Implemented |
 | 13.9 | Exact cross-language protocol-math comparison | `tests/fixtures/protocol_math`, `tests/math_differential.rs` | test compiles/deploys the source-locked harness to Anvil and requires unit equality | Implemented |
+| 14.1–14.4 | Fresh-snapshot per-head projection and deterministic exact-refresh reasons | `src/state/projection.rs` | repeat projection, stale head, revision/event/orphan/horizon tests | Implemented |
+| 16.1–16.6 | Transaction-complete attribution and exclusive FIFO idle-lock ledger | `src/state/attribution.rs`, `src/state/idle_locks.rs`, migration `0003` | ordered replay, exact-balance, lock-kind and uncertainty tests | Implemented |
+| 17.1 | Monotonic maximum executable native-deposit simulation through liquidity adapter and all three caps | `src/state/projection.rs` | service-constraint fixture and nonzero-gate rejection | Implemented |
+| 17.2–17.4 | Exact liquidity-adapter exit coverage and source accounting/token/utilization floors | `src/state/projection.rs` | healthy and deficient-liquidity fixtures | Implemented |
+| 17.5 | One sequential shared Morpho loan-token balance | `src/planner/liquidity.rs` | double-registration and exhaustion tests | Implemented |
 
 ## Dependency policy notes
 

@@ -465,6 +465,9 @@ pub fn classify_transaction(
     sender: Address,
     known_bot_transaction: bool,
     approved_allocators: &BTreeSet<Address>,
+    approved_sentinels: &BTreeSet<Address>,
+    curator: Option<Address>,
+    owner: Option<Address>,
     ordered_events: &[DecodedEvent],
 ) -> FlowOrigin {
     if known_bot_transaction {
@@ -495,11 +498,57 @@ pub fn classify_transaction(
         )
     });
     if allocator_action {
-        return if approved_allocators.contains(&sender) {
+        return if approved_sentinels.contains(&sender)
+            && ordered_events
+                .iter()
+                .any(|event| event.kind == WatchedEventKind::Vault(VaultEventKind::Deallocate))
+        {
+            FlowOrigin::SentinelDeallocation
+        } else if approved_allocators.contains(&sender) {
             FlowOrigin::ApprovedExternalAllocator
         } else {
             FlowOrigin::UnknownExternalAllocator
         };
+    }
+    let administration = ordered_events.iter().any(|event| {
+        matches!(
+            event.kind,
+            WatchedEventKind::Vault(
+                VaultEventKind::IncreaseAbsoluteCap
+                    | VaultEventKind::DecreaseAbsoluteCap
+                    | VaultEventKind::IncreaseRelativeCap
+                    | VaultEventKind::DecreaseRelativeCap
+                    | VaultEventKind::AddAdapter
+                    | VaultEventKind::RemoveAdapter
+                    | VaultEventKind::SetAdapterRegistry
+                    | VaultEventKind::SetLiquidityAdapterAndData
+                    | VaultEventKind::SetMaxRate
+                    | VaultEventKind::SetIsAllocator
+                    | VaultEventKind::SetIsSentinel
+                    | VaultEventKind::SetCurator
+                    | VaultEventKind::SetForceDeallocatePenalty
+                    | VaultEventKind::SetPerformanceFee
+                    | VaultEventKind::SetManagementFee
+                    | VaultEventKind::SetPerformanceFeeRecipient
+                    | VaultEventKind::SetManagementFeeRecipient
+                    | VaultEventKind::SetReceiveSharesGate
+                    | VaultEventKind::SetSendSharesGate
+                    | VaultEventKind::SetReceiveAssetsGate
+                    | VaultEventKind::SetSendAssetsGate
+                    | VaultEventKind::Submit
+                    | VaultEventKind::Revoke
+                    | VaultEventKind::Accept
+                    | VaultEventKind::IncreaseTimelock
+                    | VaultEventKind::DecreaseTimelock
+                    | VaultEventKind::Abdicate
+            )
+        )
+    });
+    if administration && curator == Some(sender) {
+        return FlowOrigin::CuratorAdministration;
+    }
+    if administration && owner == Some(sender) {
+        return FlowOrigin::OwnerAdministration;
     }
     if ordered_events
         .iter()
@@ -512,6 +561,13 @@ pub fn classify_transaction(
         .any(|event| matches!(event.kind, WatchedEventKind::Morpho(_)))
     {
         return FlowOrigin::MorphoExternalUser;
+    }
+    if !ordered_events.is_empty()
+        && ordered_events
+            .iter()
+            .all(|event| event.kind == WatchedEventKind::Transfer)
+    {
+        return FlowOrigin::DirectDonation;
     }
     FlowOrigin::Unknown
 }

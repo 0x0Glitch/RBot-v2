@@ -119,3 +119,24 @@ Pending in normative order. Execute remains disabled.
   signed catch-up and fail-closed arithmetic.
 - `make ci` passes with 63 positive/property/integration/differential tests and
   six compile-fail semantic-boundary cases.
+
+## Milestone 7 — Projection, Idle Locks And Service Constraints
+
+- Every canonical head is projected directly from the latest exact snapshot.
+  Market accrual, internal-share position value, enabled-adapter real assets,
+  parent accrual, signed cap catch-up and service values share that head context.
+- Deterministic refresh reasons cover age, relevant events, orphaning, static or
+  live revision changes, reward/pending horizons, relevance, caps and service
+  thresholds. Projections remain ineligible for signing by construction.
+- Complete transaction attribution verifies ordered vault-token flows against
+  the exact post balance. The unified ledger creates one exclusive lock kind,
+  consumes unlocked idle before lock kinds in FIFO order, and never clamps an
+  uncertain ledger.
+- Native deposit headroom uses bounded monotonic integer search through parent
+  uint128 bounds, direct-adapter rounding and all three caps. Atomic exit uses
+  only exact executable liquidity-adapter deallocation.
+- Source accounting liquidity, shared token liquidity and utilization floors
+  are checked explicitly; the shared token tracker registers one authoritative
+  balance and consumes it once in sequential action order.
+- `make ci` passes with 66 positive/property/integration/differential tests and
+  six compile-fail semantic-boundary cases.
