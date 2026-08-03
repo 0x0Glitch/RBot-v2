@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use alloy::primitives::B256;
 use morpho_v2_reallocator::config::{
-    AppConfig, ConfigError, RpcRole, RuntimeMode, config_revision,
+    AppConfig, ConfigError, RpcRole, RuntimeMode, SigningConfig, config_revision,
 };
 
 fn example_path() -> PathBuf {
@@ -186,6 +186,18 @@ fn vault_movement_and_headroom_bounds_are_rejected() {
 
 #[test]
 fn signer_and_rate_group_invariants_are_rejected() {
+    let mut config = raw_example();
+    config.signing = SigningConfig::LocalDevelopment {
+        private_key_env: " ".to_owned(),
+    };
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("blank signer environment name must fail"),
+            Err(error) => error,
+        },
+        "signing",
+    );
+
     let mut config = raw_example();
     config.vault[0].approved_allocators.clear();
     assert_field(

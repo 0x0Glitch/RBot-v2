@@ -16,9 +16,13 @@ fixture deploys Vault V2, a direct adapter, Morpho, IRM, token and Multicall3,
 reconstructs topology, builds an improving rate plan, signs and broadcasts it,
 confirms and validates the receipt, reconciles exact post-state, and restarts
 from terminal JSON state. The live supervisor now composes provider identity,
-canonical ingestion, durable topology replay and exact snapshots. Planner,
-executor and reconciliation service composition plus the remaining crash matrix
-remain before production Execute can be enabled.
+canonical ingestion, durable topology replay and exact snapshots. The live
+Shadow planner publishes only independently firewalled, durable plans after
+direct-parent confirmation. A local-development signer now uses the same
+capability-limited interface and signed-envelope verification as the remote
+signer, without exposing generic transaction signing. Live executor and
+reconciliation service composition plus the remaining crash matrix remain
+before production Execute can be enabled.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 

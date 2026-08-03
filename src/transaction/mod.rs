@@ -6,6 +6,7 @@ pub mod fees;
 pub mod final_preflight;
 pub mod firewall;
 pub mod lifecycle;
+pub mod local_signer;
 pub mod nonce;
 pub mod pending;
 pub mod remote_signer;

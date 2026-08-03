@@ -1075,6 +1075,16 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "at least one RPC provider is required",
         ));
     }
+    let signing_environment = match &config.signing {
+        SigningConfig::RemoteSigner { endpoint_env } => endpoint_env,
+        SigningConfig::LocalDevelopment { private_key_env } => private_key_env,
+    };
+    if signing_environment.trim().is_empty() {
+        return Err(validation(
+            "signing",
+            "signer environment-variable name must be non-empty",
+        ));
+    }
     if config.chain.maximum_log_range == 0
         || config.chain.maximum_log_range > 50
         || config.chain.reorg_rescan_blocks == 0
