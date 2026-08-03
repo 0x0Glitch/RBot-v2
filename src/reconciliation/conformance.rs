@@ -14,8 +14,11 @@ use crate::{
         },
         provider::{ProviderError, RpcTransaction, TransactionLookupProvider, parse_quantity},
     },
+    config::{ValidatedConfig, ValidatedVaultConfig},
     contracts::bindings::{IERC20, IMorpho, IMorphoMarketV1AdapterV2, IVaultV2},
     domain::{AdapterAddress, MarketId, TokenAddress, TransactionId, VaultAddress},
+    planner::simulator::simulate_actions,
+    state::projection::project_snapshot_to_head,
     storage::{
         StorageError,
         actor::StorageHandle,
@@ -23,7 +26,10 @@ use crate::{
             CanonicalReceiptRecord, ConformanceRecord, ExpectedActionKind, ExpectedActionRecord,
         },
     },
-    transaction::firewall::RoutineTransactionFields,
+    transaction::{
+        final_preflight::expected_action_records,
+        firewall::{RoutineTransactionFields, validate_plan},
+    },
 };
 
 /// Exact immutable facts required to validate one canonical routine receipt.
@@ -115,6 +121,9 @@ pub enum ReceiptReconciliationError {
     /// Durable fee values cannot be represented by the signed EIP-1559 domain.
     #[error("durable fee value exceeds EIP-1559 transaction domain")]
     FeeRange,
+    /// Inclusion-time exact action replay failed or changed immutable action identity.
+    #[error("inclusion-time action replay failed")]
+    Model,
     /// Receipt or events do not conform.
     #[error(transparent)]
     Conformance(#[from] ConformanceError),
@@ -301,9 +310,8 @@ pub async fn reconcile_confirmed_transaction(
     storage: &StorageHandle,
     provider: &dyn TransactionLookupProvider,
     transaction_id: TransactionId,
-    chain_id: u64,
-    morpho: Address,
-    asset: TokenAddress,
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
     validated_at: u64,
 ) -> Result<ConformanceReport, ReceiptReconciliationError> {
     let pending = storage
@@ -311,7 +319,7 @@ pub async fn reconcile_confirmed_transaction(
         .await?
         .ok_or(ReceiptReconciliationError::MissingCanonicalAttempt)?;
     let receipts = storage
-        .load_canonical_receipts(chain_id, pending.included_block)
+        .load_canonical_receipts(config.app.chain.chain_id, pending.included_block)
         .await?;
     let matching = receipts
         .iter()
@@ -331,7 +339,7 @@ pub async fn reconcile_confirmed_transaction(
         .await?
         .ok_or(ReceiptReconciliationError::MissingCanonicalAttempt)?;
     let transaction = RoutineTransactionFields {
-        chain_id,
+        chain_id: config.app.chain.chain_id,
         from: pending.reservation.signer,
         to: pending.reservation.vault.0,
         nonce: pending.reservation.nonce,
@@ -343,14 +351,31 @@ pub async fn reconcile_confirmed_transaction(
         value: U256::ZERO,
         calldata: pending.reservation.calldata,
     };
+    let validated = validate_plan(pending.plan.clone(), config)
+        .map_err(|_| ReceiptReconciliationError::Model)?;
+    let inclusion_projection =
+        project_snapshot_to_head(&pending.snapshot, pending.inclusion_head, vault)
+            .map_err(|_| ReceiptReconciliationError::Model)?;
+    let simulated = simulate_actions(
+        &pending.snapshot,
+        &inclusion_projection,
+        vault,
+        validated.actions(),
+    )
+    .map_err(|_| ReceiptReconciliationError::Model)?;
+    let inclusion_actions = expected_action_records(&validated, &simulated.actions, vault)
+        .map_err(|_| ReceiptReconciliationError::Model)?;
+    if !same_action_identity(&pending.expected_actions, &inclusion_actions) {
+        return Err(ReceiptReconciliationError::Model);
+    }
     let expectation = ConformanceExpectation {
         transaction_id,
         transaction_hash: receipt.transaction_hash,
         transaction: &transaction,
-        actions: &pending.expected_actions,
+        actions: &inclusion_actions,
         vault: pending.reservation.vault,
-        morpho,
-        asset,
+        morpho: config.app.chain.morpho_blue,
+        asset: vault.asset,
     };
     let report = validate_receipt_conformance(&expectation, &observed, receipt)?;
     storage
@@ -367,6 +392,21 @@ pub async fn reconcile_confirmed_transaction(
         })
         .await?;
     Ok(report)
+}
+
+fn same_action_identity(
+    preflight: &[ExpectedActionRecord],
+    inclusion: &[ExpectedActionRecord],
+) -> bool {
+    preflight.len() == inclusion.len()
+        && preflight.iter().zip(inclusion).all(|(before, after)| {
+            before.kind == after.kind
+                && before.position == after.position
+                && before.adapter == after.adapter
+                && before.market == after.market
+                && before.requested_assets == after.requested_assets
+                && before.returned_cap_ids == after.returned_cap_ids
+        })
 }
 
 fn validate_identity(

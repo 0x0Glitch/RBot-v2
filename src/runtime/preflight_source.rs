@@ -15,7 +15,11 @@ use crate::{
         objective::rate_spread,
         simulator::{no_plan_terminal_existing_shareholder_assets, simulate_actions},
     },
-    runtime::{identity::RuntimeIdentities, planning_service::build_validated_rate_plan},
+    runtime::{
+        identity::RuntimeIdentities,
+        planning_service::build_validated_rate_plan,
+        state_service::{EventSourceRegistry, replay_topology_through},
+    },
     state::{
         projection::{ProjectedVaultView, project_snapshot_to_head},
         snapshot::{SnapshotBlueprint, build_exact_snapshot},
@@ -108,23 +112,18 @@ impl<P: AtomicSnapshotProvider> LiveRatePreflightSource<P> {
             .iter()
             .find(|vault| vault.address == self.vault)
             .ok_or(PreflightSourceError::Failed)?;
-        let persisted = self
-            .storage
-            .load_topology_revision(vault.address, head.number)
+        let sources = EventSourceRegistry::from_config(&self.config)
+            .map_err(|_| PreflightSourceError::Failed)?;
+        let topology = replay_topology_through(&self.config, &sources, &self.storage, vault, head)
             .await
-            .map_err(|_| PreflightSourceError::Failed)?
-            .ok_or(PreflightSourceError::Failed)?;
-        if persisted.block != head {
-            return Err(PreflightSourceError::ContextChanged);
-        }
+            .map_err(|_| PreflightSourceError::Failed)?;
         let episode = self
             .storage
             .load_active_rate_episode(vault.address, vault.rate_group.id)
             .await
             .map_err(|_| PreflightSourceError::Failed)?
             .ok_or(PreflightSourceError::Failed)?;
-        let topology_revision = persisted
-            .topology
+        let topology_revision = topology
             .revision()
             .map_err(|_| PreflightSourceError::Failed)?;
         if episode.config_revision != self.config.revision
@@ -163,7 +162,7 @@ impl<P: AtomicSnapshotProvider> LiveRatePreflightSource<P> {
             snapshot_policy: &self.config.app.snapshot,
             strategy: &self.config.app.strategy,
             vault,
-            topology: &persisted.topology,
+            topology: &topology,
             code_hashes: self.identities.code_hashes(),
             static_config_revision: self.config.revision,
             event_cursor: head,

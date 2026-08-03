@@ -139,6 +139,12 @@ pub struct PendingConformance {
     pub included_block: u64,
     /// Canonical included block hash.
     pub included_block_hash: B256,
+    /// Canonical inclusion block, including the exact execution timestamp.
+    pub inclusion_head: BlockRef,
+    /// Exact preflight snapshot that is the sole base for action replay.
+    pub snapshot: crate::domain::ExactVaultSnapshot,
+    /// Durable semantic plan released by the signer boundary.
+    pub plan: crate::domain::V2Plan,
     /// Exact ordered simulator effects retained before signing.
     pub expected_actions: Vec<ExpectedActionRecord>,
 }

@@ -367,9 +367,8 @@ where
                     &self.storage,
                     self.provider.as_ref(),
                     pending.transaction_id,
-                    self.config.app.chain.chain_id,
-                    self.config.app.chain.morpho_blue,
-                    vault.asset,
+                    &self.config,
+                    vault,
                     head.timestamp,
                 )
                 .await?;

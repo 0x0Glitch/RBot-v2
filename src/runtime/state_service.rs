@@ -118,7 +118,7 @@ impl EventSourceRegistry {
         self.sources.keys().copied().collect()
     }
 
-    fn source(&self, address: Address) -> Option<EventSource> {
+    pub(crate) fn source(&self, address: Address) -> Option<EventSource> {
         self.sources.get(&address).copied()
     }
 }
@@ -200,8 +200,12 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
     pub async fn apply_update(&mut self, update: ChainUpdate) -> Result<(), StateServiceError> {
         match update {
             ChainUpdate::CanonicalBlock { block, logs, .. } => {
-                self.mark_catching_up().await?;
                 self.apply_block(block, &logs).await?;
+                // Preserve the last independently validated Shadow signal only as
+                // an Execute trigger. Global readiness is false until this head's
+                // exact refresh completes, and final preflight rebuilds topology,
+                // exact state and the plan before any signing decision.
+                self.publish_readiness(false, false).await?;
             }
             ChainUpdate::CanonicalHead(head) => {
                 self.ensure_replayed_through(head).await?;
@@ -286,32 +290,9 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
             if vault.deployment_block > head.number {
                 continue;
             }
-            let persisted = self
-                .storage
-                .load_topology_revision(vault.address, head.number)
-                .await?;
-            let (mut topology, replay_from) = match persisted {
-                Some(revision)
-                    if self
-                        .storage
-                        .load_canonical_block(self.config.app.chain.chain_id, revision.block.number)
-                        .await?
-                        .is_some_and(|canonical| canonical.hash == revision.block.hash) =>
-                {
-                    (revision.topology, revision.block.number.saturating_add(1))
-                }
-                _ => (new_topology(vault)?, vault.deployment_block),
-            };
-            catalog_configured_caps(&mut topology, vault, head.number)?;
-            if replay_from <= head.number {
-                let logs = self
-                    .storage
-                    .load_canonical_logs(self.config.app.chain.chain_id, replay_from, head.number)
+            let topology =
+                replay_topology_through(&self.config, &self.sources, &self.storage, vault, head)
                     .await?;
-                for log in logs {
-                    apply_log_to_topology(&self.sources, &mut topology, &log)?;
-                }
-            }
             self.storage
                 .persist_topology(topology.clone(), head)
                 .await?;
@@ -485,6 +466,44 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
             .await;
         Ok(())
     }
+}
+
+/// Rebuilds one vault's exact event-derived topology through a canonical head.
+///
+/// Events remain invalidation/topology inputs only. The returned topology is
+/// reconstructed from a canonical durable revision plus canonical raw logs; no
+/// event-derived balance becomes authoritative state.
+pub(crate) async fn replay_topology_through(
+    config: &ValidatedConfig,
+    sources: &EventSourceRegistry,
+    storage: &StorageHandle,
+    vault: &ValidatedVaultConfig,
+    head: BlockRef,
+) -> Result<TopologyIndex, StateServiceError> {
+    let persisted = storage
+        .load_topology_revision(vault.address, head.number)
+        .await?;
+    let (mut topology, replay_from) = match persisted {
+        Some(revision)
+            if storage
+                .load_canonical_block(config.app.chain.chain_id, revision.block.number)
+                .await?
+                .is_some_and(|canonical| canonical.hash == revision.block.hash) =>
+        {
+            (revision.topology, revision.block.number.saturating_add(1))
+        }
+        _ => (new_topology(vault)?, vault.deployment_block),
+    };
+    catalog_configured_caps(&mut topology, vault, head.number)?;
+    if replay_from <= head.number {
+        let logs = storage
+            .load_canonical_logs(config.app.chain.chain_id, replay_from, head.number)
+            .await?;
+        for log in logs {
+            apply_log_to_topology(sources, &mut topology, &log)?;
+        }
+    }
+    Ok(topology)
 }
 
 fn new_topology(vault: &ValidatedVaultConfig) -> Result<TopologyIndex, StateServiceError> {

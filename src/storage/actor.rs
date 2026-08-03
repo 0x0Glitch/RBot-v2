@@ -1665,12 +1665,42 @@ fn load_pending_conformance(
         .ok_or(StorageError::Invariant(
             "confirmed transaction has no final preflight",
         ))?;
+    let plan = state
+        .plans
+        .iter()
+        .find(|entry| entry.plan.plan_id == plan_id)
+        .map(|entry| entry.plan.clone())
+        .ok_or(StorageError::Invariant(
+            "confirmed transaction has no durable plan",
+        ))?;
+    let snapshot = state
+        .exact_snapshots
+        .iter()
+        .find(|entry| {
+            entry.snapshot.parent.vault == plan.vault.0 && entry.snapshot.context == plan.snapshot
+        })
+        .map(|entry| entry.snapshot.clone())
+        .ok_or(StorageError::Invariant(
+            "confirmed transaction has no exact preflight snapshot",
+        ))?;
     let included_block = row.included_block.ok_or(StorageError::Invariant(
         "confirmed transaction has no included block",
     ))?;
     let included_block_hash = row.included_block_hash.ok_or(StorageError::Invariant(
         "confirmed transaction has no included block hash",
     ))?;
+    let inclusion_head = state
+        .canonical_blocks
+        .iter()
+        .find(|record| {
+            record.chain_id == plan.snapshot.chain_id
+                && record.block.number == included_block
+                && record.block.hash == included_block_hash
+        })
+        .map(|record| record.block)
+        .ok_or(StorageError::Invariant(
+            "confirmed transaction inclusion block is not canonical",
+        ))?;
     Ok(Some(PendingConformance {
         reservation: row.reservation.clone(),
         known_transaction_hashes: state
@@ -1681,6 +1711,9 @@ fn load_pending_conformance(
             .collect(),
         included_block,
         included_block_hash,
+        inclusion_head,
+        snapshot,
+        plan,
         expected_actions: preflight.expected_actions.clone(),
     }))
 }

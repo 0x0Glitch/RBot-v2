@@ -519,7 +519,7 @@ async fn run_execution_service(
     execution: LiveExecutionService<HttpProvider>,
     shutdown: ShutdownSignal,
 ) -> Result<(), ServiceFailure> {
-    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    let mut interval = tokio::time::interval(Duration::from_millis(50));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {

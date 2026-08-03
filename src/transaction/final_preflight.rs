@@ -359,10 +359,12 @@ pub async fn execute_one_head_preflight(
         calldata_hash.as_slice(),
     ]);
 
+    require_head(head_provider.latest_header().await?, head)?;
     let (call_output, gas_estimate) = tokio::try_join!(
         simulator.call_at(vault.signer_address, vault.address.0, &calldata, head),
         simulator.estimate_gas_at(vault.signer_address, vault.address.0, &calldata, head),
     )?;
+    require_head(head_provider.latest_header().await?, head)?;
     let gas_limit = signed_gas_limit(
         gas_estimate,
         config.app.execution.gas_headroom_bps,
@@ -519,7 +521,7 @@ pub async fn execute_one_head_preflight(
     })
 }
 
-fn expected_action_records(
+pub(crate) fn expected_action_records(
     plan: &ValidatedPlan,
     projections: &[ActionProjection],
     vault: &ValidatedVaultConfig,

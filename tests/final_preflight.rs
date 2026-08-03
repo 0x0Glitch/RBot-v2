@@ -445,7 +445,7 @@ async fn head_change_after_unsigned_persistence_aborts_without_signing()
         calls: AtomicUsize::new(0),
     };
     let error = execute_one_head_preflight(
-        &HeaderProvider::new(vec![head, moved]),
+        &HeaderProvider::new(vec![head, head, head, moved]),
         &Simulator,
         &submitter,
         &source,
