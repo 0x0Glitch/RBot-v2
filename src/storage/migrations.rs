@@ -25,6 +25,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: include_str!("../../migrations/0003_idle_lock_ledger.sql"),
     },
+    Migration {
+        version: 4,
+        sql: include_str!("../../migrations/0004_topology_history.sql"),
+    },
 ];
 
 /// Applies mandatory SQLite safety pragmas to a newly opened connection.

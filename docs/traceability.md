@@ -4,7 +4,7 @@
 | --- | --- | --- | --- | --- |
 | 3, 4, 30.1 | Pinned single-crate Rust 2024 workspace and CI | `Cargo.toml`, toolchain/lint files, `Makefile`, CI workflow | `make ci` | Implemented |
 | Milestone 0 | Build identity and fail-closed bootstrap binary | `src/lib.rs`, `src/main.rs`, `src/telemetry/metrics.rs` | unit test and CLI smoke | Implemented |
-| Milestones 5–13 | State service through canary implementation | milestone modules and tests | milestone gates | Pending |
+| Milestones 6–13 | Exact protocol math through canary implementation | milestone modules and tests | milestone gates | Pending |
 | 5 | Semantic quantities, contexts, exact snapshot and plan types | `src/domain.rs` | unit and compile-fail tests | Implemented |
 | 6 | Strict TOML parsing, validation, APR conversion, canonical revision | `src/config.rs`, `config.example.toml` | `tests/config.rs` | Implemented |
 | 7.1 | Pinned source/runtime identity model and lock digest | `src/protocol_lock.rs`, `protocol-lock.toml` | `tests/protocol_lock.rs` | Implemented; deployment values pending |
@@ -25,6 +25,13 @@
 | 10.5, 4.12 | Bounded common-ancestor search, atomic rewind and canonical replay | `src/chain/reorg.rs`, `src/storage/queries.rs` | bounded and deep reorg integration tests | Implemented |
 | 10.6 | Optional raw HyperEVM block source interface | `src/chain/hyper_evm.rs` | type checked in all-target build | Implemented; deployment source optional |
 | 10.7 | Primary-provider trust and independent chain/head checkpoint | `src/chain/heads.rs`, `docs/deployment-inputs.md` | checkpoint agreement/disagreement tests | Chain/head implemented; code/receipt/nonce checks attach at state/execution milestones |
+| 12.1–12.4 | Strict authoritative query manifest and AtomicLatest header/EVM-context bracket | `src/chain/multicall.rs`, `src/state/snapshot.rs`, `abi/IMulticall3.sol` | reproducible snapshot, failed-subcall and moving-head tests | Implemented |
+| 12.5 | Complete parent, adapter, position, cap, market, role, gate, seed and pending-operation read set | `src/state/snapshot.rs` | complete configured-vault fixture | Implemented for strict direct-adapter release-one profile |
+| 12.6 | Canonical sorted snapshot hash independent of map iteration | `src/state/snapshot.rs` | repeated full-snapshot equality/hash test | Implemented |
+| 15.1–15.4, 17.1–17.5 | All-ever adapter/market topology, donation evidence, share mismatch, BurnShares and removed-adapter rules | `src/state/topology.rs`, `src/state/capability.rs` | event replay and hard-pause tests | Implemented |
+| 15.5 | Exact direct-adapter cap ID data and Vault V2 cap admission | `src/state/caps.rs` | pinned ID formula and cap-bound tests | Implemented |
+| 15.6–15.10, 17.6–17.9 | Pending administration, strict gates, parent/market seeding, liquidity path and reward readiness | `src/state/topology.rs`, `src/state/capability.rs`, `src/state/snapshot.rs` | full snapshot and capability tests | Implemented |
+| 8.4, 10.5, 15.1 | Recurring topology revisions and atomic reorg restoration | `migrations/0004_topology_history.sql`, `src/storage/queries.rs` | recurrence/rewind integration test | Implemented |
 
 ## Dependency policy notes
 

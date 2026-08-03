@@ -27,7 +27,7 @@ Pending in normative order. Execute remains disabled.
 
 ## Milestone 2 — Storage
 
-- Three normative migrations, SHA-256 manifest, SQLite 3.51.3 runtime gate and
+- The initial three normative migrations, SHA-256 manifest, SQLite 3.51.3 runtime gate and
   mandatory WAL/FULL/foreign-key/busy-timeout configuration implemented.
 - Dedicated blocking writer actor uses a bounded channel and one-shot durable
   acknowledgments; the SQLite connection is never shared through a mutex.
@@ -73,4 +73,29 @@ Pending in normative order. Execute remains disabled.
   the exact state and transaction paths in later milestones.
 - The optional `RawBlockSource` contract is available for deterministic recovery.
 - `make ci` passes with 50 positive/property/integration tests and six
+  compile-fail semantic-boundary cases.
+
+## Milestone 5 — Atomic Snapshots, Topology And Administration
+
+- The checked-in Multicall3 interface includes all four EVM-context getters.
+  Authoritative reads are generated from a selector-restricted manifest with
+  pinned target code hashes, canonical argument hashes, exact return schemas and
+  `allowFailure = false` throughout.
+- AtomicLatest brackets one aggregate with before/after headers and validates
+  block number, timestamp, chain ID, parent hash and the exact durable event
+  cursor. Moving heads discard the aggregate and a failed subcall rejects the
+  complete snapshot.
+- The complete strict-profile read set covers parent accounting, fees, gates,
+  recipient gate answers, roles, adapter arrays/immutables, positions, Morpho
+  markets, IRM state, token liquidity, all cap levels and pending operations.
+- All-ever adapter/market topology, cap ID data, external-donation evidence,
+  BurnShares synchronization and full-calldata delayed administration are
+  replayable and durable. A topology-history migration preserves recurring
+  revisions and restores derived indexes atomically on reorg.
+- Capability derivation enforces share mismatch, removed-adapter, cap, gate,
+  dead-deposit, market seed, liquidity adapter, reward horizon, pending admin,
+  idle-lock and allocator-role rules fail closed.
+- A complete configured-vault fixture builds an exact snapshot twice with the
+  same canonical hash; partial returns and malformed identities are rejected.
+- `make ci` passes with 58 positive/property/integration tests and six
   compile-fail semantic-boundary cases.

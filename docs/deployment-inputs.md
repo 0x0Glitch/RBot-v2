@@ -6,6 +6,8 @@ provided and verified:
 - chain ID and canonical HTTP/WebSocket RPC endpoints;
 - Vault V2, direct adapter, Morpho, IRM, Multicall3, gate and asset addresses;
 - pinned official source commits and accepted runtime code hashes;
+- runtime code identities for every managed vault, direct adapter, asset token,
+  Adaptive Curve IRM, Morpho singleton, Multicall3 and any nonzero gate;
 - vault allocator role and dedicated signer identity;
 - remote signer mTLS/HMAC identities or local development signer secret;
 - fee, confirmation, reconciliation and operational alert configuration;

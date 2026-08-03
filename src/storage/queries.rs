@@ -3,7 +3,11 @@
 use alloy::primitives::{Address, Bytes};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::domain::{BlockRef, ExactVaultSnapshot, PlanReason, TransactionId, V2Action, V2Plan};
+use crate::domain::{
+    BlockRef, ExactVaultSnapshot, PlanReason, TransactionId, V2Action, V2Plan, VaultAddress,
+};
+use crate::state::snapshot::canonical_snapshot_json;
+use crate::state::topology::{TopologyIndex, pending_operation_id};
 
 use super::StorageError;
 use super::codec::{decode_b256, encode_address, encode_b256, encode_u256};
@@ -133,6 +137,12 @@ pub fn rewind_to_ancestor(
         [ancestor_number],
     )?;
     transaction.execute(
+        "UPDATE topology_history SET canonical = 0
+         WHERE block_number > ?1 AND canonical = 1",
+        [ancestor_number],
+    )?;
+    rebuild_topology_indexes(&transaction)?;
+    transaction.execute(
         "UPDATE pending_admin_operations SET canonical = 0
          WHERE submitted_block > ?1 AND canonical = 1",
         [ancestor_number],
@@ -192,13 +202,174 @@ pub fn rewind_to_ancestor(
     })
 }
 
+/// Persists one complete topology revision and rebuilds its derived live indexes atomically.
+pub fn persist_topology(
+    connection: &mut Connection,
+    topology: &TopologyIndex,
+    block: BlockRef,
+) -> Result<(), StorageError> {
+    let revision = topology
+        .revision()
+        .map_err(|_| StorageError::Invariant("topology revision failed"))?;
+    let json = serde_json::to_string(topology)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "INSERT INTO topology_history(
+            vault, block_number, block_hash, topology_revision, json, canonical
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 1)
+         ON CONFLICT(vault, block_hash) DO UPDATE SET
+            block_number = excluded.block_number,
+            topology_revision = excluded.topology_revision,
+            json = excluded.json,
+            canonical = 1",
+        params![
+            encode_address(topology.vault.0).as_slice(),
+            u64_to_i64("topology.block_number", block.number)?,
+            encode_b256(block.hash).as_slice(),
+            encode_b256(revision).as_slice(),
+            json,
+        ],
+    )?;
+    rebuild_topology_indexes(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Loads the latest canonical topology at or below a caller-proven canonical height.
+pub fn load_topology(
+    connection: &Connection,
+    vault: VaultAddress,
+    through_block: u64,
+) -> Result<Option<TopologyIndex>, StorageError> {
+    let json = connection
+        .query_row(
+            "SELECT json FROM topology_history
+             WHERE vault = ?1 AND canonical = 1 AND block_number <= ?2
+             ORDER BY block_number DESC, block_hash DESC LIMIT 1",
+            params![
+                encode_address(vault.0).as_slice(),
+                u64_to_i64("topology.through_block", through_block)?,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    json.map(|json| serde_json::from_str(&json).map_err(StorageError::from))
+        .transpose()
+}
+
+fn rebuild_topology_indexes(transaction: &Transaction<'_>) -> Result<(), StorageError> {
+    transaction.execute("DELETE FROM adapter_topology", [])?;
+    transaction.execute("DELETE FROM cap_id_data", [])?;
+    transaction.execute("DELETE FROM pending_admin_operations", [])?;
+    transaction.execute("UPDATE vault_topology SET canonical = 0", [])?;
+    let topologies = {
+        let mut statement = transaction.prepare(
+            "SELECT json, topology_revision, block_number, block_hash
+             FROM (
+                 SELECT json, topology_revision, block_number, block_hash, vault,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY vault ORDER BY block_number DESC, block_hash DESC
+                        ) AS rank
+                 FROM topology_history
+                 WHERE canonical = 1
+             )
+             WHERE rank = 1
+             ORDER BY vault",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (json, revision, block_number, block_hash) in topologies {
+        let topology: TopologyIndex = serde_json::from_str(&json)?;
+        transaction.execute(
+            "INSERT INTO vault_topology(
+                vault, topology_revision, block_number, block_hash, json, canonical
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 1)
+             ON CONFLICT(vault, topology_revision) DO UPDATE SET
+                block_number = excluded.block_number,
+                block_hash = excluded.block_hash,
+                json = excluded.json,
+                canonical = 1",
+            params![
+                encode_address(topology.vault.0).as_slice(),
+                revision,
+                block_number,
+                block_hash,
+                json,
+            ],
+        )?;
+        for (adapter, state) in &topology.adapters {
+            transaction.execute(
+                "INSERT INTO adapter_topology(
+                    vault, adapter, first_seen_block, removed_at_block,
+                    currently_enabled, last_state_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    encode_address(topology.vault.0).as_slice(),
+                    encode_address(adapter.0).as_slice(),
+                    u64_to_i64("adapter.first_seen_block", state.first_seen_block)?,
+                    optional_u64_to_i64("adapter.removed_at_block", state.removed_at_block)?,
+                    i64::from(state.currently_enabled),
+                    serde_json::to_string(state)?,
+                ],
+            )?;
+        }
+        for (id, entry) in &topology.cap_id_data {
+            transaction.execute(
+                "INSERT INTO cap_id_data(
+                    vault, cap_id, id_data, id_data_hash,
+                    first_seen_block, last_seen_block
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    encode_address(topology.vault.0).as_slice(),
+                    encode_b256(id.0).as_slice(),
+                    entry.id_data.as_ref(),
+                    encode_b256(alloy::primitives::keccak256(&entry.id_data)).as_slice(),
+                    u64_to_i64("cap.first_seen_block", entry.first_seen_block)?,
+                    u64_to_i64("cap.last_seen_block", entry.last_seen_block)?,
+                ],
+            )?;
+        }
+        for operation in topology.pending_operations.values() {
+            let operation_id = pending_operation_id(operation.target, &operation.calldata);
+            transaction.execute(
+                "INSERT INTO pending_admin_operations(
+                    operation_id, target, selector, calldata_hash, calldata,
+                    executable_at, effect_json, submitted_block,
+                    submitted_transaction, status, canonical
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 1)",
+                params![
+                    encode_b256(operation_id).as_slice(),
+                    encode_address(operation.target).as_slice(),
+                    operation.selector.as_slice(),
+                    encode_b256(operation.calldata_hash).as_slice(),
+                    operation.calldata.as_ref(),
+                    u64_to_i64("pending.executable_at", operation.executable_at)?,
+                    serde_json::to_string(&operation.effect)?,
+                    u64_to_i64("pending.submitted_block", operation.submitted_block)?,
+                    encode_b256(operation.submitted_transaction).as_slice(),
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Persists an exact snapshot and canonical JSON as one durable row.
 pub fn persist_snapshot(
     connection: &mut Connection,
     snapshot: &ExactVaultSnapshot,
     created_at: u64,
 ) -> Result<(), StorageError> {
-    let json = serde_json::to_string(snapshot)?;
+    let json = canonical_snapshot_json(snapshot)
+        .map_err(|_| StorageError::Invariant("canonical snapshot serialization failed"))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute(
         "INSERT INTO exact_snapshots(

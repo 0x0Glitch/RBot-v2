@@ -63,7 +63,7 @@ async fn migrations_pragmas_and_reopen_are_stable() -> Result<(), Box<dyn std::e
         })?;
     let journal: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
     let foreign_keys: i64 = connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
-    assert_eq!(migrations, 3);
+    assert_eq!(migrations, 4);
     assert_eq!(journal.to_ascii_lowercase(), "wal");
     assert_eq!(foreign_keys, 1);
     drop(connection);

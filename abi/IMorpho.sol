@@ -34,8 +34,7 @@ interface IMorpho {
     event Liquidate(bytes32 indexed id, address indexed caller, address indexed borrower, uint256 repaidAssets, uint256 repaidShares, uint256 seizedAssets, uint256 badDebtAssets, uint256 badDebtShares);
     event AccrueInterest(bytes32 indexed id, uint256 prevBorrowRate, uint256 interest, uint256 feeShares);
 
-    function market(bytes32 id) external view returns (Market memory);
-    function position(bytes32 id, address user) external view returns (Position memory);
+    function market(bytes32 id) external view returns (Market memory marketState);
+    function position(bytes32 id, address user) external view returns (Position memory positionState);
     function feeRecipient() external view returns (address);
 }
-

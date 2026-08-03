@@ -60,19 +60,19 @@ interface IVaultV2 {
     function sendAssetsGate() external view returns (address);
     function adapterRegistry() external view returns (address);
     function adaptersLength() external view returns (uint256);
-    function adapters(uint256) external view returns (address);
-    function isAdapter(address) external view returns (bool);
-    function isAllocator(address) external view returns (bool);
-    function isSentinel(address) external view returns (bool);
+    function adapters(uint256 index) external view returns (address);
+    function isAdapter(address account) external view returns (bool);
+    function isAllocator(address account) external view returns (bool);
+    function isSentinel(address account) external view returns (bool);
     function liquidityAdapter() external view returns (address);
     function liquidityData() external view returns (bytes memory);
-    function forceDeallocatePenalty(address) external view returns (uint256);
-    function absoluteCap(bytes32) external view returns (uint256);
-    function relativeCap(bytes32) external view returns (uint256);
-    function allocation(bytes32) external view returns (uint256);
-    function executableAt(bytes calldata) external view returns (uint256);
-    function timelock(bytes4) external view returns (uint256);
-    function abdicated(bytes4) external view returns (bool);
+    function forceDeallocatePenalty(address adapter) external view returns (uint256);
+    function absoluteCap(bytes32 id) external view returns (uint256);
+    function relativeCap(bytes32 id) external view returns (uint256);
+    function allocation(bytes32 id) external view returns (uint256);
+    function executableAt(bytes calldata data) external view returns (uint256);
+    function timelock(bytes4 selector) external view returns (uint256);
+    function abdicated(bytes4 selector) external view returns (bool);
     function accrueInterestView() external view returns (uint256 newTotalAssets, uint256 performanceFeeShares, uint256 managementFeeShares);
 
     function setCurator(address newCurator) external;
@@ -106,4 +106,3 @@ interface IVaultV2 {
     function deallocate(address adapter, bytes calldata data, uint256 assets) external;
     function multicall(bytes[] calldata data) external;
 }
-

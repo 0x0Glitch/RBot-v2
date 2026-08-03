@@ -15,6 +15,8 @@ struct Result {
 interface IMulticall3 {
     function aggregate3(Call3[] calldata calls) external payable returns (Result[] memory returnData);
     function getBlockHash(uint256 blockNumber) external view returns (bytes32 blockHash);
+    function getBlockNumber() external view returns (uint256 blockNumber);
     function getCurrentBlockTimestamp() external view returns (uint256 timestamp);
+    function getLastBlockHash() external view returns (bytes32 blockHash);
+    function getChainId() external view returns (uint256 chainid);
 }
-

@@ -9,6 +9,7 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::domain::{BlockRef, ExactVaultSnapshot, V2Plan};
+use crate::state::topology::TopologyIndex;
 
 use super::StorageError;
 use super::backup::create_backup;
@@ -110,6 +111,24 @@ pub enum StorageCommand {
         number: u64,
         /// Stored canonical block.
         reply: oneshot::Sender<Result<Option<BlockRef>, StorageError>>,
+    },
+    /// Persist one complete replayable topology revision and derived indexes.
+    PersistTopology {
+        /// Canonical topology.
+        topology: Box<TopologyIndex>,
+        /// Canonical block containing the latest applied topology event.
+        block: BlockRef,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Load the latest canonical topology for one vault.
+    LoadTopology {
+        /// Parent vault.
+        vault: crate::domain::VaultAddress,
+        /// Latest allowed canonical block.
+        through_block: u64,
+        /// Canonical topology.
+        reply: oneshot::Sender<Result<Option<TopologyIndex>, StorageError>>,
     },
     /// Produce an online SQLite backup.
     Backup {
@@ -257,6 +276,38 @@ impl StorageHandle {
         self.send(StorageCommand::LoadCanonicalBlock {
             chain_id,
             number,
+            reply,
+        })
+        .await?;
+        receive.await.map_err(|_| StorageError::ActorStopped)?
+    }
+
+    /// Persists a topology revision and all derived indexes atomically.
+    pub async fn persist_topology(
+        &self,
+        topology: TopologyIndex,
+        block: BlockRef,
+    ) -> Result<(), StorageError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(StorageCommand::PersistTopology {
+            topology: Box::new(topology),
+            block,
+            reply,
+        })
+        .await?;
+        receive.await.map_err(|_| StorageError::ActorStopped)?
+    }
+
+    /// Loads the latest canonical topology at or before `through_block`.
+    pub async fn load_topology(
+        &self,
+        vault: crate::domain::VaultAddress,
+        through_block: u64,
+    ) -> Result<Option<TopologyIndex>, StorageError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(StorageCommand::LoadTopology {
+            vault,
+            through_block,
             reply,
         })
         .await?;
@@ -444,6 +495,28 @@ fn run_actor(
                     &connection,
                     chain_id,
                     number,
+                ));
+            }
+            StorageCommand::PersistTopology {
+                topology,
+                block,
+                reply,
+            } => {
+                let _ = reply.send(super::queries::persist_topology(
+                    &mut connection,
+                    &topology,
+                    block,
+                ));
+            }
+            StorageCommand::LoadTopology {
+                vault,
+                through_block,
+                reply,
+            } => {
+                let _ = reply.send(super::queries::load_topology(
+                    &connection,
+                    vault,
+                    through_block,
                 ));
             }
             StorageCommand::Backup {
