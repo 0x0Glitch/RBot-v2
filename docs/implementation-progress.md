@@ -53,3 +53,24 @@ Pending in normative order. Execute remains disabled.
 - Canonical direct-adapter data validates full consumption, re-encoding, market
   ID, loan token and immutable IRM.
 - `make ci` passes with 40 positive/property/event tests and 6 compile-fail cases.
+
+## Milestone 4 — Chain Service
+
+- Role-scoped HTTP providers expose only typed read/simulation operations and
+  signed-byte submission; startup probes cover every required RPC method without
+  exposing a generic JSON-RPC or transaction-object API.
+- Latest polling uses exactly one `eth_getBlockByNumber("latest", false)` call and
+  sequentially catches up skipped blocks from the durable cursor.
+- Complete block receipts are strictly attributed to their header. Unsupported
+  block-receipt providers use bounded address-group log queries and individually
+  fetched receipts, which must agree exactly before persistence.
+- Canonical block and watched-log writes are atomic and acknowledged before a
+  `CanonicalBlock` update is published.
+- Parent/hash divergence performs bounded common-ancestor discovery, atomic
+  replay-sensitive rewind, and ordered replay; excessive depth fails closed.
+- Independent checkpoint head disagreement emits degradation and prevents a
+  successful poll. Code, receipt and nonce checkpoint comparisons will attach to
+  the exact state and transaction paths in later milestones.
+- The optional `RawBlockSource` contract is available for deterministic recovery.
+- `make ci` passes with 50 positive/property/integration tests and six
+  compile-fail semantic-boundary cases.

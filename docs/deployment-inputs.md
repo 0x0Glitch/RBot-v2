@@ -11,6 +11,12 @@ provided and verified:
 - fee, confirmation, reconciliation and operational alert configuration;
 - fork RPC credentials for deployment-specific differential and integration tests.
 
+With one primary provider and no quorum, the primary is an explicit correctness
+trust assumption. Configuration requires a separate checkpoint provider. The
+current chain service compares chain identity and canonical head hashes; exact
+code, receipt and signer-nonce comparisons become readiness gates when their
+state and execution consumers are implemented.
+
 The checked-in `protocol-lock.toml` pins the official source commits observed on
 2026-08-03, while all deployment-specific address, bytecode, compiler, optimizer,
 immutable and signer identity values remain visibly `UNSET`. Static validation

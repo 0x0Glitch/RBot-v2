@@ -1,0 +1,145 @@
+//! HTTP provider capability and role-boundary tests.
+#![allow(clippy::panic, clippy::unwrap_used)]
+
+use std::collections::BTreeSet;
+
+use alloy::primitives::{Address, B256, Bytes};
+use morpho_v2_reallocator::chain::provider::{
+    CapabilityProbe, ChainDataProvider, HttpProvider, ProviderError, ProviderRole,
+};
+use serde_json::{Value, json};
+use url::Url;
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
+
+#[derive(Clone)]
+struct RpcResponder;
+
+impl Respond for RpcResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let id = body.get("id").cloned().unwrap_or(json!(1));
+        let method = body
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let result =
+            match method {
+                "eth_chainId" => json!("0x3e7"),
+                "eth_getBlockByNumber" => json!({
+                    "number": "0xa",
+                    "hash": B256::repeat_byte(0x0a),
+                    "parentHash": B256::repeat_byte(0x09),
+                    "timestamp": "0x64"
+                }),
+                "eth_getLogs" | "eth_getBlockReceipts" => json!([]),
+                "eth_call" => json!("0x"),
+                "eth_estimateGas" => json!("0x5208"),
+                "eth_getCode" => json!("0x6000"),
+                "eth_getStorageAt" => json!(B256::ZERO),
+                "eth_getTransactionCount" => json!("0x7"),
+                "eth_getTransactionByHash" | "eth_getTransactionReceipt" => Value::Null,
+                "eth_usingBigBlocks" => json!(false),
+                _ => return ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "missing" }
+                })),
+            };
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    }
+}
+
+fn all_roles() -> BTreeSet<ProviderRole> {
+    BTreeSet::from([
+        ProviderRole::Head,
+        ProviderRole::Logs,
+        ProviderRole::Read,
+        ProviderRole::Simulate,
+        ProviderRole::Submit,
+        ProviderRole::Receipt,
+    ])
+}
+
+#[tokio::test]
+async fn capability_probe_covers_required_methods_with_one_latest_header_call()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(RpcResponder)
+        .mount(&server)
+        .await;
+    let provider = HttpProvider::new("test".to_owned(), Url::parse(&server.uri())?, all_roles())?;
+    let capabilities = provider
+        .probe_capabilities(
+            999,
+            &CapabilityProbe {
+                read_target: Address::with_last_byte(1),
+                read_calldata: Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]),
+                signer: Address::with_last_byte(2),
+                known_transaction_hash: B256::repeat_byte(3),
+            },
+        )
+        .await?;
+    assert_eq!(capabilities.chain_id, 999);
+    assert_eq!(capabilities.latest_head.number, 10);
+    assert!(!capabilities.signer_uses_big_blocks);
+
+    let requests = server.received_requests().await.unwrap();
+    let methods = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| {
+            body.get("method")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    for required in [
+        "eth_chainId",
+        "eth_getBlockByNumber",
+        "eth_getBlockReceipts",
+        "eth_getLogs",
+        "eth_call",
+        "eth_estimateGas",
+        "eth_getCode",
+        "eth_getStorageAt",
+        "eth_getTransactionCount",
+        "eth_getTransactionByHash",
+        "eth_getTransactionReceipt",
+        "eth_usingBigBlocks",
+    ] {
+        assert!(methods.iter().any(|method| method == required));
+    }
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| method.as_str() == "eth_getBlockByNumber")
+            .count(),
+        1
+    );
+    assert!(!methods.iter().any(|method| method == "eth_blockNumber"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_methods_enforce_roles_and_accept_null_receipts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(RpcResponder)
+        .mount(&server)
+        .await;
+    let receipt_only = HttpProvider::new(
+        "receipt".to_owned(),
+        Url::parse(&server.uri())?,
+        BTreeSet::from([ProviderRole::Receipt]),
+    )?;
+    assert_eq!(receipt_only.receipt_by_hash(B256::ZERO).await?, None);
+    assert!(matches!(
+        receipt_only.latest_header().await,
+        Err(ProviderError::MissingRole {
+            role: ProviderRole::Head,
+            ..
+        })
+    ));
+    Ok(())
+}

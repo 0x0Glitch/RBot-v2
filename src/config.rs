@@ -1075,10 +1075,46 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "at least one RPC provider is required",
         ));
     }
-    if config.chain.maximum_log_range == 0 || config.chain.reorg_rescan_blocks == 0 {
+    if config.chain.maximum_log_range == 0
+        || config.chain.maximum_log_range > 50
+        || config.chain.reorg_rescan_blocks == 0
+    {
         return Err(validation(
             "chain",
-            "log range and reorg rescan bounds must be positive",
+            "log range must be in 1..=50 and reorg rescan must be positive",
+        ));
+    }
+    let primary_roles = BTreeSet::from([
+        RpcRole::Head,
+        RpcRole::Logs,
+        RpcRole::Read,
+        RpcRole::Simulate,
+        RpcRole::Submit,
+        RpcRole::Receipt,
+    ]);
+    let primary = config.chain.rpc.iter().find(|provider| {
+        provider.production_grade
+            && primary_roles
+                .iter()
+                .all(|role| provider.roles.contains(role))
+    });
+    let Some(primary) = primary else {
+        return Err(validation(
+            "chain.rpc",
+            "a production-grade primary must own head/log/read/simulate/submit/receipt roles",
+        ));
+    };
+    let checkpoint_roles = BTreeSet::from([RpcRole::Checkpoint, RpcRole::Read, RpcRole::Receipt]);
+    let has_checkpoint = config.chain.rpc.iter().any(|provider| {
+        provider.name != primary.name
+            && checkpoint_roles
+                .iter()
+                .all(|role| provider.roles.contains(role))
+    });
+    if !has_checkpoint {
+        return Err(validation(
+            "chain.rpc",
+            "an independent checkpoint/read/receipt provider is required",
         ));
     }
     if config.execution.maximum_signed_transaction_gas >= config.chain.fast_block_gas_limit {

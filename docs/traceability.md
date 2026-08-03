@@ -4,7 +4,7 @@
 | --- | --- | --- | --- | --- |
 | 3, 4, 30.1 | Pinned single-crate Rust 2024 workspace and CI | `Cargo.toml`, toolchain/lint files, `Makefile`, CI workflow | `make ci` | Implemented |
 | Milestone 0 | Build identity and fail-closed bootstrap binary | `src/lib.rs`, `src/main.rs`, `src/telemetry/metrics.rs` | unit test and CLI smoke | Implemented |
-| Milestones 1–13 | Domain through canary implementation | milestone modules and tests | milestone gates | Pending |
+| Milestones 5–13 | State service through canary implementation | milestone modules and tests | milestone gates | Pending |
 | 5 | Semantic quantities, contexts, exact snapshot and plan types | `src/domain.rs` | unit and compile-fail tests | Implemented |
 | 6 | Strict TOML parsing, validation, APR conversion, canonical revision | `src/config.rs`, `config.example.toml` | `tests/config.rs` | Implemented |
 | 7.1 | Pinned source/runtime identity model and lock digest | `src/protocol_lock.rs`, `protocol-lock.toml` | `tests/protocol_lock.rs` | Implemented; deployment values pending |
@@ -19,6 +19,12 @@
 | 7.1, 11.1 | Runtime bytecode identity and watched-address categories | `src/contracts/code_identity.rs`, `src/chain/logs.rs` | runtime mismatch tests | Implemented; dynamic RPC checks later |
 | 11.2–11.4 | Strict watched event decoding, invalidations and transaction attribution | `src/chain/logs.rs` | 53 official event fixtures plus malformed/unknown tests | Implemented |
 | 11.5–11.6 | Exact pending calldata effect decoder | `src/state/pending_admin.rs` | cap/gate/adapter/unknown tests | Decoder implemented; durable index in milestone 5 |
+| 9.2–9.3 | Bounded typed chain messages and single-owner ChainService | `src/runtime/messages.rs`, `src/chain/heads.rs` | `tests/chain_service.rs` | Implemented |
+| 10.1–10.3 | Role-scoped providers, exhaustive startup probes and one-request latest polling | `src/chain/provider.rs`, `src/config.rs` | `tests/provider.rs`, `tests/config.rs` | Implemented; signed-submit dry run remains provider/deployment specific |
+| 10.4, 24.2 | Sequential receipt ingestion, strict block attribution and deterministic log fallback | `src/chain/heads.rs`, `src/chain/receipts.rs` | catch-up, fallback and malformed-receipt integration tests | Implemented |
+| 10.5, 4.12 | Bounded common-ancestor search, atomic rewind and canonical replay | `src/chain/reorg.rs`, `src/storage/queries.rs` | bounded and deep reorg integration tests | Implemented |
+| 10.6 | Optional raw HyperEVM block source interface | `src/chain/hyper_evm.rs` | type checked in all-target build | Implemented; deployment source optional |
+| 10.7 | Primary-provider trust and independent chain/head checkpoint | `src/chain/heads.rs`, `docs/deployment-inputs.md` | checkpoint agreement/disagreement tests | Chain/head implemented; code/receipt/nonce checks attach at state/execution milestones |
 
 ## Dependency policy notes
 

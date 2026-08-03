@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 
 use alloy::primitives::B256;
-use morpho_v2_reallocator::config::{AppConfig, ConfigError, RuntimeMode, config_revision};
+use morpho_v2_reallocator::config::{
+    AppConfig, ConfigError, RpcRole, RuntimeMode, config_revision,
+};
 
 fn example_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml")
@@ -119,6 +121,43 @@ fn gas_and_pending_horizons_are_rejected() {
             Err(error) => error,
         },
         "execution.maximum_rate_rebalance_pending_fast_blocks",
+    );
+}
+
+#[test]
+fn provider_roles_and_hyperevm_log_bound_are_rejected() {
+    let mut config = raw_example();
+    config.chain.rpc[0]
+        .roles
+        .retain(|role| *role != RpcRole::Receipt);
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("primary without receipt role must fail"),
+            Err(error) => error,
+        },
+        "chain.rpc",
+    );
+
+    let mut config = raw_example();
+    config.chain.rpc[1]
+        .roles
+        .retain(|role| *role != RpcRole::Checkpoint);
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("missing checkpoint must fail"),
+            Err(error) => error,
+        },
+        "chain.rpc",
+    );
+
+    let mut config = raw_example();
+    config.chain.maximum_log_range = 51;
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("official log range above 50 must fail"),
+            Err(error) => error,
+        },
+        "chain",
     );
 }
 

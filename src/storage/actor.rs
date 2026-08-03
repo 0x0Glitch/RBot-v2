@@ -95,6 +95,22 @@ pub enum StorageCommand {
         /// Recovery result.
         reply: oneshot::Sender<Result<Option<UnresolvedTransaction>, StorageError>>,
     },
+    /// Load the persisted canonical cursor for a chain.
+    LoadCursor {
+        /// EVM chain ID.
+        chain_id: u64,
+        /// Persisted cursor.
+        reply: oneshot::Sender<Result<Option<BlockRef>, StorageError>>,
+    },
+    /// Load one stored canonical block at a height.
+    LoadCanonicalBlock {
+        /// EVM chain ID.
+        chain_id: u64,
+        /// EVM block number.
+        number: u64,
+        /// Stored canonical block.
+        reply: oneshot::Sender<Result<Option<BlockRef>, StorageError>>,
+    },
     /// Produce an online SQLite backup.
     Backup {
         /// Final destination path.
@@ -220,6 +236,30 @@ impl StorageHandle {
         let (reply, receive) = oneshot::channel();
         self.send(StorageCommand::LoadUnresolved { signer, reply })
             .await?;
+        receive.await.map_err(|_| StorageError::ActorStopped)?
+    }
+
+    /// Loads the persisted chain cursor through the actor.
+    pub async fn load_cursor(&self, chain_id: u64) -> Result<Option<BlockRef>, StorageError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(StorageCommand::LoadCursor { chain_id, reply })
+            .await?;
+        receive.await.map_err(|_| StorageError::ActorStopped)?
+    }
+
+    /// Loads a canonical block reference at one height through the actor.
+    pub async fn load_canonical_block(
+        &self,
+        chain_id: u64,
+        number: u64,
+    ) -> Result<Option<BlockRef>, StorageError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(StorageCommand::LoadCanonicalBlock {
+            chain_id,
+            number,
+            reply,
+        })
+        .await?;
         receive.await.map_err(|_| StorageError::ActorStopped)?
     }
 
@@ -391,6 +431,20 @@ fn run_actor(
             }
             StorageCommand::LoadUnresolved { signer, reply } => {
                 let _ = reply.send(load_unresolved_transaction(&connection, signer));
+            }
+            StorageCommand::LoadCursor { chain_id, reply } => {
+                let _ = reply.send(super::queries::load_cursor(&connection, chain_id));
+            }
+            StorageCommand::LoadCanonicalBlock {
+                chain_id,
+                number,
+                reply,
+            } => {
+                let _ = reply.send(super::queries::load_canonical_block(
+                    &connection,
+                    chain_id,
+                    number,
+                ));
             }
             StorageCommand::Backup {
                 destination,

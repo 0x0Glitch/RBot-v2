@@ -22,7 +22,7 @@ slow_block_gas_limit = 30000000
 [[chain.rpc]]
 name = "primary"
 url_env = "MORPHO_V2_RPC_PRIMARY"
-roles = ["head", "logs", "read", "simulate", "submit"]
+roles = ["head", "logs", "read", "simulate", "submit", "receipt"]
 production_grade = true
 supports_websocket = true
 supports_historical_state = false
@@ -167,4 +167,3 @@ maximum_action_assets = "1000000000000"
 allow_active_complete_exit = false
 complete_exit_dust_threshold_assets = "1000"
 reward_policy = { mode = "no_material_rewards", checked_at_block = 2345678, valid_until_timestamp = 4102444800, evidence_hash = "0x4444444444444444444444444444444444444444444444444444444444444444" }
-

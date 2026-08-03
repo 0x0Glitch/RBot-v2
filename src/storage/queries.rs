@@ -502,6 +502,72 @@ pub fn load_unresolved_transaction(
     }))
 }
 
+/// Loads the canonical block referenced by the durable cursor.
+pub fn load_cursor(
+    connection: &Connection,
+    chain_id: u64,
+) -> Result<Option<BlockRef>, StorageError> {
+    let chain_id = u64_to_i64("chain_id", chain_id)?;
+    let raw = connection
+        .query_row(
+            "SELECT b.number, b.hash, b.parent_hash, b.timestamp
+             FROM chain_cursor c
+             JOIN canonical_blocks b
+               ON b.chain_id = c.chain_id
+              AND b.number = c.block_number
+              AND b.hash = c.block_hash
+             WHERE c.chain_id = ?1 AND b.canonical = 1",
+            [chain_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    raw.map(decode_block_ref).transpose()
+}
+
+/// Loads the stored canonical block at `number` for reorg ancestry checks.
+pub fn load_canonical_block(
+    connection: &Connection,
+    chain_id: u64,
+    number: u64,
+) -> Result<Option<BlockRef>, StorageError> {
+    let raw = connection
+        .query_row(
+            "SELECT number, hash, parent_hash, timestamp
+             FROM canonical_blocks
+             WHERE chain_id = ?1 AND number = ?2 AND canonical = 1",
+            params![
+                u64_to_i64("chain_id", chain_id)?,
+                u64_to_i64("block.number", number)?,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    raw.map(decode_block_ref).transpose()
+}
+
+fn decode_block_ref(raw: (i64, Vec<u8>, Vec<u8>, i64)) -> Result<BlockRef, StorageError> {
+    Ok(BlockRef {
+        number: i64_to_u64("block.number", raw.0)?,
+        hash: decode_b256(&raw.1)?,
+        parent_hash: decode_b256(&raw.2)?,
+        timestamp: i64_to_u64("block.timestamp", raw.3)?,
+    })
+}
+
 fn plan_reason_code(reason: PlanReason) -> i64 {
     match reason {
         PlanReason::LiquidityMaintenance => 0,
