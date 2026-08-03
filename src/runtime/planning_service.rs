@@ -3,7 +3,6 @@
 use std::collections::BTreeSet;
 
 use alloy::primitives::{B256, U256, keccak256};
-use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -11,7 +10,7 @@ use crate::{
     config::{ValidatedConfig, ValidatedVaultConfig},
     domain::{
         Assets, ExactVaultSnapshot, MarketId, MarketMode, PlanId, PlanProjection, PlanReason,
-        RateObjectiveBranch, SolverCertificate, V2Action, V2Plan,
+        RateObjectiveBranch, SolverCertificate, V2Plan,
     },
     planner::{
         episodes::{EpisodeError, RateEpisodeState, RateSignalEpisode},
@@ -220,14 +219,8 @@ pub fn build_validated_rate_plan(
         return Ok(None);
     };
     let action_projections = best.state.actions.clone();
-    let plan_id = derive_plan_id(
-        snapshot.snapshot_hash,
-        episode.episode_id.0,
-        solved.certificate.candidate_lattice_hash,
-        &best.actions,
-    )?;
     let mut plan = V2Plan {
-        plan_id,
+        plan_id: PlanId(B256::ZERO),
         reason: PlanReason::RateRebalance,
         vault: vault.address,
         snapshot: snapshot.context.clone(),
@@ -255,6 +248,7 @@ pub fn build_validated_rate_plan(
         episode_id: Some(episode.episode_id),
         plan_hash: B256::ZERO,
     };
+    plan.plan_id = derive_plan_id(&plan)?;
     plan.plan_hash = canonical_plan_hash(&plan)?;
     let plan = validate_plan(plan, config)?;
     Ok(Some(PreparedRatePlan {
@@ -411,26 +405,12 @@ fn duration_seconds_ceil(milliseconds: u128) -> Result<u64, PlanningServiceError
     u64::try_from(seconds).map_err(|_| PlanningServiceError::TimestampRange)
 }
 
-fn derive_plan_id(
-    snapshot_hash: B256,
-    episode_id: B256,
-    lattice_hash: B256,
-    actions: &[V2Action],
-) -> Result<PlanId, PlanningServiceError> {
-    #[derive(Serialize)]
-    struct Identity<'a> {
-        snapshot_hash: B256,
-        episode_id: B256,
-        lattice_hash: B256,
-        actions: &'a [V2Action],
-    }
-    serde_json::to_vec(&Identity {
-        snapshot_hash,
-        episode_id,
-        lattice_hash,
-        actions,
-    })
-    .map(keccak256)
-    .map(PlanId)
-    .map_err(|_| PlanningServiceError::Serialization)
+fn derive_plan_id(plan: &V2Plan) -> Result<PlanId, PlanningServiceError> {
+    let mut identity = plan.clone();
+    identity.plan_id = PlanId(B256::ZERO);
+    identity.plan_hash = B256::ZERO;
+    serde_json::to_vec(&identity)
+        .map(keccak256)
+        .map(PlanId)
+        .map_err(|_| PlanningServiceError::Serialization)
 }

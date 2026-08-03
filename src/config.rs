@@ -23,7 +23,7 @@ pub const SECONDS_PER_YEAR: u64 = 31_536_000;
 /// Exact fixed-point scale.
 pub const WAD: u64 = 1_000_000_000_000_000_000;
 
-/// Raw application configuration loaded from TOML.
+/// Raw application configuration loaded from strict JSON.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -46,6 +46,7 @@ pub struct AppConfig {
     /// Operator alert transports.
     pub alerts: AlertConfig,
     /// Per-vault configuration.
+    #[serde(rename = "vaults")]
     pub vault: Vec<VaultConfig>,
 }
 
@@ -104,6 +105,7 @@ pub struct ChainConfig {
     /// Slow-block gas limit.
     pub slow_block_gas_limit: u64,
     /// Role-scoped RPC references.
+    #[serde(rename = "providers")]
     pub rpc: Vec<RpcConfig>,
 }
 
@@ -134,7 +136,10 @@ pub struct RpcConfig {
     /// Stable provider name.
     pub name: String,
     /// Environment variable containing the endpoint.
+    #[serde(rename = "http_url_env")]
     pub url_env: String,
+    /// Optional environment variable containing a WebSocket endpoint used for head hints.
+    pub websocket_url_env: Option<String>,
     /// Allowed provider roles.
     pub roles: Vec<RpcRole>,
     /// Whether the deployment owner treats the endpoint as production-grade.
@@ -149,6 +154,8 @@ pub struct RpcConfig {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotMode {
+    /// State calls are pinned to one canonical EIP-1898 block hash.
+    PinnedBlock,
     /// Atomic latest-head reads with header matching.
     AtomicLatest,
 }
@@ -388,10 +395,13 @@ pub struct VaultConfig {
     /// Static sentinel allowlist.
     pub approved_sentinels: Vec<String>,
     /// Release-one rate groups; exactly one is required.
+    #[serde(rename = "rate_groups")]
     pub rate_group: Vec<RateGroupConfig>,
     /// Configured direct adapters.
+    #[serde(rename = "adapters")]
     pub adapter: Vec<AdapterConfig>,
     /// Configured direct positions.
+    #[serde(rename = "positions")]
     pub position: Vec<PositionConfig>,
 }
 
@@ -569,6 +579,8 @@ pub struct ValidatedRpcConfig {
     pub name: String,
     /// Endpoint environment reference.
     pub url_env: String,
+    /// Optional WebSocket endpoint environment reference.
+    pub websocket_url_env: Option<String>,
     /// Sorted roles.
     pub roles: Vec<RpcRole>,
     /// Production-grade policy flag.
@@ -842,9 +854,9 @@ pub enum ConfigError {
     /// Configuration file read failed.
     #[error("cannot read configuration: {0}")]
     Io(#[from] std::io::Error),
-    /// TOML parsing failed, including unknown fields and enum variants.
-    #[error("invalid configuration TOML: {0}")]
-    Parse(#[from] toml::de::Error),
+    /// JSON parsing failed, including unknown fields and enum variants.
+    #[error("invalid configuration JSON: {0}")]
+    Parse(#[from] serde_json::Error),
     /// A named field violates a fail-closed invariant.
     #[error("invalid configuration field `{field}`: {reason}")]
     Validation {
@@ -857,15 +869,15 @@ pub enum ConfigError {
     #[error("configuration arithmetic failed: {0}")]
     Arithmetic(#[from] ArithmeticError),
     /// Canonical serialization failed.
-    #[error("cannot canonicalize validated configuration: {0}")]
-    Canonical(#[from] serde_json::Error),
+    #[error("cannot canonicalize validated configuration")]
+    Canonical,
 }
 
 impl AppConfig {
-    /// Loads raw TOML from `path`. Unknown fields and enum variants are rejected.
+    /// Loads raw JSON from `path`. Unknown fields and enum variants are rejected.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path)?;
-        Ok(toml::from_str(&text)?)
+        Ok(serde_json::from_str(&text)?)
     }
 
     /// Parses every address/amount, validates frozen invariants, sorts unordered inputs,
@@ -884,6 +896,7 @@ impl AppConfig {
                 ValidatedRpcConfig {
                     name: item.name,
                     url_env: item.url_env,
+                    websocket_url_env: item.websocket_url_env,
                     roles,
                     production_grade: item.production_grade,
                     supports_websocket: item.supports_websocket,
@@ -1073,6 +1086,20 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
         return Err(validation(
             "chain.rpc",
             "at least one RPC provider is required",
+        ));
+    }
+    if config.chain.rpc.iter().any(|provider| {
+        provider.name.trim().is_empty()
+            || provider.url_env.trim().is_empty()
+            || provider.supports_websocket
+                != provider
+                    .websocket_url_env
+                    .as_ref()
+                    .is_some_and(|name| !name.trim().is_empty())
+    }) {
+        return Err(validation(
+            "chain.rpc",
+            "provider names and HTTP environment references must be non-empty, and WebSocket support requires exactly one WebSocket environment reference",
         ));
     }
     let signing_environment = match &config.signing {
@@ -1605,7 +1632,7 @@ pub fn config_revision(config: &ValidatedConfig) -> B256 {
 }
 
 fn config_revision_checked(config: &ValidatedConfig) -> Result<B256, ConfigError> {
-    let bytes = serde_json::to_vec(&config.app)?;
+    let bytes = serde_json::to_vec(&config.app).map_err(|_| ConfigError::Canonical)?;
     Ok(alloy::primitives::keccak256(bytes))
 }
 

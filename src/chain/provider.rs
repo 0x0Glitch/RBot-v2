@@ -1,7 +1,7 @@
 //! Role-scoped HTTP JSON-RPC providers with no generic public request surface.
 
-use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, Bytes, U256};
@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::RwLock;
 use url::Url;
 
 use crate::config::{RpcRole, ValidatedRpcConfig};
@@ -18,6 +19,9 @@ use crate::domain::BlockRef;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CAPABILITY_UNKNOWN: u8 = 0;
+const CAPABILITY_SUPPORTED: u8 = 1;
+const CAPABILITY_UNSUPPORTED: u8 = 2;
 
 /// Provider capability role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -195,9 +199,23 @@ pub enum ProviderError {
     /// Endpoint environment reference is absent or malformed.
     #[error("provider endpoint configuration is invalid")]
     Endpoint,
-    /// HTTP transport failed; details are intentionally redacted to protect credential-bearing URLs.
-    #[error("provider transport failed")]
-    Transport,
+    /// HTTP transport failed; endpoint details remain redacted.
+    #[error("provider transport failed for {method}")]
+    Transport {
+        /// Static JSON-RPC method name, safe for operator diagnostics.
+        method: &'static str,
+    },
+    /// Provider returned a non-success HTTP status; response bodies stay redacted.
+    #[error("provider HTTP request for {method} failed with status {status}")]
+    HttpStatus {
+        /// Static JSON-RPC method name.
+        method: &'static str,
+        /// Numeric HTTP status only.
+        status: u16,
+    },
+    /// The redacting HTTP client could not be constructed.
+    #[error("provider HTTP client initialization failed")]
+    ClientInitialization,
     /// JSON-RPC response could not be decoded.
     #[error("provider returned malformed JSON-RPC")]
     MalformedResponse,
@@ -319,6 +337,8 @@ pub struct HttpProvider {
     roles: BTreeSet<ProviderRole>,
     client: Client,
     next_id: AtomicU64,
+    block_receipts_capability: AtomicU8,
+    code_cache: RwLock<BTreeMap<Address, Bytes>>,
 }
 
 impl std::fmt::Debug for HttpProvider {
@@ -350,6 +370,8 @@ impl HttpProvider {
                 .collect(),
             client: build_client()?,
             next_id: AtomicU64::new(1),
+            block_receipts_capability: AtomicU8::new(CAPABILITY_UNKNOWN),
+            code_cache: RwLock::new(BTreeMap::new()),
         })
     }
 
@@ -368,6 +390,8 @@ impl HttpProvider {
             roles,
             client: build_client()?,
             next_id: AtomicU64::new(1),
+            block_receipts_capability: AtomicU8::new(CAPABILITY_UNKNOWN),
+            code_cache: RwLock::new(BTreeMap::new()),
         })
     }
 
@@ -476,6 +500,27 @@ impl HttpProvider {
         .await
     }
 
+    /// Executes a read-only call at one canonical EIP-1898 block hash.
+    pub async fn read_call_at(
+        &self,
+        target: Address,
+        data: &Bytes,
+        block: BlockRef,
+    ) -> Result<Bytes, ProviderError> {
+        self.request(
+            ProviderRole::Read,
+            "eth_call",
+            json!([{
+                "to": target,
+                "data": data,
+            }, {
+                "blockHash": block.hash,
+                "requireCanonical": true,
+            }]),
+        )
+        .await
+    }
+
     /// Estimates one already-scoped transaction at latest state.
     pub async fn estimate_gas(
         &self,
@@ -495,8 +540,37 @@ impl HttpProvider {
 
     /// Reads complete runtime bytecode at latest state.
     pub async fn code_at(&self, target: Address) -> Result<Bytes, ProviderError> {
-        self.request(ProviderRole::Read, "eth_getCode", json!([target, "latest"]))
-            .await
+        if let Some(code) = self.code_cache.read().await.get(&target).cloned() {
+            return Ok(code);
+        }
+        let code: Bytes = self
+            .request(ProviderRole::Read, "eth_getCode", json!([target, "latest"]))
+            .await?;
+        self.code_cache.write().await.insert(target, code.clone());
+        Ok(code)
+    }
+
+    /// Reads runtime bytecode at one canonical EIP-1898 block hash.
+    pub async fn code_at_block(
+        &self,
+        target: Address,
+        block: BlockRef,
+    ) -> Result<Bytes, ProviderError> {
+        if let Some(code) = self.code_cache.read().await.get(&target).cloned() {
+            return Ok(code);
+        }
+        let code: Bytes = self
+            .request(
+                ProviderRole::Read,
+                "eth_getCode",
+                json!([target, {
+                    "blockHash": block.hash,
+                    "requireCanonical": true,
+                }]),
+            )
+            .await?;
+        self.code_cache.write().await.insert(target, code.clone());
+        Ok(code)
     }
 
     /// Reads one storage slot at latest state.
@@ -587,9 +661,12 @@ impl HttpProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|_| ProviderError::Transport)?;
+            .map_err(|_| ProviderError::Transport { method })?;
         if !response.status().is_success() {
-            return Err(ProviderError::Transport);
+            return Err(ProviderError::HttpStatus {
+                method,
+                status: response.status().as_u16(),
+            });
         }
         let envelope: RpcResponse = response
             .json()
@@ -652,8 +729,38 @@ impl ChainDataProvider for HttpProvider {
 
     async fn block_receipts(&self, number: u64) -> Result<Vec<RpcReceipt>, ProviderError> {
         self.require_any_role(&[ProviderRole::Receipt, ProviderRole::Checkpoint])?;
-        self.request_unscoped("eth_getBlockReceipts", json!([format_quantity(number)]))
+        if self.block_receipts_capability.load(Ordering::Relaxed) == CAPABILITY_UNSUPPORTED {
+            return Err(ProviderError::MethodUnsupported {
+                method: "eth_getBlockReceipts",
+            });
+        }
+        match self
+            .request_unscoped("eth_getBlockReceipts", json!([format_quantity(number)]))
             .await
+        {
+            Ok(receipts) => {
+                self.block_receipts_capability
+                    .store(CAPABILITY_SUPPORTED, Ordering::Relaxed);
+                Ok(receipts)
+            }
+            Err(ProviderError::HttpStatus {
+                status: 403..=405, ..
+            }) => {
+                self.block_receipts_capability
+                    .store(CAPABILITY_UNSUPPORTED, Ordering::Relaxed);
+                Err(ProviderError::MethodUnsupported {
+                    method: "eth_getBlockReceipts",
+                })
+            }
+            Err(ProviderError::MethodUnsupported { .. }) => {
+                self.block_receipts_capability
+                    .store(CAPABILITY_UNSUPPORTED, Ordering::Relaxed);
+                Err(ProviderError::MethodUnsupported {
+                    method: "eth_getBlockReceipts",
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn logs(
@@ -788,7 +895,7 @@ fn build_client() -> Result<Client, ProviderError> {
         .connect_timeout(RPC_CONNECT_TIMEOUT)
         .timeout(RPC_TIMEOUT)
         .build()
-        .map_err(|_| ProviderError::Transport)
+        .map_err(|_| ProviderError::ClientInitialization)
 }
 
 /// Parses an EVM hex quantity into `u64` without narrowing.

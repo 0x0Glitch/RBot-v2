@@ -50,7 +50,7 @@ use tempfile::TempDir;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 fn example_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.json")
 }
 
 fn config_for_signer(signer: Address) -> ValidatedConfig {

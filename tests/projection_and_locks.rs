@@ -40,7 +40,7 @@ use morpho_v2_reallocator::{
 };
 
 fn config() -> Result<morpho_v2_reallocator::config::ValidatedConfig, Box<dyn Error>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
     Ok(AppConfig::load(&path)?.validate()?)
 }
 

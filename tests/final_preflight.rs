@@ -43,7 +43,7 @@ use morpho_v2_reallocator::{
 use tempfile::TempDir;
 
 fn example_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.json")
 }
 
 fn config_for_signer(signer: Address) -> ValidatedConfig {
@@ -445,7 +445,7 @@ async fn head_change_after_unsigned_persistence_aborts_without_signing()
         calls: AtomicUsize::new(0),
     };
     let error = execute_one_head_preflight(
-        &HeaderProvider::new(vec![head, head, head, moved]),
+        &HeaderProvider::new(vec![head, moved]),
         &Simulator,
         &submitter,
         &source,

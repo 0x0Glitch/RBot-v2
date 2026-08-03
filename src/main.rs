@@ -3,7 +3,9 @@
 
 use std::{path::Path, process::ExitCode, sync::Arc, time::Duration};
 
+use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use clap::Parser;
+use futures::StreamExt;
 use morpho_v2_reallocator::api::{ApiDataStore, ReadOnlyApiState, router};
 use morpho_v2_reallocator::chain::{
     heads::{ChainService, ChainServiceConfig},
@@ -190,6 +192,7 @@ async fn run_supervised(
         RuntimeIdentities::from_config(&config, &lock).map_err(|error| error.to_string())?;
     let primary_config =
         provider_for_roles(&config, &[RpcRole::Head, RpcRole::Logs, RpcRole::Receipt])?;
+    let websocket_url_env = primary_config.websocket_url_env.clone();
     let read_config = provider_for_roles(&config, &[RpcRole::Read])?;
     let checkpoint_config = config
         .app
@@ -311,7 +314,10 @@ async fn run_supervised(
         Supervisor::new(shutdown.clone(), health.clone(), DEFAULT_SHUTDOWN_TIMEOUT);
     let chain_shutdown = shutdown.clone();
     supervisor
-        .spawn("chain", run_chain_service(chain, chain_shutdown))
+        .spawn(
+            "chain",
+            run_chain_service(chain, websocket_url_env, chain_shutdown),
+        )
         .map_err(|error| error.to_string())?;
     if let Some(signer) = signer {
         let execution = LiveExecutionService::new(
@@ -385,6 +391,52 @@ fn provider_for_roles<'a>(
 
 async fn run_chain_service(
     chain: Arc<ChainService<HttpProvider>>,
+    websocket_url_env: Option<String>,
+    shutdown: ShutdownSignal,
+) -> Result<(), ServiceFailure> {
+    let Some(websocket_url_env) = websocket_url_env else {
+        return run_polling_chain_service(chain, shutdown).await;
+    };
+    let raw_endpoint = std::env::var(websocket_url_env).map_err(|_| ServiceFailure {
+        reason: "WebSocket endpoint configuration is invalid",
+    })?;
+    let endpoint = url::Url::parse(&raw_endpoint).map_err(|_| ServiceFailure {
+        reason: "WebSocket endpoint configuration is invalid",
+    })?;
+    if !matches!(endpoint.scheme(), "ws" | "wss") {
+        return Err(ServiceFailure {
+            reason: "WebSocket endpoint configuration is invalid",
+        });
+    }
+    let provider = ProviderBuilder::new()
+        .connect_ws(WsConnect::new(endpoint.as_str()))
+        .await
+        .map_err(|_| ServiceFailure {
+            reason: "WebSocket head connection failed",
+        })?;
+    let subscription = provider
+        .subscribe_blocks()
+        .await
+        .map_err(|_| ServiceFailure {
+            reason: "WebSocket head subscription failed",
+        })?;
+    let mut hints = subscription.into_stream();
+    let mut fallback = tokio::time::interval(Duration::from_secs(5));
+    fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            _ = fallback.tick() => poll_canonical_chain(&chain).await?,
+            hint = hints.next() => match hint {
+                Some(_) => poll_canonical_chain(&chain).await?,
+                None => return Err(ServiceFailure { reason: "WebSocket head subscription ended" }),
+            },
+        }
+    }
+}
+
+async fn run_polling_chain_service(
+    chain: Arc<ChainService<HttpProvider>>,
     shutdown: ShutdownSignal,
 ) -> Result<(), ServiceFailure> {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -392,14 +444,21 @@ async fn run_chain_service(
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
-            _ = interval.tick() => {
-                if let Err(error) = chain.poll_once().await {
-                    tracing::error!(service = "chain", %error, "canonical chain service failed");
-                    return Err(ServiceFailure { reason: "canonical chain service failed" });
-                }
-            }
+            _ = interval.tick() => poll_canonical_chain(&chain).await?,
         }
     }
+}
+
+async fn poll_canonical_chain(
+    chain: &Arc<ChainService<HttpProvider>>,
+) -> Result<(), ServiceFailure> {
+    chain.poll_once().await.map(|_| ()).map_err(|error| {
+        tracing::error!(service = "chain", %error, "canonical chain service failed");
+        eprintln!("chain service failed: {error}");
+        ServiceFailure {
+            reason: "canonical chain service failed",
+        }
+    })
 }
 
 async fn run_state_service(
@@ -414,6 +473,7 @@ async fn run_state_service(
                 Some(update) => {
                     if let Err(error) = state.apply_update(update).await {
                         tracing::error!(service = "state", %error, "canonical state service failed");
+                        eprintln!("state service failed: {error}");
                         return Err(ServiceFailure { reason: "canonical state service failed" });
                     }
                 }
@@ -474,6 +534,7 @@ async fn run_execution_service(
                     )) => {}
                     Err(error) => {
                         tracing::error!(service = "execution", %error, "execution service failed");
+                        eprintln!("execution service failed: {error}");
                         return Err(ServiceFailure { reason: "execution service failed" });
                     }
                 }

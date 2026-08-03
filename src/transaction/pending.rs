@@ -400,7 +400,7 @@ mod tests {
     };
 
     fn test_config() -> Option<ValidatedConfig> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
         let mut config = AppConfig::load(&path).ok()?;
         config.execution.maximum_inclusion_fast_blocks = 8;
         config.execution.maximum_rate_rebalance_pending_fast_blocks = 6;

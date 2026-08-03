@@ -15,9 +15,9 @@ atomic rename preserve transaction and reorg recovery boundaries.
 ```bash
 make ci
 cargo run -- status
-cargo run -- config check --config config.example.toml
-cargo run -- config effective --config config.example.toml
-cargo run -- doctor --config config.example.toml --protocol-lock protocol-lock.toml
+cargo run -- config check --config config.example.json
+cargo run -- config effective --config config.example.json
+cargo run -- doctor --config config.example.json --protocol-lock protocol-lock.toml
 ```
 
 `run` validates configured deployment identities against live runtime bytecode,
@@ -25,11 +25,19 @@ catches up and replays canonical events into the JSON state file, builds atomic
 exact snapshots, and serves the GET-only health/metrics/operator API on
 `127.0.0.1:9090` by default. Shadow mode also persists rate episodes, requires
 direct-parent confirmation, runs the bounded solver, firewalls plans, and serves
-the current candidate at `/v1/vaults/{address}/plan`. Execute remains not-ready
-because live nonzero-idle attribution and the restricted signer/executor services
-are not yet composed.
+the current candidate at `/v1/vaults/{address}/plan`. Local-development Execute
+is available only on non-mainnet chains and uses the same restricted transaction
+grammar, final simulation, durable signed-byte boundary, receipt conformance and
+exact post-state reconciliation as the production path. Production Execute
+remains fail-closed until the deployment inputs in `docs/deployment-inputs.md`
+and authenticated remote signer are supplied.
 `alerts-test` sends only a typed P2 delivery test; it cannot construct or sign a
 transaction.
+
+Application configuration is strict schema-v3 JSON. Unknown fields fail startup;
+risk values live only in the file, while secrets and HTTP/WebSocket endpoints
+are referenced by environment-variable name. `protocol-lock.toml` remains the
+separate immutable protocol identity lock.
 
 The normative architecture and implementation roadmap live under
 `docs/normative/` and are protected by digest checks.

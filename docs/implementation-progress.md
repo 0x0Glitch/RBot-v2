@@ -37,7 +37,7 @@ production Execute.
 
 - Semantic identifiers, quantities, block contexts, exact snapshots, projections,
   actions, plans and checked arithmetic implemented.
-- Representative schema-v3 TOML parses into sorted typed values; risk fields
+- Per owner override SC-002, representative schema-v3 JSON parses into sorted typed values; risk fields
   cannot be overridden by environment variables.
 - Exact APR ceil/floor conversion and canonical Keccak configuration revision implemented.
 - Official source HEADs pinned to exact commits; deployment runtime identities

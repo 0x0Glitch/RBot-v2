@@ -9,7 +9,7 @@ use morpho_v2_reallocator::config::{
 };
 
 fn example_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.json")
 }
 
 fn raw_example() -> AppConfig {
@@ -47,11 +47,11 @@ fn unknown_field_is_rejected() {
         Err(error) => panic!("cannot read fixture: {error}"),
     };
     let modified = text.replacen(
-        "schema_version = 3",
-        "schema_version = 3\nunknown = true",
+        "\"schema_version\": 3,",
+        "\"schema_version\": 3,\n  \"unknown\": true,",
         1,
     );
-    assert!(toml::from_str::<AppConfig>(&modified).is_err());
+    assert!(serde_json::from_str::<AppConfig>(&modified).is_err());
 }
 
 #[test]
@@ -158,6 +158,16 @@ fn provider_roles_and_hyperevm_log_bound_are_rejected() {
             Err(error) => error,
         },
         "chain",
+    );
+
+    let mut config = raw_example();
+    config.chain.rpc[0].websocket_url_env = None;
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("declared WebSocket support without an endpoint must fail"),
+            Err(error) => error,
+        },
+        "chain.rpc",
     );
 }
 

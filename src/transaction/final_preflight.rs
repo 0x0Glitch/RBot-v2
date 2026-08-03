@@ -225,6 +225,9 @@ impl Drop for ExecutionLease {
 /// State/planner bridge failed closed.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum PreflightSourceError {
+    /// Canonical head or durable event cursor moved while the source was rebuilding.
+    #[error("exact preflight context changed")]
+    ContextChanged,
     /// Exact refresh or plan construction failed.
     #[error("exact preflight source failed")]
     Failed,
@@ -336,7 +339,13 @@ pub async fn execute_one_head_preflight(
         config.app.execution.maximum_inclusion_fast_blocks,
         request.max_fee_per_gas,
     )?;
-    let prepared = source.rebuild_plan(head, &scenarios).await?;
+    let prepared = match source.rebuild_plan(head, &scenarios).await {
+        Ok(prepared) => prepared,
+        Err(PreflightSourceError::ContextChanged) => {
+            return Err(PreflightError::HeadChanged);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let plan = prepared.plan;
     if plan.plan().snapshot.block != head || plan.plan().vault != vault.address {
         return Err(PreflightError::HeadChanged);
@@ -350,14 +359,10 @@ pub async fn execute_one_head_preflight(
         calldata_hash.as_slice(),
     ]);
 
-    require_head(head_provider.latest_header().await?, head)?;
-    let call_output = simulator
-        .call_at(vault.signer_address, vault.address.0, &calldata, head)
-        .await?;
-    let gas_estimate = simulator
-        .estimate_gas_at(vault.signer_address, vault.address.0, &calldata, head)
-        .await?;
-    require_head(head_provider.latest_header().await?, head)?;
+    let (call_output, gas_estimate) = tokio::try_join!(
+        simulator.call_at(vault.signer_address, vault.address.0, &calldata, head),
+        simulator.estimate_gas_at(vault.signer_address, vault.address.0, &calldata, head),
+    )?;
     let gas_limit = signed_gas_limit(
         gas_estimate,
         config.app.execution.gas_headroom_bps,
@@ -672,7 +677,7 @@ mod tests {
 
     #[test]
     fn overlapping_execution_resources_are_exclusive_and_raii_released() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
         let config = AppConfig::load(&path).and_then(AppConfig::validate);
         assert!(config.is_ok());
         let Ok(config) = config else {

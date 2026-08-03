@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn share_deficit_and_removed_accounted_adapter_hard_pause() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
         let config = match AppConfig::load(&path).and_then(AppConfig::validate) {
             Ok(config) => config,
             Err(error) => panic!("fixture configuration must validate: {error}"),

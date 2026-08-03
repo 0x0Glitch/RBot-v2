@@ -4,22 +4,25 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use alloy::primitives::{Address, B256, Bytes, I256, U256, keccak256};
 use alloy::sol_types::{SolCall, SolValue};
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::chain::multicall::{
     AtomicCall, AtomicReadResult, AtomicSnapshotProvider, MulticallError, atomic_latest,
+    pinned_block,
 };
 use crate::config::{
-    ValidatedChainConfig, ValidatedSnapshotConfig, ValidatedStrategyConfig, ValidatedVaultConfig,
+    SnapshotMode, ValidatedChainConfig, ValidatedSnapshotConfig, ValidatedStrategyConfig,
+    ValidatedVaultConfig,
 };
 use crate::contracts::bindings::{
     AdapterMarketParams, IAdapter, IERC20, IGate, IIrm, IMorpho, IMorphoMarketV1AdapterV2, IVaultV2,
 };
 use crate::domain::{
-    AdapterAddress, BlockHashBinding, CapId, CapRef, CapState, DirectAdapterState,
-    DirectMarketPositionState, ExactVaultSnapshot, IdleLockLedgerSnapshot, MarketId, MarketMode,
-    ParentVaultState, PendingAdminOperation, PositionKey, StateContext, StoredMarketState,
+    AdapterAddress, CapId, CapRef, CapState, DirectAdapterState, DirectMarketPositionState,
+    ExactVaultSnapshot, IdleLockLedgerSnapshot, MarketId, MarketMode, ParentVaultState,
+    PendingAdminOperation, PositionKey, StateContext, StoredMarketState,
 };
 
 use super::capability::{
@@ -820,14 +823,17 @@ pub async fn build_exact_snapshot<P: AtomicSnapshotProvider>(
     blueprint: &SnapshotBlueprint<'_>,
 ) -> Result<ExactVaultSnapshot, SnapshotError> {
     let manifest = build_snapshot_manifest(blueprint)?;
-    verify_manifest_code(provider, &manifest).await?;
-    let multicall_code = provider
-        .code_at(blueprint.chain.multicall3)
-        .await
-        .map_err(MulticallError::from)?;
-    if keccak256(multicall_code) != blueprint.chain.expected_multicall3_code_hash {
-        return Err(SnapshotError::CodeIdentityMismatch);
-    }
+    verify_manifest_code(
+        provider,
+        &manifest,
+        blueprint.snapshot_policy.mode,
+        blueprint.event_cursor,
+        (
+            blueprint.chain.multicall3,
+            blueprint.chain.expected_multicall3_code_hash,
+        ),
+    )
+    .await?;
     let calls = manifest
         .calls
         .iter()
@@ -836,15 +842,29 @@ pub async fn build_exact_snapshot<P: AtomicSnapshotProvider>(
             call_data: call.call_data.clone(),
         })
         .collect::<Vec<_>>();
-    let atomic = atomic_latest(
-        provider,
-        blueprint.chain.multicall3,
-        blueprint.chain.chain_id,
-        blueprint.event_cursor,
-        &calls,
-        blueprint.snapshot_policy.maximum_snapshot_retries,
-    )
-    .await?;
+    let atomic = match blueprint.snapshot_policy.mode {
+        SnapshotMode::PinnedBlock => {
+            pinned_block(
+                provider,
+                blueprint.chain.multicall3,
+                blueprint.chain.chain_id,
+                blueprint.event_cursor,
+                &calls,
+            )
+            .await?
+        }
+        SnapshotMode::AtomicLatest => {
+            atomic_latest(
+                provider,
+                blueprint.chain.multicall3,
+                blueprint.chain.chain_id,
+                blueprint.event_cursor,
+                &calls,
+                blueprint.snapshot_policy.maximum_snapshot_retries,
+            )
+            .await?
+        }
+    };
     let values = decode_results(&manifest, &atomic)?;
     assemble_snapshot(blueprint, atomic, values)
 }
@@ -965,20 +985,32 @@ impl<'a> ManifestBuilder<'a> {
 async fn verify_manifest_code<P: AtomicSnapshotProvider>(
     provider: &P,
     manifest: &SnapshotManifest,
+    mode: SnapshotMode,
+    block: crate::domain::BlockRef,
+    multicall: (Address, B256),
 ) -> Result<(), SnapshotError> {
-    let targets = manifest
+    let mut targets = manifest
         .calls
         .iter()
         .map(|call| (call.target, call.expected_code_hash))
         .collect::<BTreeSet<_>>();
-    for (target, expected) in targets {
-        let code = provider
-            .code_at(target)
-            .await
+    targets.insert(multicall);
+    let checks = stream::iter(targets)
+        .map(|(target, expected)| async move {
+            let code = match mode {
+                SnapshotMode::PinnedBlock => provider.code_at_block(target, block).await,
+                SnapshotMode::AtomicLatest => provider.code_at(target).await,
+            }
             .map_err(MulticallError::from)?;
-        if keccak256(code) != expected {
-            return Err(SnapshotError::CodeIdentityMismatch);
-        }
+            if keccak256(code) != expected {
+                return Err(SnapshotError::CodeIdentityMismatch);
+            }
+            Ok(())
+        })
+        .buffer_unordered(8);
+    futures::pin_mut!(checks);
+    while let Some(result) = checks.next().await {
+        result?;
     }
     Ok(())
 }
@@ -1501,7 +1533,7 @@ fn assemble_snapshot(
         context: StateContext {
             chain_id: blueprint.chain.chain_id,
             block: atomic.block,
-            block_hash_binding: BlockHashBinding::Unproven,
+            block_hash_binding: atomic.block_hash_binding,
             static_config_revision: blueprint.static_config_revision,
             dynamic_topology_revision: blueprint.topology.revision()?,
         },
@@ -1666,13 +1698,30 @@ mod tests {
             Ok(self.aggregate_results.clone().abi_encode().into())
         }
 
+        async fn call_at_block(
+            &self,
+            _target: Address,
+            _data: &Bytes,
+            _block: BlockRef,
+        ) -> Result<Bytes, ProviderError> {
+            Ok(self.aggregate_results.clone().abi_encode().into())
+        }
+
         async fn code_at(&self, _target: Address) -> Result<Bytes, ProviderError> {
+            Ok(self.code.clone())
+        }
+
+        async fn code_at_block(
+            &self,
+            _target: Address,
+            _block: BlockRef,
+        ) -> Result<Bytes, ProviderError> {
             Ok(self.code.clone())
         }
     }
 
     fn fixture_config() -> crate::config::ValidatedConfig {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
         match AppConfig::load(&path).and_then(AppConfig::validate) {
             Ok(config) => config,
             Err(error) => panic!("fixture configuration must validate: {error}"),

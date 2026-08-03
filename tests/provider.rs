@@ -143,3 +143,32 @@ async fn runtime_methods_enforce_roles_and_accept_null_receipts()
     ));
     Ok(())
 }
+
+#[tokio::test]
+async fn forbidden_optional_block_receipts_are_treated_as_unsupported()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    let provider = HttpProvider::new(
+        "base-style".to_owned(),
+        Url::parse(&server.uri())?,
+        BTreeSet::from([ProviderRole::Receipt]),
+    )?;
+    assert!(matches!(
+        provider.block_receipts(1).await,
+        Err(ProviderError::MethodUnsupported {
+            method: "eth_getBlockReceipts"
+        })
+    ));
+    assert!(matches!(
+        provider.block_receipts(2).await,
+        Err(ProviderError::MethodUnsupported {
+            method: "eth_getBlockReceipts"
+        })
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    Ok(())
+}

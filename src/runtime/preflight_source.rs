@@ -77,7 +77,7 @@ impl<P: AtomicSnapshotProvider> ExactPreflightSource for LiveRatePreflightSource
         scenarios: &[InclusionAssumption; 3],
     ) -> Result<PreparedPreflightPlan, PreflightSourceError> {
         if self.event_cursor().await? != head {
-            return Err(PreflightSourceError::Failed);
+            return Err(PreflightSourceError::ContextChanged);
         }
         *self.rebuilding_head.write().await = Some(head);
         let result = self.rebuild_at_head(head, scenarios).await;
@@ -115,7 +115,7 @@ impl<P: AtomicSnapshotProvider> LiveRatePreflightSource<P> {
             .map_err(|_| PreflightSourceError::Failed)?
             .ok_or(PreflightSourceError::Failed)?;
         if persisted.block != head {
-            return Err(PreflightSourceError::Failed);
+            return Err(PreflightSourceError::ContextChanged);
         }
         let episode = self
             .storage

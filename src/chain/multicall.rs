@@ -39,8 +39,18 @@ pub trait AtomicSnapshotProvider: Send + Sync {
     async fn latest_header(&self) -> Result<BlockRef, ProviderError>;
     /// Read-only latest-state call.
     async fn call_latest(&self, target: Address, data: &Bytes) -> Result<Bytes, ProviderError>;
+    /// Read-only call pinned to one canonical block hash.
+    async fn call_at_block(
+        &self,
+        target: Address,
+        data: &Bytes,
+        block: BlockRef,
+    ) -> Result<Bytes, ProviderError>;
     /// Latest runtime bytecode.
     async fn code_at(&self, target: Address) -> Result<Bytes, ProviderError>;
+    /// Runtime bytecode pinned to one canonical block hash.
+    async fn code_at_block(&self, target: Address, block: BlockRef)
+    -> Result<Bytes, ProviderError>;
 }
 
 #[async_trait]
@@ -53,8 +63,25 @@ impl AtomicSnapshotProvider for HttpProvider {
         self.read_call(target, data).await
     }
 
+    async fn call_at_block(
+        &self,
+        target: Address,
+        data: &Bytes,
+        block: BlockRef,
+    ) -> Result<Bytes, ProviderError> {
+        self.read_call_at(target, data, block).await
+    }
+
     async fn code_at(&self, target: Address) -> Result<Bytes, ProviderError> {
         HttpProvider::code_at(self, target).await
+    }
+
+    async fn code_at_block(
+        &self,
+        target: Address,
+        block: BlockRef,
+    ) -> Result<Bytes, ProviderError> {
+        self.code_at_block(target, block).await
     }
 }
 
@@ -113,6 +140,30 @@ pub async fn atomic_latest<P: AtomicSnapshotProvider>(
     Err(last_context_failure)
 }
 
+/// Executes the approved aggregate at one canonical EIP-1898 block hash.
+pub async fn pinned_block<P: AtomicSnapshotProvider>(
+    provider: &P,
+    multicall: Address,
+    expected_chain_id: u64,
+    block: BlockRef,
+    calls: &[AtomicCall],
+) -> Result<AtomicReadResult, MulticallError> {
+    let aggregate_calls = context_and_authoritative_calls(multicall, calls);
+    let calldata: Bytes = IMulticall3::aggregate3Call {
+        calls: aggregate_calls,
+    }
+    .abi_encode()
+    .into();
+    let raw = provider.call_at_block(multicall, &calldata, block).await?;
+    decode_aggregate(
+        raw,
+        expected_chain_id,
+        block,
+        BlockHashBinding::Proven,
+        calls.len(),
+    )
+}
+
 async fn atomic_latest_once<P: AtomicSnapshotProvider>(
     provider: &P,
     multicall: Address,
@@ -124,6 +175,27 @@ async fn atomic_latest_once<P: AtomicSnapshotProvider>(
     if event_cursor.number != before.number || event_cursor.hash != before.hash {
         return Err(MulticallError::CursorNotAtHead);
     }
+    let aggregate_calls = context_and_authoritative_calls(multicall, calls);
+    let calldata: Bytes = IMulticall3::aggregate3Call {
+        calls: aggregate_calls,
+    }
+    .abi_encode()
+    .into();
+    let raw = provider.call_latest(multicall, &calldata).await?;
+    let after = provider.latest_header().await?;
+    if before.hash != after.hash || before != after {
+        return Err(MulticallError::ContextChanged);
+    }
+    decode_aggregate(
+        raw,
+        expected_chain_id,
+        before,
+        BlockHashBinding::Unproven,
+        calls.len(),
+    )
+}
+
+fn context_and_authoritative_calls(multicall: Address, calls: &[AtomicCall]) -> Vec<Call3> {
     let mut aggregate_calls = Vec::with_capacity(CONTEXT_CALLS.saturating_add(calls.len()));
     for call_data in [
         IMulticall3::getBlockNumberCall {}.abi_encode().into(),
@@ -144,16 +216,20 @@ async fn atomic_latest_once<P: AtomicSnapshotProvider>(
         allowFailure: false,
         callData: call.call_data.clone(),
     }));
-    let calldata: Bytes = IMulticall3::aggregate3Call {
-        calls: aggregate_calls,
-    }
-    .abi_encode()
-    .into();
-    let raw = provider.call_latest(multicall, &calldata).await?;
+    aggregate_calls
+}
+
+fn decode_aggregate(
+    raw: Bytes,
+    expected_chain_id: u64,
+    block: BlockRef,
+    block_hash_binding: BlockHashBinding,
+    authoritative_calls: usize,
+) -> Result<AtomicReadResult, MulticallError> {
     let decoded = <Vec<(bool, Bytes)> as SolValue>::abi_decode(&raw)
         .map_err(|_| MulticallError::MalformedAggregate)?;
     if decoded.abi_encode().as_slice() != raw.as_ref()
-        || decoded.len() != CONTEXT_CALLS.saturating_add(calls.len())
+        || decoded.len() != CONTEXT_CALLS.saturating_add(authoritative_calls)
     {
         return Err(MulticallError::MalformedAggregate);
     }
@@ -164,25 +240,20 @@ async fn atomic_latest_once<P: AtomicSnapshotProvider>(
             });
         }
     }
-    let after = provider.latest_header().await?;
-    if before.hash != after.hash || before != after {
-        return Err(MulticallError::ContextChanged);
-    }
-
     let number = decode_u256(&decoded[0].1)?;
     let timestamp = decode_u256(&decoded[1].1)?;
     let chain_id = decode_u256(&decoded[2].1)?;
     let parent_hash = decode_b256(&decoded[3].1)?;
-    if number != U256::from(before.number)
-        || timestamp != U256::from(before.timestamp)
+    if number != U256::from(block.number)
+        || timestamp != U256::from(block.timestamp)
         || chain_id != U256::from(expected_chain_id)
-        || parent_hash != before.parent_hash
+        || parent_hash != block.parent_hash
     {
         return Err(MulticallError::ContextMismatch);
     }
     Ok(AtomicReadResult {
-        block: before,
-        block_hash_binding: BlockHashBinding::Unproven,
+        block,
+        block_hash_binding,
         return_data: decoded
             .into_iter()
             .skip(CONTEXT_CALLS)

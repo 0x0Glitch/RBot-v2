@@ -6,7 +6,7 @@
 | Milestone 0 | Build identity and fail-closed bootstrap binary | `src/lib.rs`, `src/main.rs`, `src/telemetry/metrics.rs` | unit test and CLI smoke | Implemented |
 | Milestones 10–13 | Final preflight through canary implementation | milestone modules and tests | milestone gates | Milestones 10–11 and operations implemented; real local E2E reaches terminal signed execution/reconciliation; canonical live state composition implemented, live planner/executor and invalidation/crash matrix pending |
 | 5 | Semantic quantities, contexts, exact snapshot and plan types | `src/domain.rs` | unit and compile-fail tests | Implemented |
-| 6 | Strict TOML parsing, validation, APR conversion, canonical revision | `src/config.rs`, `config.example.toml` | `tests/config.rs` | Implemented |
+| 6 | Owner override SC-002: strict JSON parsing, validation, APR conversion, canonical revision | `src/config.rs`, `config.example.json`, `docs/spec-conflicts.md` | `tests/config.rs` | Implemented; syntax-only override of normative TOML |
 | 7.1 | Pinned source/runtime identity model and lock digest | `src/protocol_lock.rs`, `protocol-lock.toml` | `tests/protocol_lock.rs` | Implemented; deployment values pending |
 | 7.5 | Static doctor and lock validation commands | `src/cli.rs`, `src/main.rs` | CLI smoke at milestone gate | Static phase implemented |
 | 8.1–8.7 | Owner override: strict versioned JSON document, exclusive single-writer actor and bounded commands | `src/storage/actor.rs`, `src/serde_helpers.rs`, `docs/spec-conflicts.md` | format/reopen, cap-rich topology round-trip, corruption and writer-lock tests | Implemented by explicit owner override |

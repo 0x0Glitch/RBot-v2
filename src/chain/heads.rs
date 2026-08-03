@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use alloy::primitives::{Address, B256};
+use futures::{StreamExt, stream};
 use tokio::sync::mpsc;
 
 use crate::domain::BlockRef;
@@ -18,6 +19,8 @@ use super::reorg::find_common_ancestor;
 
 const MAX_OFFICIAL_LOG_RANGE: u64 = 50;
 const ADDRESS_GROUP_SIZE: usize = 64;
+const MAX_CATCH_UP_CONCURRENCY: usize = 8;
+const MAX_PUBLISHED_CATCH_UP_BLOCKS: u64 = 8;
 
 /// Canonical chain-service settings after fail-closed validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,8 +134,16 @@ impl<P: ChainDataProvider> ChainService<P> {
         let cursor = self.storage.load_cursor(self.config.chain_id).await?;
         match cursor {
             None => {
-                self.catch_up_from(self.config.event_start_block, latest)
-                    .await?
+                let span = latest
+                    .number
+                    .saturating_sub(self.config.event_start_block)
+                    .saturating_add(1);
+                self.catch_up_from(
+                    self.config.event_start_block,
+                    latest,
+                    span <= MAX_PUBLISHED_CATCH_UP_BLOCKS,
+                )
+                .await?
             }
             Some(old_head) => {
                 let same_height = latest.number == old_head.number;
@@ -144,7 +155,9 @@ impl<P: ChainDataProvider> ChainService<P> {
                 if !cursor_still_canonical || (same_height && latest.hash != old_head.hash) {
                     self.rewind_and_replay(old_head, latest).await?;
                 } else if latest.number > old_head.number {
-                    self.catch_up_from(old_head.number.saturating_add(1), latest)
+                    let start = old_head.number.saturating_add(1);
+                    let span = latest.number.saturating_sub(start).saturating_add(1);
+                    self.catch_up_from(start, latest, span <= MAX_PUBLISHED_CATCH_UP_BLOCKS)
                         .await?;
                 }
             }
@@ -158,7 +171,12 @@ impl<P: ChainDataProvider> ChainService<P> {
         self.poll_once().await
     }
 
-    async fn catch_up_from(&self, start: u64, latest: BlockRef) -> Result<(), ChainError> {
+    async fn catch_up_from(
+        &self,
+        start: u64,
+        latest: BlockRef,
+        publish_blocks: bool,
+    ) -> Result<(), ChainError> {
         if start > latest.number {
             return Ok(());
         }
@@ -169,12 +187,27 @@ impl<P: ChainDataProvider> ChainService<P> {
                 .load_canonical_block(self.config.chain_id, start.saturating_sub(1))
                 .await?
         };
-        for number in start..=latest.number {
-            let block = if number == latest.number {
-                latest
-            } else {
-                self.primary.header_by_number(number).await?
-            };
+        let bundles = stream::iter(start..=latest.number)
+            .map(|number| async move {
+                let block = if number == latest.number {
+                    latest
+                } else {
+                    self.primary.header_by_number(number).await?
+                };
+                let (receipts, logs) = if !publish_blocks {
+                    // Historical replay needs receipts only for transactions that
+                    // emitted watched logs. Fetching every unrelated receipt is
+                    // expensive and provides no additional canonical state.
+                    self.fallback_bundle(block).await?
+                } else {
+                    self.block_bundle(block).await?
+                };
+                Ok::<_, ChainError>((block, receipts, logs))
+            })
+            .buffered(MAX_CATCH_UP_CONCURRENCY);
+        futures::pin_mut!(bundles);
+        while let Some(bundle) = bundles.next().await {
+            let (block, receipts, logs) = bundle?;
             if let Some(parent) = previous
                 && (block.number != parent.number.saturating_add(1)
                     || block.parent_hash != parent.hash)
@@ -183,7 +216,6 @@ impl<P: ChainDataProvider> ChainService<P> {
                     "canonical head changed during bounded catch-up",
                 ));
             }
-            let (receipts, logs) = self.block_bundle(block).await?;
             self.storage
                 .apply_canonical_block_with_receipts(
                     CanonicalBlockRecord {
@@ -207,12 +239,14 @@ impl<P: ChainDataProvider> ChainService<P> {
                     block.timestamp,
                 )
                 .await?;
-            self.send_update(ChainUpdate::CanonicalBlock {
-                block,
-                receipts,
-                logs,
-            })
-            .await?;
+            if publish_blocks {
+                self.send_update(ChainUpdate::CanonicalBlock {
+                    block,
+                    receipts,
+                    logs,
+                })
+                .await?;
+            }
             previous = Some(block);
         }
         Ok(())
@@ -241,7 +275,7 @@ impl<P: ChainDataProvider> ChainService<P> {
             common_ancestor: ancestor,
         })
         .await?;
-        self.catch_up_from(ancestor.number.saturating_add(1), new_head)
+        self.catch_up_from(ancestor.number.saturating_add(1), new_head, false)
             .await
     }
 
@@ -253,6 +287,14 @@ impl<P: ChainDataProvider> ChainService<P> {
             Ok(receipts) => {
                 let receipts = validate_receipts(self.config.chain_id, block, receipts)?;
                 let logs = watched_logs(&receipts, &self.config.watched_addresses);
+                let watched_transactions = logs
+                    .iter()
+                    .map(|log| log.transaction_hash)
+                    .collect::<BTreeSet<_>>();
+                let receipts = receipts
+                    .into_iter()
+                    .filter(|receipt| watched_transactions.contains(&receipt.transaction_hash))
+                    .collect();
                 Ok((receipts, logs))
             }
             Err(ProviderError::MethodUnsupported { .. }) => self.fallback_bundle(block).await,

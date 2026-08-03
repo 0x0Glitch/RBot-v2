@@ -27,3 +27,20 @@ Operational limitation: a single JSON document has linear rewrite cost as
 history grows. Release sizing must demonstrate acceptable state-file size and
 commit latency; exceeding those bounds disables Execute rather than weakening
 durability.
+
+## SC-002 — Operator configuration format
+
+- Date: 2026-08-03
+- Authority: explicit repository-owner instruction during implementation
+- Normative text affected: engineering specification section 6.1 and
+  architecture section 22.2
+- Decision: JSON replaces TOML for the application configuration file.
+
+This changes syntax only. The schema remains versioned, every raw configuration
+struct rejects unknown fields, parsing and validation remain separate, risk
+settings cannot be supplied through environment variables, endpoint and secret
+values remain environment references, and the validated configuration revision
+continues to hash canonical sorted JSON. Operator-facing collection names are
+plural (`providers`, `vaults`, `rate_groups`, `adapters`, and `positions`), and
+HTTP and WebSocket endpoint references are explicit. `protocol-lock.toml`
+remains TOML exactly as required by the normative protocol-lock specification.
