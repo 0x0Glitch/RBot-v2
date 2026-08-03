@@ -26,6 +26,8 @@ pub struct SignedEnvelope {
 pub struct ValidatedPendingTransaction {
     transaction_id: TransactionId,
     original: ValidatedRoutineTransaction,
+    current_max_fee_per_gas: u128,
+    current_max_priority_fee_per_gas: u128,
 }
 
 impl ValidatedPendingTransaction {
@@ -35,10 +37,36 @@ impl ValidatedPendingTransaction {
         transaction_id: TransactionId,
         original: ValidatedRoutineTransaction,
     ) -> Self {
+        let current_max_fee_per_gas = original.fields().max_fee_per_gas;
+        let current_max_priority_fee_per_gas = original.fields().max_priority_fee_per_gas;
         Self {
             transaction_id,
             original,
+            current_max_fee_per_gas,
+            current_max_priority_fee_per_gas,
         }
+    }
+
+    /// Restores the latest durable replacement fee pair for the same original calldata.
+    pub fn from_recovered_attempt(
+        transaction_id: TransactionId,
+        original: ValidatedRoutineTransaction,
+        current_max_fee_per_gas: u128,
+        current_max_priority_fee_per_gas: u128,
+    ) -> Result<Self, SignerError> {
+        let original_fields = original.fields();
+        if current_max_fee_per_gas < original_fields.max_fee_per_gas
+            || current_max_priority_fee_per_gas < original_fields.max_priority_fee_per_gas
+            || current_max_priority_fee_per_gas > current_max_fee_per_gas
+        {
+            return Err(SignerError::Policy);
+        }
+        Ok(Self {
+            transaction_id,
+            original,
+            current_max_fee_per_gas,
+            current_max_priority_fee_per_gas,
+        })
     }
 
     /// Returns the durable transaction identity.
@@ -51,6 +79,18 @@ impl ValidatedPendingTransaction {
     #[must_use]
     pub fn original(&self) -> &ValidatedRoutineTransaction {
         &self.original
+    }
+
+    /// Returns the latest durable maximum fee for this nonce lane.
+    #[must_use]
+    pub fn current_max_fee_per_gas(&self) -> u128 {
+        self.current_max_fee_per_gas
+    }
+
+    /// Returns the latest durable priority fee for this nonce lane.
+    #[must_use]
+    pub fn current_max_priority_fee_per_gas(&self) -> u128 {
+        self.current_max_priority_fee_per_gas
     }
 }
 
@@ -169,8 +209,8 @@ impl ExpectedSignedTransaction {
 
     pub(crate) fn replacement(request: &SignReplacementRequest) -> Result<Self, SignerError> {
         let original = request.pending.original().fields();
-        if request.max_fee_per_gas <= original.max_fee_per_gas
-            || request.max_priority_fee_per_gas <= original.max_priority_fee_per_gas
+        if request.max_fee_per_gas <= request.pending.current_max_fee_per_gas
+            || request.max_priority_fee_per_gas <= request.pending.current_max_priority_fee_per_gas
             || request.max_priority_fee_per_gas > request.max_fee_per_gas
         {
             return Err(SignerError::Policy);
@@ -191,8 +231,8 @@ impl ExpectedSignedTransaction {
     pub(crate) fn cancellation(request: &SignCancellationRequest) -> Result<Self, SignerError> {
         let original = request.pending.original().fields();
         if request.gas_limit == 0
-            || request.max_fee_per_gas <= original.max_fee_per_gas
-            || request.max_priority_fee_per_gas <= original.max_priority_fee_per_gas
+            || request.max_fee_per_gas <= request.pending.current_max_fee_per_gas
+            || request.max_priority_fee_per_gas <= request.pending.current_max_priority_fee_per_gas
             || request.max_priority_fee_per_gas > request.max_fee_per_gas
         {
             return Err(SignerError::Policy);

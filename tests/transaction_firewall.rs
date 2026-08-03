@@ -9,11 +9,12 @@ use std::{
 use alloy::{
     consensus::{SignableTransaction, TxEip1559, TxEnvelope},
     eips::eip2718::Encodable2718,
-    primitives::{Address, B256, Bytes, I256, U256},
+    primitives::{Address, B256, Bytes, I256, TxKind, U256},
     signers::{SignerSync, local::PrivateKeySigner},
     sol_types::SolCall,
 };
 use morpho_v2_reallocator::{
+    chain::provider::{ProviderError, SignedTransactionSubmitter},
     config::{AppConfig, ValidatedConfig},
     contracts::bindings::IVaultV2,
     domain::{
@@ -34,6 +35,9 @@ use morpho_v2_reallocator::{
             sign_durable_rebalance,
         },
         nonce::NonceLane,
+        pending::{
+            CancellationReason, PendingAttemptRequest, PendingDecision, execute_pending_attempt,
+        },
         remote_signer::{RemoteRoutineSigner, RemoteSignerPolicy},
         signer::{
             RoutineSigner, SignCancellationRequest, SignRebalanceRequest, SignReplacementRequest,
@@ -376,16 +380,50 @@ impl RoutineSigner for LocalTestRoutineSigner {
 
     async fn sign_replacement(
         &self,
-        _request: SignReplacementRequest,
+        request: SignReplacementRequest,
     ) -> Result<SignedEnvelope, SignerError> {
-        Err(SignerError::Policy)
+        let mut transaction = request.pending.original().eip1559();
+        transaction.max_fee_per_gas = request.max_fee_per_gas;
+        transaction.max_priority_fee_per_gas = request.max_priority_fee_per_gas;
+        let raw_transaction = signed_raw(&self.0, transaction);
+        Ok(SignedEnvelope {
+            transaction_hash: alloy::primitives::keccak256(&raw_transaction),
+            signer: self.0.address(),
+            raw_transaction,
+        })
     }
 
     async fn sign_cancellation(
         &self,
-        _request: SignCancellationRequest,
+        request: SignCancellationRequest,
     ) -> Result<SignedEnvelope, SignerError> {
-        Err(SignerError::Policy)
+        let original = request.pending.original().fields();
+        let transaction = TxEip1559 {
+            chain_id: original.chain_id,
+            nonce: original.nonce,
+            gas_limit: request.gas_limit,
+            max_fee_per_gas: request.max_fee_per_gas,
+            max_priority_fee_per_gas: request.max_priority_fee_per_gas,
+            to: TxKind::Call(original.from),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        };
+        let raw_transaction = signed_raw(&self.0, transaction);
+        Ok(SignedEnvelope {
+            transaction_hash: alloy::primitives::keccak256(&raw_transaction),
+            signer: self.0.address(),
+            raw_transaction,
+        })
+    }
+}
+
+struct HashingSubmitter;
+
+#[async_trait::async_trait]
+impl SignedTransactionSubmitter for HashingSubmitter {
+    async fn submit_signed_bytes(&self, signed: &Bytes) -> Result<B256, ProviderError> {
+        Ok(alloy::primitives::keccak256(signed))
     }
 }
 
@@ -455,6 +493,146 @@ async fn plan_nonce_and_signed_bytes_are_durable_before_envelope_is_returned() {
         Ok(None) => panic!("signed transaction must be durably unresolved"),
         Err(error) => panic!("recovery query must pass: {error}"),
     }
+    if let Err(error) = service.shutdown().await {
+        panic!("storage must shut down: {error}");
+    }
+}
+
+#[tokio::test]
+async fn replacement_and_cancellation_are_durable_before_each_broadcast() {
+    let signer = LocalTestRoutineSigner(PrivateKeySigner::random());
+    let config = config_for_signer(signer.0.address());
+    let plan = validated_plan(&config);
+    let transaction = match validate_routine_transaction(
+        &plan,
+        fields(&config, &plan),
+        config.app.chain.chain_id,
+        &config.app.vaults[0],
+        &config.app.execution,
+    ) {
+        Ok(transaction) => transaction,
+        Err(error) => panic!("fixture transaction must validate: {error}"),
+    };
+    let original = transaction.clone();
+    let directory = match TempDir::new() {
+        Ok(directory) => directory,
+        Err(error) => panic!("temporary directory must open: {error}"),
+    };
+    let service = match morpho_v2_reallocator::storage::actor::StorageService::start(
+        &directory.path().join("pending-attempts.json"),
+        8,
+        1_800_000_000,
+    ) {
+        Ok(service) => service,
+        Err(error) => panic!("storage must start: {error}"),
+    };
+    if let Err(error) = service
+        .handle()
+        .persist_snapshot(durable_snapshot(&plan, &config), 1_800_000_000)
+        .await
+    {
+        panic!("exact snapshot must be durable first: {error}");
+    }
+    let transaction_id = TransactionId(B256::repeat_byte(0xc0));
+    let durable = match persist_unsigned_rebalance(
+        &service.handle(),
+        &plan,
+        transaction,
+        transaction_id,
+        1_800_000_001,
+    )
+    .await
+    {
+        Ok(durable) => durable,
+        Err(error) => panic!("unsigned boundary must persist: {error}"),
+    };
+    let initial =
+        match sign_durable_rebalance(&service.handle(), &signer, durable, B256::repeat_byte(0xc1))
+            .await
+        {
+            Ok(signed) => signed,
+            Err(error) => panic!("initial signing must pass: {error}"),
+        };
+    if let Err(error) = service
+        .handle()
+        .transition_transaction(
+            morpho_v2_reallocator::storage::models::TransactionTransition {
+                transaction_id,
+                expected_state: morpho_v2_reallocator::storage::models::TransactionState::Signed,
+                next_state: morpho_v2_reallocator::storage::models::TransactionState::Submitted,
+                transaction_hash: Some(initial.transaction_hash),
+                submitted_at: Some(1_800_000_002),
+                included_block: None,
+                included_block_hash: None,
+                updated_at: 1_800_000_002,
+            },
+        )
+        .await
+    {
+        panic!("initial submission must persist: {error}");
+    }
+
+    let pending = ValidatedPendingTransaction::from_submitted(transaction_id, original.clone());
+    let replacement = execute_pending_attempt(
+        &service.handle(),
+        &signer,
+        &HashingSubmitter,
+        &config.app.execution,
+        PendingAttemptRequest {
+            pending,
+            expected_state: morpho_v2_reallocator::storage::models::TransactionState::Submitted,
+            decision: PendingDecision::Replace,
+            signer_request_id: B256::repeat_byte(0xc2),
+            max_fee_per_gas: 3_000_000_000,
+            max_priority_fee_per_gas: 1_500_000_000,
+            cancellation_gas_limit: 21_000,
+            created_at: 1_800_000_003,
+        },
+    )
+    .await;
+    assert!(replacement.is_ok(), "replacement failed: {replacement:?}");
+
+    let replaced_pending = match ValidatedPendingTransaction::from_recovered_attempt(
+        transaction_id,
+        original,
+        3_000_000_000,
+        1_500_000_000,
+    ) {
+        Ok(pending) => pending,
+        Err(error) => panic!("replacement recovery must validate: {error}"),
+    };
+    let cancellation = execute_pending_attempt(
+        &service.handle(),
+        &signer,
+        &HashingSubmitter,
+        &config.app.execution,
+        PendingAttemptRequest {
+            pending: replaced_pending,
+            expected_state: morpho_v2_reallocator::storage::models::TransactionState::Replaced,
+            decision: PendingDecision::Cancel(CancellationReason::PendingHorizon),
+            signer_request_id: B256::repeat_byte(0xc3),
+            max_fee_per_gas: 4_000_000_000,
+            max_priority_fee_per_gas: 2_000_000_000,
+            cancellation_gas_limit: 21_000,
+            created_at: 1_800_000_004,
+        },
+    )
+    .await;
+    assert!(
+        cancellation.is_ok(),
+        "cancellation failed: {cancellation:?}"
+    );
+    let unresolved = service.handle().load_unresolved(signer.0.address()).await;
+    let unresolved = match unresolved {
+        Ok(Some(unresolved)) => unresolved,
+        Ok(None) => panic!("cancellation must remain unresolved"),
+        Err(error) => panic!("recovery query must pass: {error}"),
+    };
+    assert_eq!(
+        unresolved.state,
+        morpho_v2_reallocator::storage::models::TransactionState::CancellationSubmitted
+    );
+    assert_eq!(unresolved.known_transaction_hashes.len(), 3);
     if let Err(error) = service.shutdown().await {
         panic!("storage must shut down: {error}");
     }

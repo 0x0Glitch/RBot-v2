@@ -106,7 +106,14 @@ impl TransactionState {
                     | Self::Reverted
                     | Self::Failed
             ),
-            Self::Replaced => matches!(next, Self::Included | Self::Orphaned | Self::Failed),
+            Self::Replaced => matches!(
+                next,
+                Self::Replaced
+                    | Self::CancellationSubmitted
+                    | Self::Included
+                    | Self::Orphaned
+                    | Self::Failed
+            ),
             Self::CancellationSubmitted => {
                 matches!(next, Self::Included | Self::Reverted | Self::Failed)
             }
@@ -192,6 +199,39 @@ pub struct SignedTransactionRecord {
     pub updated_at: u64,
 }
 
+/// Restricted signed-attempt kind within one nonce lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionAttemptKind {
+    /// Initial routine rebalance.
+    Initial,
+    /// Identical-calldata fee replacement.
+    Replacement,
+    /// Same-nonce self-transfer cancellation.
+    Cancellation,
+}
+
+/// One exact signed transaction attempt, durable before its broadcast.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignedAttemptRecord {
+    /// Existing lifecycle identity.
+    pub transaction_id: TransactionId,
+    /// Restricted attempt kind.
+    pub kind: TransactionAttemptKind,
+    /// Signed transaction hash.
+    pub transaction_hash: B256,
+    /// Complete signed EIP-2718 bytes.
+    pub raw_signed_transaction: Bytes,
+    /// EIP-1559 maximum fee per gas.
+    pub max_fee_per_gas: U256,
+    /// EIP-1559 priority fee per gas.
+    pub max_priority_fee_per_gas: U256,
+    /// Durable signing timestamp.
+    pub signed_at: u64,
+    /// Durable broadcast timestamp, populated only after submission returns.
+    pub broadcast_at: Option<u64>,
+}
+
 /// Checked state transition with optional inclusion/submission facts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransactionTransition {
@@ -232,6 +272,12 @@ pub struct UnresolvedTransaction {
     pub calldata: Bytes,
     /// Calldata hash.
     pub calldata_hash: B256,
+    /// Every durable signed-attempt hash, in signing order.
+    pub known_transaction_hashes: Vec<B256>,
+    /// Latest durable attempt maximum fee per gas.
+    pub current_max_fee_per_gas: U256,
+    /// Latest durable attempt priority fee per gas.
+    pub current_max_priority_fee_per_gas: U256,
 }
 
 /// Result of an atomic canonical rewind.

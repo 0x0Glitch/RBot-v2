@@ -10,7 +10,7 @@
 
 ## Later milestones
 
-Milestones 10–13 remain pending in normative order. Execute remains disabled.
+Milestones 11–13 remain pending in normative order. Execute remains disabled.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 
@@ -197,7 +197,7 @@ Milestones 10–13 remain pending in normative order. Execute remains disabled.
 - `make ci` passes with 79 positive/property/integration/differential tests and
   six compile-fail semantic-boundary cases.
 
-## Milestone 10 — One-Head Preflight And Submission (In Progress)
+## Milestone 10 — One-Head Preflight And Submission
 
 - Typed provider surfaces now support canonical pinned `eth_call`, gas
   estimation, HyperEVM lane checking and already-signed-byte submission without
@@ -209,6 +209,19 @@ Milestones 10–13 remain pending in normative order. Execute remains disabled.
 - Signing is split into durable reservation, final gate, restricted signing and
   durable signed-byte phases; moved heads and queued invalidations abort an
   unsigned nonce reservation.
-- Runtime lock ownership, episode movement-reservation integration, replacement
-  scheduling and complete submit/receipt/reconciliation orchestration remain in
-  later Milestone 10–11 work. Execute remains disabled.
+- A process-wide reservation manager excludes overlapping vault, signer, Morpho
+  market and shared loan-token execution. The exact-state source must durably
+  reserve episode/plan movement before nonce ownership and release it on every
+  unsigned abort.
+- Pending policy counts only eligible fast-block opportunities, applies
+  plan-reason-specific horizons, cancels on touched-state or hard-safety
+  invalidation before replacement, and rejects clocks that move backwards.
+- Initial, replacement and cancellation signed attempts are individually
+  persisted before broadcast. Recovery returns every known hash, the latest
+  signed bytes and current fee pair; every later fee pair must strictly exceed
+  the latest durable attempt rather than merely the original transaction.
+- Focused tests cover successful same-head submission, head movement after
+  unsigned persistence, reservation release, fast-block timing, material
+  cancellation, attempt crash boundaries and three-attempt recovery.
+- The concrete supervised runtime source and receipt/reconciliation consumer are
+  Milestones 11–12 work. Execute remains disabled.

@@ -23,8 +23,8 @@ use super::{
     StorageError,
     models::{
         CanonicalBlockRecord, CanonicalLogRecord, FinalPreflightRecord, NonceReservation,
-        RewindResult, SignedTransactionRecord, TransactionState, TransactionTransition,
-        UnresolvedTransaction,
+        RewindResult, SignedAttemptRecord, SignedTransactionRecord, TransactionAttemptKind,
+        TransactionState, TransactionTransition, UnresolvedTransaction,
     },
 };
 
@@ -80,6 +80,8 @@ struct JsonState {
     plans: Vec<TimedPlan>,
     final_preflights: Vec<FinalPreflightRecord>,
     transactions: Vec<TransactionRow>,
+    #[serde(default)]
+    transaction_attempts: Vec<SignedAttemptRecord>,
     topology_history: Vec<TopologyRevision>,
     rate_episodes: Vec<TimedEpisode>,
 }
@@ -96,6 +98,7 @@ impl Default for JsonState {
             plans: Vec::new(),
             final_preflights: Vec::new(),
             transactions: Vec::new(),
+            transaction_attempts: Vec::new(),
             topology_history: Vec::new(),
             rate_episodes: Vec::new(),
         }
@@ -255,6 +258,13 @@ pub enum StorageCommand {
     PersistSignedTransaction {
         /// Signed record.
         transaction: SignedTransactionRecord,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Persist a replacement or cancellation attempt before broadcast.
+    PersistSignedAttempt {
+        /// Complete signed attempt.
+        attempt: SignedAttemptRecord,
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
@@ -424,6 +434,15 @@ impl StorageHandle {
         transaction: SignedTransactionRecord,
     ) -> Result<(), StorageError> {
         self.request(|reply| StorageCommand::PersistSignedTransaction { transaction, reply })
+            .await
+    }
+
+    /// Persists an exact replacement or cancellation attempt before broadcast.
+    pub async fn persist_signed_attempt(
+        &self,
+        attempt: SignedAttemptRecord,
+    ) -> Result<(), StorageError> {
+        self.request(|reply| StorageCommand::PersistSignedAttempt { attempt, reply })
             .await
     }
 
@@ -688,6 +707,9 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
             StorageCommand::PersistSignedTransaction { transaction, reply } => {
                 let _ = reply.send(store.commit(|state| persist_signed(state, transaction)));
             }
+            StorageCommand::PersistSignedAttempt { attempt, reply } => {
+                let _ = reply.send(store.commit(|state| persist_signed_attempt(state, attempt)));
+            }
             StorageCommand::TransitionTransaction { transition, reply } => {
                 let _ = reply.send(store.commit(|state| transition_transaction(state, transition)));
             }
@@ -942,6 +964,9 @@ fn persist_signed(
             "signed transaction bytes are empty",
         ));
     }
+    if keccak256(&signed.raw_signed_transaction) != signed.transaction_hash {
+        return Err(StorageError::Invariant("signed transaction hash mismatch"));
+    }
     let row = state
         .transactions
         .iter_mut()
@@ -954,6 +979,59 @@ fn persist_signed(
     row.transaction_hash = Some(signed.transaction_hash);
     row.raw_signed_transaction = Some(signed.raw_signed_transaction);
     row.updated_at = signed.updated_at;
+    state.transaction_attempts.push(SignedAttemptRecord {
+        transaction_id: signed.transaction_id,
+        kind: TransactionAttemptKind::Initial,
+        transaction_hash: signed.transaction_hash,
+        raw_signed_transaction: row
+            .raw_signed_transaction
+            .clone()
+            .ok_or(StorageError::Invariant("signed bytes disappeared"))?,
+        max_fee_per_gas: row.reservation.max_fee_per_gas,
+        max_priority_fee_per_gas: row.reservation.max_priority_fee_per_gas,
+        signed_at: signed.updated_at,
+        broadcast_at: None,
+    });
+    Ok(())
+}
+
+fn persist_signed_attempt(
+    state: &mut JsonState,
+    attempt: SignedAttemptRecord,
+) -> Result<(), StorageError> {
+    if attempt.kind == TransactionAttemptKind::Initial {
+        return Err(StorageError::Invariant(
+            "additional signed attempt cannot be initial",
+        ));
+    }
+    if attempt.raw_signed_transaction.is_empty()
+        || keccak256(&attempt.raw_signed_transaction) != attempt.transaction_hash
+        || attempt.broadcast_at.is_some()
+    {
+        return Err(StorageError::Invariant("invalid signed attempt"));
+    }
+    if state
+        .transaction_attempts
+        .iter()
+        .any(|existing| existing.transaction_hash == attempt.transaction_hash)
+    {
+        return Err(StorageError::Invariant("duplicate signed attempt"));
+    }
+    let row = state
+        .transactions
+        .iter_mut()
+        .find(|row| row.reservation.transaction_id == attempt.transaction_id)
+        .ok_or(StorageError::StaleTransition)?;
+    if !matches!(
+        row.state,
+        TransactionState::Submitted | TransactionState::Replaced
+    ) {
+        return Err(StorageError::StaleTransition);
+    }
+    row.transaction_hash = Some(attempt.transaction_hash);
+    row.raw_signed_transaction = Some(attempt.raw_signed_transaction.clone());
+    row.updated_at = attempt.signed_at;
+    state.transaction_attempts.push(attempt);
     Ok(())
 }
 
@@ -974,6 +1052,30 @@ fn transition_transaction(
         .ok_or(StorageError::StaleTransition)?;
     if row.state != transition.expected_state {
         return Err(StorageError::StaleTransition);
+    }
+    if matches!(
+        transition.next_state,
+        TransactionState::Submitted
+            | TransactionState::Replaced
+            | TransactionState::CancellationSubmitted
+    ) {
+        let hash = transition.transaction_hash.ok_or(StorageError::Invariant(
+            "broadcast transition has no transaction hash",
+        ))?;
+        let submitted_at = transition.submitted_at.ok_or(StorageError::Invariant(
+            "broadcast transition has no submission timestamp",
+        ))?;
+        let attempt = state
+            .transaction_attempts
+            .iter_mut()
+            .find(|attempt| {
+                attempt.transaction_id == transition.transaction_id
+                    && attempt.transaction_hash == hash
+            })
+            .ok_or(StorageError::Invariant(
+                "broadcast transition has no durable signed attempt",
+            ))?;
+        attempt.broadcast_at = Some(submitted_at);
     }
     row.state = transition.next_state;
     if let Some(hash) = transition.transaction_hash {
@@ -1004,15 +1106,36 @@ fn load_unresolved(
     if rows.len() > 1 {
         return Err(StorageError::MultipleUnresolved { signer });
     }
-    Ok(rows.first().map(|row| UnresolvedTransaction {
-        transaction_id: row.reservation.transaction_id,
-        signer,
-        nonce: row.reservation.nonce,
-        state: row.state,
-        transaction_hash: row.transaction_hash,
-        raw_signed_transaction: row.raw_signed_transaction.clone(),
-        calldata: row.reservation.calldata.clone(),
-        calldata_hash: row.reservation.calldata_hash,
+    Ok(rows.first().map(|row| {
+        let latest_attempt = state
+            .transaction_attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.transaction_id == row.reservation.transaction_id);
+        UnresolvedTransaction {
+            transaction_id: row.reservation.transaction_id,
+            signer,
+            nonce: row.reservation.nonce,
+            state: row.state,
+            transaction_hash: row.transaction_hash,
+            raw_signed_transaction: row.raw_signed_transaction.clone(),
+            calldata: row.reservation.calldata.clone(),
+            calldata_hash: row.reservation.calldata_hash,
+            known_transaction_hashes: state
+                .transaction_attempts
+                .iter()
+                .filter(|attempt| attempt.transaction_id == row.reservation.transaction_id)
+                .map(|attempt| attempt.transaction_hash)
+                .collect(),
+            current_max_fee_per_gas: latest_attempt
+                .map_or(row.reservation.max_fee_per_gas, |attempt| {
+                    attempt.max_fee_per_gas
+                }),
+            current_max_priority_fee_per_gas: latest_attempt
+                .map_or(row.reservation.max_priority_fee_per_gas, |attempt| {
+                    attempt.max_priority_fee_per_gas
+                }),
+        }
     }))
 }
 

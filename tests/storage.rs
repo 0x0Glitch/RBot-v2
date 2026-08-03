@@ -15,8 +15,8 @@ use morpho_v2_reallocator::planner::episodes::RateSignalEpisode;
 use morpho_v2_reallocator::storage::StorageError;
 use morpho_v2_reallocator::storage::actor::StorageService;
 use morpho_v2_reallocator::storage::models::{
-    CanonicalBlockRecord, CanonicalLogRecord, NonceReservation, SignedTransactionRecord,
-    TransactionState, TransactionTransition,
+    CanonicalBlockRecord, CanonicalLogRecord, NonceReservation, SignedAttemptRecord,
+    SignedTransactionRecord, TransactionAttemptKind, TransactionState, TransactionTransition,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -147,6 +147,15 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
     let service = reopen(&path).await?;
     service.shutdown().await?;
     assert_eq!(read_json(&path)?, state);
+
+    let mut additive_upgrade = state;
+    additive_upgrade
+        .as_object_mut()
+        .ok_or("state is not an object")?
+        .remove("transaction_attempts");
+    std::fs::write(&path, serde_json::to_vec_pretty(&additive_upgrade)?)?;
+    reopen(&path).await?.shutdown().await?;
+    assert!(read_json(&path)?["transaction_attempts"].is_array());
     Ok(())
 }
 
@@ -260,12 +269,14 @@ async fn transaction_boundaries_recover_after_every_reopen()
     assert_recovered(&path, signer, TransactionState::NonceReserved).await?;
 
     let service = reopen(&path).await?;
+    let raw_signed_transaction = Bytes::from_static(&[0x02, 0xaa, 0xbb]);
+    let transaction_hash = alloy::primitives::keccak256(&raw_signed_transaction);
     service
         .handle()
         .persist_signed_transaction(SignedTransactionRecord {
             transaction_id: TransactionId(B256::repeat_byte(0x71)),
-            transaction_hash: B256::repeat_byte(0x72),
-            raw_signed_transaction: Bytes::from_static(&[0x02, 0xaa, 0xbb]),
+            transaction_hash,
+            raw_signed_transaction,
             updated_at: 1_800_000_001,
         })
         .await?;
@@ -277,7 +288,7 @@ async fn transaction_boundaries_recover_after_every_reopen()
         signer,
         TransactionState::Signed,
         TransactionState::Submitted,
-        Some(B256::repeat_byte(0x72)),
+        Some(transaction_hash),
         None,
     )
     .await?;
@@ -401,6 +412,126 @@ async fn signer_lane_and_transition_graph_fail_closed() -> Result<(), Box<dyn st
             .await,
         Err(StorageError::InvalidTransition { .. })
     ));
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacement_and_cancellation_bytes_survive_every_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("attempts.json");
+    let signer = Address::with_last_byte(0x67);
+    let transaction_id = TransactionId(B256::repeat_byte(0x71));
+    let initial_raw = Bytes::from_static(&[0x02, 0x01]);
+    let initial_hash = alloy::primitives::keccak256(&initial_raw);
+
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    handle.reserve_nonce(reservation(signer)).await?;
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id,
+            transaction_hash: initial_hash,
+            raw_signed_transaction: initial_raw,
+            updated_at: 10,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(initial_hash),
+            submitted_at: Some(11),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 11,
+        })
+        .await?;
+    let replacement_raw = Bytes::from_static(&[0x02, 0x02]);
+    let replacement_hash = alloy::primitives::keccak256(&replacement_raw);
+    handle
+        .persist_signed_attempt(SignedAttemptRecord {
+            transaction_id,
+            kind: TransactionAttemptKind::Replacement,
+            transaction_hash: replacement_hash,
+            raw_signed_transaction: replacement_raw.clone(),
+            max_fee_per_gas: U256::from(120_u64),
+            max_priority_fee_per_gas: U256::from(3_u64),
+            signed_at: 12,
+            broadcast_at: None,
+        })
+        .await?;
+    service.shutdown().await?;
+
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let recovered = handle
+        .load_unresolved(signer)
+        .await?
+        .ok_or("replacement must remain unresolved")?;
+    assert_eq!(recovered.state, TransactionState::Submitted);
+    assert_eq!(recovered.transaction_hash, Some(replacement_hash));
+    assert_eq!(recovered.raw_signed_transaction, Some(replacement_raw));
+    assert_eq!(recovered.current_max_fee_per_gas, U256::from(120_u64));
+    assert_eq!(
+        recovered.current_max_priority_fee_per_gas,
+        U256::from(3_u64)
+    );
+    assert_eq!(
+        recovered.known_transaction_hashes,
+        vec![initial_hash, replacement_hash]
+    );
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Submitted,
+            next_state: TransactionState::Replaced,
+            transaction_hash: Some(replacement_hash),
+            submitted_at: Some(13),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 13,
+        })
+        .await?;
+    let cancellation_raw = Bytes::from_static(&[0x02, 0x03]);
+    let cancellation_hash = alloy::primitives::keccak256(&cancellation_raw);
+    handle
+        .persist_signed_attempt(SignedAttemptRecord {
+            transaction_id,
+            kind: TransactionAttemptKind::Cancellation,
+            transaction_hash: cancellation_hash,
+            raw_signed_transaction: cancellation_raw,
+            max_fee_per_gas: U256::from(140_u64),
+            max_priority_fee_per_gas: U256::from(4_u64),
+            signed_at: 14,
+            broadcast_at: None,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Replaced,
+            next_state: TransactionState::CancellationSubmitted,
+            transaction_hash: Some(cancellation_hash),
+            submitted_at: Some(15),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 15,
+        })
+        .await?;
+    service.shutdown().await?;
+
+    let service = reopen(&path).await?;
+    let recovered = service
+        .handle()
+        .load_unresolved(signer)
+        .await?
+        .ok_or("cancellation must remain unresolved")?;
+    assert_eq!(recovered.state, TransactionState::CancellationSubmitted);
+    assert_eq!(recovered.transaction_hash, Some(cancellation_hash));
+    assert_eq!(recovered.known_transaction_hashes.len(), 3);
     service.shutdown().await?;
     Ok(())
 }

@@ -50,7 +50,9 @@
 | 23.1–23.4, 16.4–16.5 | One nonce lane, recovery classification and durable plan→nonce→sign→signed-bytes ordering | `src/transaction/{nonce,lifecycle}.rs`, `src/storage/actor.rs` | nonce/recovery and durable-boundary recovery tests | Implemented |
 | 23.5–23.6, 16.6 | Strictly higher identical-calldata replacement and known-nonce self-cancellation signing types | `src/transaction/{fees,signer}.rs` | replacement/cancellation signer tests | Signing boundary implemented; submission timing in milestone 10 |
 | 24.1 | Earliest, expected and latest accepted inclusion clocks with checked integer timestamps | `src/transaction/final_preflight.rs` | ordered, invalid-bound and overflow unit tests | Implemented |
-| 24.2–24.3 | Same-head simulation, gas bound, durable signing order and signed-byte submission | `src/transaction/final_preflight.rs`, `src/chain/provider.rs` | head/scenario unit tests plus existing firewall and durability tests | Core sequence implemented; runtime lock and episode reservation integration pending |
+| 24.2–24.4 | Same-head simulation, gas bound, exclusive dependencies, durable movement/nonce/signing order and signed-byte submission | `src/transaction/final_preflight.rs`, `src/chain/provider.rs` | success and post-persistence head-move integration tests, reservation unit test | Implemented; concrete supervised source attaches in Milestone 12 |
+| 23.5–23.7, 24.5 | Fast-block plan-specific pending horizons, touched-state cancellation and strictly increasing fee attempts | `src/transaction/pending.rs`, `src/transaction/signer.rs` | fast-opportunity/material-invalidation tests and replacement/cancellation integration test | Implemented |
+| 23.3–23.6 | Every initial/replacement/cancellation signed attempt durable before broadcast and recoverable by hash | `src/storage/{actor,models}.rs` | three-attempt crash/reopen test | Implemented by JSON storage override |
 
 ## Dependency policy notes
 

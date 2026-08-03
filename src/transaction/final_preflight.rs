@@ -1,6 +1,10 @@
 //! One-head inclusion-scenario preflight and durable submission.
 
-use std::time::Instant;
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use alloy::primitives::{B256, U256, keccak256};
 use async_trait::async_trait;
@@ -84,6 +88,8 @@ pub struct FinalPreflightContext {
     pub episode_budget_before: Option<U256>,
     /// Episode budget after reservation when applicable.
     pub episode_budget_after_reservation: Option<U256>,
+    /// Durable planner/resource movement reservation identity.
+    pub movement_reservation_id: B256,
 }
 
 /// Inputs not derived by the final preflight itself.
@@ -129,6 +135,97 @@ pub trait ExactPreflightSource: Send + Sync {
     ) -> Result<ValidatedPlan, PreflightSourceError>;
     /// Returns whether a planning-relevant invalidation is queued locally.
     async fn invalidation_queued(&self) -> Result<bool, PreflightSourceError>;
+    /// Durably reserves plan movement after the unsigned plan is persisted.
+    async fn reserve_plan_movement(
+        &self,
+        plan: &ValidatedPlan,
+    ) -> Result<PlanMovementReservation, PreflightSourceError>;
+    /// Releases one exact unsigned movement reservation after a pre-sign abort.
+    async fn release_plan_movement(
+        &self,
+        reservation: PlanMovementReservation,
+    ) -> Result<(), PreflightSourceError>;
+}
+
+/// Durable movement reservation made immediately before nonce ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlanMovementReservation {
+    /// Stable reservation identity.
+    pub reservation_id: B256,
+    /// Episode budget before reservation, when applicable.
+    pub episode_budget_before: Option<U256>,
+    /// Episode budget after reservation, when applicable.
+    pub episode_budget_after: Option<U256>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ExecutionResource {
+    Vault(alloy::primitives::Address),
+    Signer(alloy::primitives::Address),
+    Market(B256),
+    LoanToken(alloy::primitives::Address),
+}
+
+/// Process-wide exclusive vault/signer/shared-market reservation manager.
+#[derive(Clone, Default)]
+pub struct ExecutionReservationManager {
+    held: Arc<Mutex<BTreeSet<ExecutionResource>>>,
+}
+
+impl ExecutionReservationManager {
+    /// Acquires the vault, signer and every configured shared market/token dependency.
+    pub fn acquire(
+        &self,
+        vault: &ValidatedVaultConfig,
+    ) -> Result<ExecutionLease, ReservationError> {
+        let mut resources = BTreeSet::from([
+            ExecutionResource::Vault(vault.address.0),
+            ExecutionResource::Signer(vault.signer_address),
+        ]);
+        for position in &vault.positions {
+            resources.insert(ExecutionResource::Market(position.market_id.0));
+            resources.insert(ExecutionResource::LoanToken(
+                position.market_params.loan_token,
+            ));
+        }
+        let mut held = self.held.lock().map_err(|_| ReservationError::Poisoned)?;
+        if resources.iter().any(|resource| held.contains(resource)) {
+            return Err(ReservationError::Busy);
+        }
+        held.extend(resources.iter().copied());
+        drop(held);
+        Ok(ExecutionLease {
+            held: Arc::clone(&self.held),
+            resources,
+        })
+    }
+}
+
+/// Exclusive execution-resource reservation failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ReservationError {
+    /// Another transaction owns an overlapping vault, signer, market, or token.
+    #[error("execution resource is already reserved")]
+    Busy,
+    /// Reservation state was poisoned by a panicking owner.
+    #[error("execution reservation state is poisoned")]
+    Poisoned,
+}
+
+/// RAII lease that releases every resource on all return paths.
+pub struct ExecutionLease {
+    held: Arc<Mutex<BTreeSet<ExecutionResource>>>,
+    resources: BTreeSet<ExecutionResource>,
+}
+
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.held.lock() {
+            for resource in &self.resources {
+                held.remove(resource);
+            }
+        }
+    }
 }
 
 /// State/planner bridge failed closed.
@@ -142,6 +239,12 @@ pub enum PreflightSourceError {
 /// One-head final preflight or submission failure.
 #[derive(Debug, Error)]
 pub enum PreflightError {
+    /// Vault, signer, or shared dependency is owned by another transaction.
+    #[error(transparent)]
+    Reservation(#[from] ReservationError),
+    /// Durable signer nonce lane is not empty.
+    #[error("signer already owns an unresolved transaction")]
+    NonceBusy,
     /// Head, event cursor, or queued invalidation changed the decision context.
     #[error("same-head signing context changed")]
     HeadChanged,
@@ -214,10 +317,22 @@ pub async fn execute_one_head_preflight(
     source: &dyn ExactPreflightSource,
     storage: &StorageHandle,
     signer: &dyn RoutineSigner,
+    reservations: &ExecutionReservationManager,
     config: &ValidatedConfig,
     vault: &ValidatedVaultConfig,
     request: ExecutePreflightRequest,
 ) -> Result<SubmittedPreflight, PreflightError> {
+    let _lease = reservations.acquire(vault)?;
+    if storage
+        .load_unresolved(vault.signer_address)
+        .await?
+        .is_some()
+    {
+        return Err(PreflightError::NonceBusy);
+    }
+    if simulator.using_big_blocks(vault.signer_address).await? {
+        return Err(PreflightError::BigBlocks);
+    }
     let started = Instant::now();
     let head = head_provider.latest_header().await?;
     require_cursor(source.event_cursor().await?, head)?;
@@ -247,9 +362,6 @@ pub async fn execute_one_head_preflight(
         .estimate_gas_at(vault.signer_address, vault.address.0, &calldata, head)
         .await?;
     require_head(head_provider.latest_header().await?, head)?;
-    if simulator.using_big_blocks(vault.signer_address).await? {
-        return Err(PreflightError::BigBlocks);
-    }
     let gas_limit = signed_gas_limit(
         gas_estimate,
         config.app.execution.gas_headroom_bps,
@@ -303,14 +415,22 @@ pub async fn execute_one_head_preflight(
             created_at: request.created_at,
         })
         .await?;
-    let durable = reserve_durable_rebalance(
+    let movement_reservation = source.reserve_plan_movement(&plan).await?;
+    let durable = match reserve_durable_rebalance(
         storage,
         &plan,
         transaction,
         request.transaction_id,
         request.created_at,
     )
-    .await?;
+    .await
+    {
+        Ok(durable) => durable,
+        Err(error) => {
+            source.release_plan_movement(movement_reservation).await?;
+            return Err(PreflightError::Signing(error));
+        }
+    };
 
     let gate_head = head_provider.latest_header().await?;
     let gate_cursor = source.event_cursor().await?;
@@ -322,6 +442,7 @@ pub async fn execute_one_head_preflight(
         || u128::from(elapsed_millis) > config.app.snapshot.maximum_snapshot_to_sign_latency_millis
     {
         abort_unsigned_rebalance(storage, &durable, request.created_at).await?;
+        source.release_plan_movement(movement_reservation).await?;
         return Err(
             if elapsed_millis as u128 > config.app.snapshot.maximum_snapshot_to_sign_latency_millis
             {
@@ -338,7 +459,14 @@ pub async fn execute_one_head_preflight(
     ]);
     let sign_started = Instant::now();
     let signed =
-        sign_durable_rebalance(storage, signer, durable, request.signer_request_id).await?;
+        match sign_durable_rebalance(storage, signer, durable, request.signer_request_id).await {
+            Ok(signed) => signed,
+            Err(SigningBoundaryError::Signer(error)) => {
+                source.release_plan_movement(movement_reservation).await?;
+                return Err(PreflightError::Signing(SigningBoundaryError::Signer(error)));
+            }
+            Err(error) => return Err(PreflightError::Signing(error)),
+        };
     if sign_started.elapsed().as_millis()
         > config.app.snapshot.maximum_sign_to_broadcast_latency_millis
     {
@@ -380,8 +508,9 @@ pub async fn execute_one_head_preflight(
             snapshot_to_sign_latency_ms: elapsed_millis,
             rate_episode_id: plan.plan().episode_id.map(|episode| episode.0),
             rate_objective_branch: plan.plan().solver_certificate.objective_branch,
-            episode_budget_before: None,
-            episode_budget_after_reservation: None,
+            episode_budget_before: movement_reservation.episode_budget_before,
+            episode_budget_after_reservation: movement_reservation.episode_budget_after,
+            movement_reservation_id: movement_reservation.reservation_id,
         },
         scenarios,
         submitted_hash,
@@ -412,10 +541,15 @@ fn context_hash(parts: &[&[u8]]) -> B256 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use alloy::primitives::B256;
 
-    use super::{InclusionScenarioKind, PreflightError, inclusion_assumptions, require_head};
-    use crate::domain::BlockRef;
+    use super::{
+        ExecutionReservationManager, InclusionScenarioKind, PreflightError, ReservationError,
+        inclusion_assumptions, require_head,
+    };
+    use crate::{config::AppConfig, domain::BlockRef};
 
     fn head(timestamp: u64) -> BlockRef {
         BlockRef {
@@ -473,5 +607,25 @@ mod tests {
             require_head(moved, expected),
             Err(PreflightError::HeadChanged)
         ));
+    }
+
+    #[test]
+    fn overlapping_execution_resources_are_exclusive_and_raii_released() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let config = AppConfig::load(&path).and_then(AppConfig::validate);
+        assert!(config.is_ok());
+        let Ok(config) = config else {
+            return;
+        };
+        let vault = &config.app.vaults[0];
+        let manager = ExecutionReservationManager::default();
+        let first = manager.acquire(vault);
+        assert!(first.is_ok());
+        assert!(matches!(
+            manager.acquire(vault),
+            Err(ReservationError::Busy)
+        ));
+        drop(first);
+        assert!(manager.acquire(vault).is_ok());
     }
 }
