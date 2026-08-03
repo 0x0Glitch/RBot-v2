@@ -81,6 +81,7 @@ fn raw_plan(config: &ValidatedConfig) -> V2Plan {
                 hash: B256::repeat_byte(0x31),
                 parent_hash: B256::repeat_byte(0x30),
                 timestamp: 1_800_000_000,
+                gas_limit: 10_000_000,
             },
             block_hash_binding: BlockHashBinding::Proven,
             static_config_revision: config.revision,
@@ -587,6 +588,7 @@ async fn replacement_and_cancellation_are_durable_before_each_broadcast() {
             max_priority_fee_per_gas: 1_500_000_000,
             cancellation_gas_limit: 21_000,
             created_at: 1_800_000_003,
+            signed_block: 12,
         },
     )
     .await;
@@ -615,6 +617,7 @@ async fn replacement_and_cancellation_are_durable_before_each_broadcast() {
             max_priority_fee_per_gas: 2_000_000_000,
             cancellation_gas_limit: 21_000,
             created_at: 1_800_000_004,
+            signed_block: 13,
         },
     )
     .await;

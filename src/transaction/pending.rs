@@ -291,6 +291,8 @@ pub struct PendingAttemptRequest {
     pub cancellation_gas_limit: u64,
     /// Durable signing/submission timestamp.
     pub created_at: u64,
+    /// Canonical fast-block clock source at signing.
+    pub signed_block: u64,
 }
 
 /// Signs, persists, broadcasts, and transitions one restricted pending attempt.
@@ -359,6 +361,7 @@ pub async fn execute_pending_attempt(
             max_fee_per_gas: U256::from(request.max_fee_per_gas),
             max_priority_fee_per_gas: U256::from(request.max_priority_fee_per_gas),
             signed_at: request.created_at,
+            signed_block: request.signed_block,
             broadcast_at: None,
         })
         .await?;

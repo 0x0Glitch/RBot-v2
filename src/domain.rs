@@ -108,6 +108,8 @@ pub struct BlockRef {
     pub parent_hash: B256,
     /// Block timestamp in Unix seconds.
     pub timestamp: u64,
+    /// Canonical EVM block gas limit used by chain-profile classification.
+    pub gas_limit: u64,
 }
 
 /// Strength of the provider's block-number-to-hash binding.

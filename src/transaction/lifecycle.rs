@@ -102,6 +102,7 @@ pub async fn reserve_durable_rebalance(
         max_fee_per_gas: U256::from(fields.max_fee_per_gas),
         max_priority_fee_per_gas: U256::from(fields.max_priority_fee_per_gas),
         gas_limit: fields.gas_limit,
+        created_block: plan.plan().snapshot.block.number,
         created_at,
     };
     let movement_reservation = if let Some(episode_id) = plan.plan().episode_id {

@@ -295,6 +295,8 @@ pub struct NonceReservation {
     pub max_priority_fee_per_gas: U256,
     /// Signed gas limit.
     pub gas_limit: u64,
+    /// Canonical head number at which this nonce was reserved.
+    pub created_block: u64,
     /// Unix creation timestamp.
     pub created_at: u64,
 }
@@ -404,6 +406,8 @@ pub struct SignedAttemptRecord {
     pub max_priority_fee_per_gas: U256,
     /// Durable signing timestamp.
     pub signed_at: u64,
+    /// Canonical head number used for this signing decision.
+    pub signed_block: u64,
     /// Durable broadcast timestamp, populated only after submission returns.
     pub broadcast_at: Option<u64>,
 }
@@ -458,6 +462,20 @@ pub struct UnresolvedTransaction {
     pub current_max_fee_per_gas: U256,
     /// Latest durable attempt priority fee per gas.
     pub current_max_priority_fee_per_gas: U256,
+    /// Original routine transaction maximum fee per gas.
+    pub original_max_fee_per_gas: U256,
+    /// Original routine transaction priority fee per gas.
+    pub original_max_priority_fee_per_gas: U256,
+    /// Immutable original routine transaction gas limit.
+    pub gas_limit: u64,
+    /// Exact originating semantic plan, when this is a routine transaction.
+    pub plan: Option<crate::domain::V2Plan>,
+    /// Canonical head number used for the original signing decision.
+    pub created_block: u64,
+    /// Canonical head number used for the latest durable signed attempt.
+    pub last_attempt_block: u64,
+    /// Restricted kind of the latest durable signed attempt.
+    pub last_attempt_kind: TransactionAttemptKind,
 }
 
 /// Result of an atomic canonical rewind.

@@ -87,14 +87,11 @@ pub async fn refresh_rate_plan(
             || active.topology_revision != snapshot.context.dynamic_topology_revision;
         let expired = projection.head.timestamp >= active.expires_at;
         let incompatible_signal = signal.as_ref().is_none_or(|current| {
-            current.spread < config.app.strategy.entry_spread_rate_per_second.0
-                || active
-                    .validate_direction(
-                        current.branch,
-                        &current.source_markets,
-                        &current.destination_markets,
-                    )
-                    .is_err()
+            !signal_matches_episode(
+                active,
+                current,
+                config.app.strategy.target_spread_rate_per_second.0,
+            )
         });
         if incompatible_revision || expired || incompatible_signal {
             active.complete();
@@ -177,6 +174,30 @@ pub async fn refresh_rate_plan(
         clear_plan(vault, api, runtime, Some(episode.episode_id)).await?;
         return Ok(None);
     }
+    if episode.state == RateEpisodeState::Immediate {
+        let persistent_seconds =
+            duration_seconds_ceil(config.app.strategy.persistent_confirmation_duration_millis)?;
+        let persistent_at = episode
+            .started_at
+            .checked_add(persistent_seconds)
+            .ok_or(PlanningServiceError::TimestampRange)?;
+        let persistent_signal = detect_rate_signal(snapshot, projection, vault, true);
+        if projection.head.timestamp >= persistent_at
+            && persistent_signal.as_ref().is_some_and(|current| {
+                signal_matches_episode(
+                    &episode,
+                    current,
+                    config.app.strategy.target_spread_rate_per_second.0,
+                )
+            })
+        {
+            episode.unlock_persistent()?;
+            storage
+                .persist_rate_episode(episode.clone(), projection.head.timestamp)
+                .await?;
+            api.record_episode(episode.clone()).await;
+        }
+    }
 
     let Some(prepared) = build_validated_rate_plan(config, vault, snapshot, projection, &episode)?
     else {
@@ -194,6 +215,21 @@ pub async fn refresh_rate_plan(
         })
         .await?;
     Ok(Some(plan))
+}
+
+fn signal_matches_episode(
+    episode: &RateSignalEpisode,
+    signal: &RateSignal,
+    target_spread: U256,
+) -> bool {
+    signal.spread > target_spread
+        && episode
+            .validate_direction(
+                signal.branch,
+                &signal.source_markets,
+                &signal.destination_markets,
+            )
+            .is_ok()
 }
 
 /// Rebuilds one exact rate plan from a frozen, already-confirmed episode.
@@ -413,4 +449,86 @@ fn derive_plan_id(plan: &V2Plan) -> Result<PlanId, PlanningServiceError> {
         .map(keccak256)
         .map(PlanId)
         .map_err(|_| PlanningServiceError::Serialization)
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use alloy::primitives::{Address, B256, U256};
+
+    use super::{RateSignal, signal_matches_episode};
+    use crate::{
+        domain::{Assets, BlockRef, MarketId, RateGroupId, RateObjectiveBranch, VaultAddress},
+        planner::episodes::RateSignalEpisode,
+    };
+
+    fn episode() -> RateSignalEpisode {
+        let source = MarketId(B256::repeat_byte(1));
+        let destination = MarketId(B256::repeat_byte(2));
+        RateSignalEpisode::start(
+            VaultAddress(Address::with_last_byte(1)),
+            RateGroupId(B256::repeat_byte(3)),
+            RateObjectiveBranch::Portfolio,
+            BlockRef {
+                number: 10,
+                hash: B256::repeat_byte(10),
+                parent_hash: B256::repeat_byte(9),
+                timestamp: 100,
+                gas_limit: 10_000_000,
+            },
+            B256::repeat_byte(4),
+            B256::repeat_byte(5),
+            BTreeSet::from([source, destination]),
+            BTreeSet::from([source, destination]),
+            BTreeSet::from([source]),
+            BTreeSet::from([destination]),
+            Assets(U256::from(1_000_u64)),
+            2_000,
+            100,
+            1_000,
+        )
+        .unwrap_or_else(|error| panic!("valid test episode rejected: {error}"))
+    }
+
+    fn signal(source: MarketId, destination: MarketId, spread: u64) -> RateSignal {
+        RateSignal {
+            branch: RateObjectiveBranch::Portfolio,
+            evaluation_markets: BTreeSet::from([source, destination]),
+            controllable_markets: BTreeSet::from([source, destination]),
+            source_markets: BTreeSet::from([source]),
+            destination_markets: BTreeSet::from([destination]),
+            spread: U256::from(spread),
+            desired_movement: U256::from(1_000_u64),
+        }
+    }
+
+    #[test]
+    fn active_episode_uses_target_threshold_and_frozen_direction() {
+        let episode = episode();
+        let source = *episode
+            .source_markets
+            .first()
+            .unwrap_or_else(|| panic!("source fixture missing"));
+        let destination = *episode
+            .destination_markets
+            .first()
+            .unwrap_or_else(|| panic!("destination fixture missing"));
+        assert!(signal_matches_episode(
+            &episode,
+            &signal(source, destination, 6),
+            U256::from(5_u8)
+        ));
+        assert!(!signal_matches_episode(
+            &episode,
+            &signal(source, destination, 5),
+            U256::from(5_u8)
+        ));
+        assert!(!signal_matches_episode(
+            &episode,
+            &signal(destination, source, 6),
+            U256::from(5_u8)
+        ));
+    }
 }

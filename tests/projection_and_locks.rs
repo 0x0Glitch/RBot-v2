@@ -126,6 +126,7 @@ fn projection_fixture() -> Result<
                 hash: B256::repeat_byte(0x10),
                 parent_hash: B256::repeat_byte(0x0f),
                 timestamp: 2_000_000_000,
+                gas_limit: 10_000_000,
             },
             block_hash_binding: BlockHashBinding::Proven,
             static_config_revision: validated.revision,
@@ -196,6 +197,7 @@ fn projection_restarts_from_exact_snapshot_and_computes_service_constraints()
         hash: B256::repeat_byte(0x11),
         parent_hash: snapshot.context.block.hash,
         timestamp: snapshot.context.block.timestamp + 12,
+        gas_limit: snapshot.context.block.gas_limit,
     };
     let first = project_snapshot_to_head(&snapshot, head, &config)?;
     let second = project_snapshot_to_head(&snapshot, head, &config)?;
@@ -468,6 +470,7 @@ fn rate_solver_matches_exhaustive_tiny_domain_and_episode_budget_never_rearms()
         hash: B256::repeat_byte(0x11),
         parent_hash: snapshot.context.block.hash,
         timestamp: snapshot.context.block.timestamp + 12,
+        gas_limit: snapshot.context.block.gas_limit,
     };
     let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
     let mut by_rate: Vec<_> = projection.markets.values().collect();
@@ -620,6 +623,7 @@ fn capital_solver_deploys_only_verified_unreserved_idle() -> Result<(), Box<dyn 
         hash: B256::repeat_byte(0x11),
         parent_hash: snapshot.context.block.hash,
         timestamp: snapshot.context.block.timestamp + 12,
+        gas_limit: snapshot.context.block.gas_limit,
     };
     let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
     let result = solve_capital_deployment(
@@ -667,6 +671,7 @@ fn sequential_simulator_enforces_phase_funding_and_bounded_order_search()
         hash: B256::repeat_byte(0x11),
         parent_hash: snapshot.context.block.hash,
         timestamp: snapshot.context.block.timestamp + 12,
+        gas_limit: snapshot.context.block.gas_limit,
     };
     let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
     let mut positions = vault.positions.iter();

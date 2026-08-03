@@ -238,6 +238,7 @@ fn projected_scenario_head(
         hash: keccak256(identity),
         parent_hash: head.hash,
         timestamp: scenario.projected_timestamp,
+        gas_limit: head.gas_limit,
     })
 }
 

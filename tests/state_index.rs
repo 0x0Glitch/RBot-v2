@@ -27,6 +27,7 @@ fn block(number: u64, hash: u8, parent: u8) -> BlockRef {
         hash: B256::repeat_byte(hash),
         parent_hash: B256::repeat_byte(parent),
         timestamp: 1_900_000_000 + number,
+        gas_limit: 10_000_000,
     }
 }
 

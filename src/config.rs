@@ -1160,6 +1160,27 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "must be below the fast-block gas limit",
         ));
     }
+    let maximum_fee_per_gas = parse_u256(
+        "execution.maximum_fee_per_gas_wei",
+        &config.execution.maximum_fee_per_gas_wei,
+    )?;
+    if maximum_fee_per_gas < U256::from(2_u8) {
+        return Err(validation(
+            "execution.maximum_fee_per_gas_wei",
+            "must leave room for an initial fee and a higher cancellation fee",
+        ));
+    }
+    if parse_u256(
+        "execution.maximum_daily_gas_spend_wei",
+        &config.execution.maximum_daily_gas_spend_wei,
+    )?
+    .is_zero()
+    {
+        return Err(validation(
+            "execution.maximum_daily_gas_spend_wei",
+            "must be positive",
+        ));
+    }
     if config.execution.maximum_rate_rebalance_pending_fast_blocks
         > config.execution.maximum_inclusion_fast_blocks
     {

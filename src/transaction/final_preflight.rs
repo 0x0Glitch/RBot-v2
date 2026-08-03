@@ -625,6 +625,7 @@ mod tests {
             hash: B256::repeat_byte(0x42),
             parent_hash: B256::repeat_byte(0x41),
             timestamp,
+            gas_limit: 10_000_000,
         }
     }
 

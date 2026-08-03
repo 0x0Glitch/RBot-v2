@@ -130,6 +130,7 @@ struct RpcHeader {
     hash: B256,
     parent_hash: B256,
     timestamp: String,
+    gas_limit: String,
 }
 
 impl RpcHeader {
@@ -139,6 +140,7 @@ impl RpcHeader {
             hash: self.hash,
             parent_hash: self.parent_hash,
             timestamp: parse_quantity("block.timestamp", &self.timestamp)?,
+            gas_limit: parse_quantity("block.gas_limit", &self.gas_limit)?,
         })
     }
 }

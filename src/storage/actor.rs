@@ -32,7 +32,7 @@ use super::{
 
 /// Default bounded storage mailbox capacity.
 pub const DEFAULT_STORAGE_CHANNEL_CAPACITY: usize = 128;
-const JSON_FORMAT_VERSION: u32 = 1;
+const JSON_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TimedSnapshot {
@@ -227,6 +227,13 @@ pub enum StorageCommand {
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
+    /// Attach one independently fetched receipt to an already-canonical block.
+    PersistCanonicalReceipt {
+        /// Strictly validated canonical receipt.
+        receipt: CanonicalReceiptRecord,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
     /// Atomically rewind replay-sensitive state.
     RewindToAncestor {
         /// EVM chain ID.
@@ -349,6 +356,28 @@ pub enum StorageCommand {
         number: u64,
         /// Block result.
         reply: oneshot::Sender<Result<Option<BlockRef>, StorageError>>,
+    },
+    /// Count canonical execution opportunities over one exclusive/inclusive range.
+    CountExecutionOpportunities {
+        /// EVM chain ID.
+        chain_id: u64,
+        /// Excluded starting block.
+        from_exclusive: u64,
+        /// Included ending block.
+        to_inclusive: u64,
+        /// Required gas limit for HyperEVM fast blocks; `None` counts every block.
+        required_gas_limit: Option<u64>,
+        /// Exact count.
+        reply: oneshot::Sender<Result<u64, StorageError>>,
+    },
+    /// Sum conservative confirmed gas cost over a rolling timestamp window.
+    ConfirmedGasSpendSince {
+        /// EVM chain ID.
+        chain_id: u64,
+        /// Inclusive canonical block timestamp lower bound.
+        since_timestamp: u64,
+        /// Fee-cap-denominated spend upper bound.
+        reply: oneshot::Sender<Result<U256, StorageError>>,
     },
     /// Load complete canonical receipts for one block.
     LoadCanonicalReceipts {
@@ -483,6 +512,15 @@ impl StorageHandle {
         .await
     }
 
+    /// Persists one directly fetched receipt only when its exact block is still canonical.
+    pub async fn persist_canonical_receipt(
+        &self,
+        receipt: CanonicalReceiptRecord,
+    ) -> Result<(), StorageError> {
+        self.request(|reply| StorageCommand::PersistCanonicalReceipt { receipt, reply })
+            .await
+    }
+
     /// Rewinds to one canonical ancestor.
     pub async fn rewind_to_ancestor(
         &self,
@@ -605,6 +643,38 @@ impl StorageHandle {
         self.request(|reply| StorageCommand::LoadCanonicalBlock {
             chain_id,
             number,
+            reply,
+        })
+        .await
+    }
+
+    /// Counts canonical fast-lane opportunities, or every block on non-HyperEVM chains.
+    pub async fn count_execution_opportunities(
+        &self,
+        chain_id: u64,
+        from_exclusive: u64,
+        to_inclusive: u64,
+        required_gas_limit: Option<u64>,
+    ) -> Result<u64, StorageError> {
+        self.request(|reply| StorageCommand::CountExecutionOpportunities {
+            chain_id,
+            from_exclusive,
+            to_inclusive,
+            required_gas_limit,
+            reply,
+        })
+        .await
+    }
+
+    /// Returns a conservative confirmed gas spend using each included attempt's fee cap.
+    pub async fn confirmed_gas_spend_since(
+        &self,
+        chain_id: u64,
+        since_timestamp: u64,
+    ) -> Result<U256, StorageError> {
+        self.request(|reply| StorageCommand::ConfirmedGasSpendSince {
+            chain_id,
+            since_timestamp,
             reply,
         })
         .await
@@ -908,6 +978,9 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                     Ok(())
                 }));
             }
+            StorageCommand::PersistCanonicalReceipt { receipt, reply } => {
+                let _ = reply.send(store.commit(|state| persist_canonical_receipt(state, receipt)));
+            }
             StorageCommand::PersistPlan {
                 plan,
                 created_at,
@@ -1012,6 +1085,44 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                     .find(|record| record.chain_id == chain_id && record.block.number == number)
                     .map(|record| record.block);
                 let _ = reply.send(Ok(block));
+            }
+            StorageCommand::CountExecutionOpportunities {
+                chain_id,
+                from_exclusive,
+                to_inclusive,
+                required_gas_limit,
+                reply,
+            } => {
+                let result = if to_inclusive < from_exclusive {
+                    Err(StorageError::Invariant(
+                        "execution opportunity range is reversed",
+                    ))
+                } else {
+                    let count = store
+                        .state
+                        .canonical_blocks
+                        .iter()
+                        .filter(|record| {
+                            record.chain_id == chain_id
+                                && record.block.number > from_exclusive
+                                && record.block.number <= to_inclusive
+                                && required_gas_limit
+                                    .is_none_or(|limit| record.block.gas_limit == limit)
+                        })
+                        .count();
+                    u64::try_from(count).map_err(|_| {
+                        StorageError::Invariant("execution opportunity count exceeds u64")
+                    })
+                };
+                let _ = reply.send(result);
+            }
+            StorageCommand::ConfirmedGasSpendSince {
+                chain_id,
+                since_timestamp,
+                reply,
+            } => {
+                let result = confirmed_gas_spend_since(&store.state, chain_id, since_timestamp);
+                let _ = reply.send(result);
             }
             StorageCommand::LoadCanonicalReceipts {
                 chain_id,
@@ -1243,6 +1354,104 @@ fn apply_block(
     state.canonical_receipts.extend(receipts);
     state.chain_cursors.insert(block.chain_id, block.block);
     Ok(())
+}
+
+fn persist_canonical_receipt(
+    state: &mut JsonState,
+    receipt: CanonicalReceiptRecord,
+) -> Result<(), StorageError> {
+    let canonical = state.canonical_blocks.iter().any(|record| {
+        record.chain_id == receipt.chain_id
+            && record.block.number == receipt.block_number
+            && record.block.hash == receipt.block_hash
+    });
+    if !canonical
+        || receipt.logs.iter().any(|log| {
+            log.chain_id != receipt.chain_id
+                || log.block_number != receipt.block_number
+                || log.block_hash != receipt.block_hash
+                || log.transaction_hash != receipt.transaction_hash
+                || log.transaction_index != receipt.transaction_index
+        })
+        || receipt
+            .logs
+            .windows(2)
+            .any(|pair| pair[0].log_index >= pair[1].log_index)
+    {
+        return Err(StorageError::Invariant(
+            "direct receipt is not bound to a canonical block",
+        ));
+    }
+    if let Some(existing) = state
+        .canonical_receipts
+        .iter()
+        .find(|existing| existing.transaction_hash == receipt.transaction_hash)
+    {
+        return if existing == &receipt {
+            Ok(())
+        } else {
+            Err(StorageError::Invariant(
+                "canonical receipt identity changed",
+            ))
+        };
+    }
+    if state.canonical_receipts.iter().any(|existing| {
+        existing.chain_id == receipt.chain_id
+            && existing.block_number == receipt.block_number
+            && existing.transaction_index == receipt.transaction_index
+    }) {
+        return Err(StorageError::Invariant(
+            "canonical receipt transaction index is duplicated",
+        ));
+    }
+    state.canonical_receipts.push(receipt);
+    Ok(())
+}
+
+fn confirmed_gas_spend_since(
+    state: &JsonState,
+    chain_id: u64,
+    since_timestamp: u64,
+) -> Result<U256, StorageError> {
+    let mut spend = U256::ZERO;
+    for receipt in state
+        .canonical_receipts
+        .iter()
+        .filter(|receipt| receipt.chain_id == chain_id)
+    {
+        let Some(block) = state.canonical_blocks.iter().find(|record| {
+            record.chain_id == chain_id
+                && record.block.number == receipt.block_number
+                && record.block.hash == receipt.block_hash
+        }) else {
+            return Err(StorageError::Invariant(
+                "canonical receipt has no canonical block",
+            ));
+        };
+        if block.block.timestamp < since_timestamp {
+            continue;
+        }
+        let attempts = state
+            .transaction_attempts
+            .iter()
+            .filter(|attempt| attempt.transaction_hash == receipt.transaction_hash)
+            .collect::<Vec<_>>();
+        let Some(attempt) = attempts.first() else {
+            continue;
+        };
+        if attempts.len() != 1 {
+            return Err(StorageError::Invariant(
+                "canonical transaction hash maps to multiple attempts",
+            ));
+        }
+        let cost = U256::from(receipt.gas_used)
+            .checked_mul(attempt.max_fee_per_gas)
+            .ok_or(StorageError::Invariant("confirmed gas cost overflow"))?;
+        spend = spend
+            .checked_add(cost)
+            .ok_or(StorageError::Invariant("confirmed gas spend overflow"))?;
+    }
+    Ok(spend)
 }
 
 fn rewind(state: &mut JsonState, chain_id: u64, ancestor: BlockRef) -> RewindResult {
@@ -1481,6 +1690,7 @@ fn persist_signed(
         max_fee_per_gas: row.reservation.max_fee_per_gas,
         max_priority_fee_per_gas: row.reservation.max_priority_fee_per_gas,
         signed_at: signed.updated_at,
+        signed_block: row.reservation.created_block,
         broadcast_at: None,
     });
     Ok(())
@@ -1906,6 +2116,22 @@ fn load_unresolved(
                 .map_or(row.reservation.max_priority_fee_per_gas, |attempt| {
                     attempt.max_priority_fee_per_gas
                 }),
+            original_max_fee_per_gas: row.reservation.max_fee_per_gas,
+            original_max_priority_fee_per_gas: row.reservation.max_priority_fee_per_gas,
+            gas_limit: row.reservation.gas_limit,
+            plan: row.reservation.plan_id.and_then(|plan_id| {
+                state
+                    .plans
+                    .iter()
+                    .find(|entry| entry.plan.plan_id == plan_id)
+                    .map(|entry| entry.plan.clone())
+            }),
+            created_block: row.reservation.created_block,
+            last_attempt_block: latest_attempt.map_or(row.reservation.created_block, |attempt| {
+                attempt.signed_block
+            }),
+            last_attempt_kind: latest_attempt
+                .map_or(TransactionAttemptKind::Initial, |attempt| attempt.kind),
         }
     }))
 }

@@ -29,9 +29,11 @@ single-vault local-development Execute controller on non-mainnet chains. It
 recovers signed bytes, observes canonical inclusion from JSON, waits for depth,
 validates receipt/event conformance and performs an exact current-state rebuild
 that atomically confirms episode movement. The real local E2E exercises that
-pending-to-reconciled controller. Production remote-signer authentication,
-replacement/cancellation automation and the remaining crash matrix still gate
-production Execute.
+pending-to-reconciled controller. The live controller now owns canonical
+no-log receipt recovery, fast-opportunity replacement, same-nonce cancellation,
+same-byte crash/reorg recovery, a rolling gas-spend bound, and production mTLS
+remote-signer composition. The remaining recovery/invalidation matrix and the
+independent-event persistent-unlock path still gate production Execute.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 
@@ -257,14 +259,18 @@ production Execute.
 - Focused tests cover successful same-head submission, head movement after
   unsigned persistence, reservation release, fast-block timing, material
   cancellation, attempt crash boundaries and three-attempt recovery.
-- The concrete supervised runtime source and receipt/reconciliation consumer are
-  Milestones 11–12 work. Execute remains disabled.
+- The concrete supervised runtime invokes this source, advances the complete
+  receipt/conformance/reconciliation lifecycle, and applies the fast-block
+  replacement/cancellation policy. Execute remains fail closed unless every
+  runtime identity, provider, signer and exact-state readiness gate passes.
 
 ## Milestone 11 — Canonical Receipt And Current-State Reconciliation (Core)
 
 - Chain ingestion durably retains complete ordered canonical receipts, not only
   watched logs. Receipt/block/log binding and transaction ordering are checked
-  before the block cursor advances, and reorg rewind removes orphaned receipts.
+  before the block cursor advances, reorg rewind removes orphaned receipts, and
+  execution directly attaches a strictly validated no-log receipt to an already
+  canonical block when provider fallback ingestion could not discover it.
 - Final preflight now persists one exact simulator projection per ordered
   action: direction, position/adapter/market, requested assets, minted or burned
   shares, post-action adapter allocation, all three returned cap IDs, signed cap
@@ -303,8 +309,9 @@ production Execute.
 - Observe publishes no plans. Shadow and fail-closed Execute operation now own
   durable rate detection, consecutive short confirmation, bounded exact solving,
   semantic-plan hashing, independent firewall validation, JSON persistence and
-  `/plan` publication. Persistent independent-event unlocking, live execution
-  and receipt-reconciliation consumers remain.
+  `/plan` publication. The persistent continuous-time path is live and retains
+  the frozen target-threshold direction; exact independent-event unlocking
+  remains fail closed.
 
 ## Milestone 12 — Hardening (In Progress)
 
@@ -326,5 +333,12 @@ production Execute.
   adapter removal hard-pauses projection, and re-addition restores capability
   and produces a fresh improving plan. The supervised state owner then confirms
   a new live episode on the next direct-parent block and publishes a durable,
-  firewalled improving Shadow plan. Base Sepolia remains blocked on the live
-  execution owner and deployment-specific protocol identities.
+  firewalled improving Shadow plan.
+- Base Sepolia subsequently completed three autonomous two-action rebalances
+  against the pinned exact-accrual fixture. Transactions
+  `0x7a76bf553fa00236e38daf4920333fac45357715421a5e9b77884eb5805fb431`,
+  `0xa92f8795db6c8acc4dd6038d310ef76d0c250857d5bd057920b74ed27dcde17a`
+  and `0x73f23c53a5f815afdcd21cfc35e58f7bd48b5e951df0b7b103f70523a1539f96`
+  all reached canonical receipt conformance and exact post-state reconciliation.
+  The test fixture and runtime identities are pinned in `deployments/` and are
+  not presented as production Morpho deployments.

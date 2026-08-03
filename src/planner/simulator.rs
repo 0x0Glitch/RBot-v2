@@ -343,6 +343,7 @@ pub fn no_plan_terminal_existing_shareholder_assets(
         hash: projection.head.hash,
         parent_hash: projection.head.parent_hash,
         timestamp: horizon_timestamp,
+        gas_limit: projection.head.gas_limit,
     };
     let terminal = crate::state::projection::project_snapshot_to_head(snapshot, head, config)
         .map_err(|_| SimulationError::IncompleteState)?;

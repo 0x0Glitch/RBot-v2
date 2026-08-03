@@ -28,6 +28,7 @@ fn block(number: u64, hash_byte: u8, parent_byte: u8) -> BlockRef {
         hash: B256::repeat_byte(hash_byte),
         parent_hash: B256::repeat_byte(parent_byte),
         timestamp: 1_800_000_000 + number,
+        gas_limit: 10_000_000,
     }
 }
 
@@ -44,6 +45,7 @@ fn reservation(signer: Address) -> NonceReservation {
         max_fee_per_gas: U256::from(100_u64),
         max_priority_fee_per_gas: U256::from(2_u64),
         gas_limit: 500_000,
+        created_block: 1,
         created_at: 1_800_000_000,
     }
 }
@@ -141,7 +143,7 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
     service.shutdown().await?;
 
     let state = read_json(&path)?;
-    assert_eq!(state["format_version"], 1);
+    assert_eq!(state["format_version"], 2);
     assert_eq!(state["revision"], 0);
     assert_eq!(state["transactions"].as_array().map(Vec::len), Some(0));
 
@@ -257,7 +259,7 @@ async fn corrupt_and_unknown_json_formats_fail_reopen() -> Result<(), Box<dyn st
         error,
         StorageError::FormatVersion {
             actual: 999,
-            expected: 1
+            expected: 2
         }
     ));
 
@@ -287,7 +289,8 @@ async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::erro
     let service = reopen(&path).await?;
     let handle = service.handle();
     let first = block(10, 0x10, 0x09);
-    let second = block(11, 0x11, 0x10);
+    let mut second = block(11, 0x11, 0x10);
+    second.gas_limit = 30_000_000;
     handle
         .apply_canonical_block(
             CanonicalBlockRecord {
@@ -329,6 +332,24 @@ async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::erro
             101,
         )
         .await?;
+    assert_eq!(
+        handle
+            .count_execution_opportunities(999, 9, 11, None)
+            .await?,
+        2
+    );
+    assert_eq!(
+        handle
+            .count_execution_opportunities(999, 9, 11, Some(10_000_000))
+            .await?,
+        1
+    );
+    assert_eq!(
+        handle
+            .count_execution_opportunities(999, 9, 11, Some(30_000_000))
+            .await?,
+        1
+    );
     assert_eq!(handle.load_canonical_receipts(999, 11).await?.len(), 1);
     assert_eq!(
         handle
@@ -343,6 +364,38 @@ async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::erro
             .await?
             .is_none()
     );
+    let direct = CanonicalReceiptRecord {
+        chain_id: 999,
+        transaction_hash: B256::repeat_byte(0x23),
+        block_number: second.number,
+        block_hash: second.hash,
+        transaction_index: 1,
+        status: Some(0),
+        gas_used: 30_000,
+        logs: Vec::new(),
+    };
+    handle.persist_canonical_receipt(direct.clone()).await?;
+    handle.persist_canonical_receipt(direct).await?;
+    assert_eq!(handle.load_canonical_receipts(999, 11).await?.len(), 2);
+    let mut orphan = CanonicalReceiptRecord {
+        chain_id: 999,
+        transaction_hash: B256::repeat_byte(0x24),
+        block_number: second.number,
+        block_hash: B256::repeat_byte(0xff),
+        transaction_index: 2,
+        status: Some(0),
+        gas_used: 30_000,
+        logs: Vec::new(),
+    };
+    assert!(
+        handle
+            .persist_canonical_receipt(orphan.clone())
+            .await
+            .is_err()
+    );
+    orphan.block_hash = second.hash;
+    orphan.transaction_index = 1;
+    assert!(handle.persist_canonical_receipt(orphan).await.is_err());
     let replay_logs = handle.load_canonical_logs(999, 10, 11).await?;
     assert_eq!(replay_logs.len(), 1);
     assert_eq!(replay_logs[0].transaction_hash, B256::repeat_byte(0x22));
@@ -650,6 +703,7 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
             max_fee_per_gas: U256::from(120_u64),
             max_priority_fee_per_gas: U256::from(3_u64),
             signed_at: 12,
+            signed_block: 12,
             broadcast_at: None,
         })
         .await?;
@@ -672,6 +726,11 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
     assert_eq!(
         recovered.known_transaction_hashes,
         vec![initial_hash, replacement_hash]
+    );
+    assert_eq!(recovered.last_attempt_block, 12);
+    assert_eq!(
+        recovered.last_attempt_kind,
+        TransactionAttemptKind::Replacement
     );
     handle
         .transition_transaction(TransactionTransition {
@@ -696,6 +755,7 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
             max_fee_per_gas: U256::from(140_u64),
             max_priority_fee_per_gas: U256::from(4_u64),
             signed_at: 14,
+            signed_block: 14,
             broadcast_at: None,
         })
         .await?;
@@ -722,6 +782,47 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
     assert_eq!(recovered.state, TransactionState::CancellationSubmitted);
     assert_eq!(recovered.transaction_hash, Some(cancellation_hash));
     assert_eq!(recovered.known_transaction_hashes.len(), 3);
+    assert_eq!(recovered.last_attempt_block, 14);
+    assert_eq!(
+        recovered.last_attempt_kind,
+        TransactionAttemptKind::Cancellation
+    );
+    let included = block(16, 0x16, 0x15);
+    service
+        .handle()
+        .apply_canonical_block_with_receipts(
+            CanonicalBlockRecord {
+                chain_id: 1,
+                block: included,
+            },
+            Vec::new(),
+            vec![CanonicalReceiptRecord {
+                chain_id: 1,
+                transaction_hash: cancellation_hash,
+                block_number: included.number,
+                block_hash: included.hash,
+                transaction_index: 0,
+                status: Some(1),
+                gas_used: 21_000,
+                logs: Vec::new(),
+            }],
+            included.timestamp,
+        )
+        .await?;
+    assert_eq!(
+        service
+            .handle()
+            .confirmed_gas_spend_since(1, included.timestamp)
+            .await?,
+        U256::from(2_940_000_u64)
+    );
+    assert_eq!(
+        service
+            .handle()
+            .confirmed_gas_spend_since(1, included.timestamp.saturating_add(1))
+            .await?,
+        U256::ZERO
+    );
     service.shutdown().await?;
     Ok(())
 }

@@ -1,7 +1,7 @@
 //! Binary entry point for supervised live operation and bounded bootstrap commands.
 #![forbid(unsafe_code)]
 
-use std::{path::Path, process::ExitCode, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::Path, process::ExitCode, sync::Arc, time::Duration};
 
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use clap::Parser;
@@ -15,7 +15,7 @@ use morpho_v2_reallocator::cli::{Cli, Command, ConfigCommand};
 use morpho_v2_reallocator::config::{
     AppConfig, RpcRole, RuntimeMode, SigningConfig, ValidatedConfig, ValidatedRpcConfig,
 };
-use morpho_v2_reallocator::protocol_lock::ProtocolLock;
+use morpho_v2_reallocator::protocol_lock::{ProtocolLock, ValidatedProtocolLock};
 use morpho_v2_reallocator::runtime::{
     controller::{RuntimeRegistry, RuntimeVaultState},
     execution_service::{ExecutionServiceError, LiveExecutionService},
@@ -37,8 +37,10 @@ use morpho_v2_reallocator::telemetry::{
 use morpho_v2_reallocator::transaction::{
     final_preflight::{ExecutionReservationManager, PreflightError},
     local_signer::LocalDevelopmentRoutineSigner,
+    remote_signer::{RemoteRoutineSigner, RemoteSignerPolicy},
     signer::RoutineSigner,
 };
+use secrecy::SecretString;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -218,7 +220,7 @@ async fn run_supervised(
         .verify_deployed(read.as_ref())
         .await
         .map_err(|error| error.to_string())?;
-    let signer = build_execute_signer(&config)?;
+    let signer = build_execute_signer(&config, &lock)?;
     let signer_ready = signer.is_some();
 
     let timestamp = unix_timestamp().map_err(|error| error.to_string())?;
@@ -485,6 +487,7 @@ async fn run_state_service(
 
 fn build_execute_signer(
     config: &ValidatedConfig,
+    lock: &ValidatedProtocolLock,
 ) -> Result<Option<Arc<dyn RoutineSigner>>, String> {
     if config.app.node.mode != RuntimeMode::Execute {
         return Ok(None);
@@ -508,10 +511,56 @@ fn build_execute_signer(
                 .map(|signer| Some(Arc::new(signer) as Arc<dyn RoutineSigner>))
                 .map_err(|error| error.to_string())
         }
-        SigningConfig::RemoteSigner { .. } => Err(
-            "remote production signer authentication is not yet composed; Execute stays disabled"
-                .to_owned(),
-        ),
+        SigningConfig::RemoteSigner { endpoint_env } => {
+            let raw_endpoint = std::env::var(endpoint_env)
+                .map_err(|_| "remote signer endpoint environment variable is missing".to_owned())?;
+            let endpoint = reqwest::Url::parse(&raw_endpoint)
+                .map_err(|_| "remote signer endpoint is invalid".to_owned())?;
+            if endpoint.scheme() != "https"
+                || endpoint.host_str() != Some(lock.remote_signer.service_identity.as_str())
+            {
+                return Err(
+                    "remote signer HTTPS host differs from the pinned service identity".to_owned(),
+                );
+            }
+            let identity_path = std::env::var(&lock.remote_signer.client_identity_env)
+                .map_err(|_| "remote signer client-identity reference is missing".to_owned())?;
+            let identity_pem = std::fs::read(identity_path)
+                .map_err(|_| "remote signer client identity cannot be read".to_owned())?;
+            let identity = reqwest::Identity::from_pem(&identity_pem)
+                .map_err(|_| "remote signer client identity is invalid".to_owned())?;
+            let bearer = std::env::var(&lock.remote_signer.authentication_secret_env)
+                .map_err(|_| "remote signer authentication secret is missing".to_owned())?;
+            if bearer.is_empty() {
+                return Err("remote signer authentication secret is empty".to_owned());
+            }
+            let client = reqwest::Client::builder()
+                .https_only(true)
+                .identity(identity)
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|_| "remote signer authenticated client cannot be built".to_owned())?;
+            let maximum_fee_per_gas = u128::try_from(config.app.execution.maximum_fee_per_gas_wei)
+                .map_err(|_| "remote signer fee bound exceeds u128".to_owned())?;
+            let signer_vaults = config
+                .app
+                .vaults
+                .iter()
+                .map(|vault| (vault.signer_address, vault.address.0))
+                .collect::<BTreeMap<_, _>>();
+            Ok(Some(Arc::new(RemoteRoutineSigner::new(
+                client,
+                endpoint,
+                SecretString::from(bearer),
+                RemoteSignerPolicy {
+                    chain_id: config.app.chain.chain_id,
+                    signer_vaults,
+                    maximum_gas_limit: config.app.execution.maximum_signed_transaction_gas,
+                    maximum_fee_per_gas,
+                },
+            ))))
+        }
     }
 }
 

@@ -1739,6 +1739,7 @@ mod tests {
             hash: B256::repeat_byte(0x30),
             parent_hash: B256::repeat_byte(0x2f),
             timestamp: 1_900_000_000,
+            gas_limit: 10_000_000,
         }
     }
 
@@ -2011,6 +2012,7 @@ mod tests {
             hash: B256::repeat_byte(0x31),
             parent_hash: first.hash,
             timestamp: first.timestamp + 1,
+            gas_limit: first.gas_limit,
         };
         let provider = FixtureProvider {
             headers: Mutex::new(VecDeque::from([first, second, second])),

@@ -29,7 +29,8 @@ impl Respond for RpcResponder {
                     "number": "0xa",
                     "hash": B256::repeat_byte(0x0a),
                     "parentHash": B256::repeat_byte(0x09),
-                    "timestamp": "0x64"
+                    "timestamp": "0x64",
+                    "gasLimit": "0x989680"
                 }),
                 "eth_getLogs" | "eth_getBlockReceipts" => json!([]),
                 "eth_call" => json!("0x"),

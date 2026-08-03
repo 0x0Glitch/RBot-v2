@@ -9,8 +9,9 @@ provided and verified:
 - runtime code identities for every managed vault, direct adapter, asset token,
   Adaptive Curve IRM, Morpho singleton, Multicall3 and any nonzero gate;
 - vault allocator role and dedicated signer identity;
-- remote signer mTLS/HMAC identities, bearer/request credential, isolated
-  allowlist and signer-to-vault routing table, or local development signer secret;
+- remote signer HTTPS service identity, client-identity PEM path, bearer/request
+  credential and isolated signer-side allowlist, or a non-mainnet
+  local-development signer secret;
 - fee, confirmation, reconciliation and operational alert configuration;
 - an approved executable reward cash-flow module and revision when any position
   uses `Modeled` reward policy (without one that position remains non-executable);
@@ -18,9 +19,9 @@ provided and verified:
 
 With one primary provider and no quorum, the primary is an explicit correctness
 trust assumption. Configuration requires a separate checkpoint provider. The
-current chain service compares chain identity and canonical head hashes; exact
-code, receipt and signer-nonce comparisons become readiness gates when their
-state and execution consumers are implemented.
+current chain service compares chain identity and canonical head hashes; runtime
+code is checked against the protocol lock, receipts are tied to the durable
+canonical block, and signer-nonce ambiguity stops the execution owner.
 
 The checked-in `protocol-lock.toml` pins the official source commits observed on
 2026-08-03, while all deployment-specific address, bytecode, compiler, optimizer,
