@@ -397,14 +397,22 @@ where
                     self.storage.clone(),
                     self.api.clone(),
                 );
-                let _ = reconcile_current_state(
+                match reconcile_current_state(
                     &self.storage,
                     &source,
                     vault,
                     &conformance,
                     head.timestamp,
                 )
-                .await?;
+                .await
+                {
+                    Ok(_) => {}
+                    // The chain cursor is committed before the state owner publishes the
+                    // matching exact topology/snapshot checkpoint. That normal bounded race is
+                    // retried on the next controller tick; no lifecycle state is advanced.
+                    Err(CurrentStateError::Source(_)) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
                 self.runtime
                     .update(vault.address, |status| {
                         status.transaction_id = None;

@@ -226,8 +226,11 @@ pub enum SnapshotError {
     #[error("snapshot return schema mismatch")]
     ReturnSchemaMismatch,
     /// Required semantic result is absent or has a different type.
-    #[error("snapshot result is missing or has the wrong semantic type")]
-    MissingResult,
+    #[error("snapshot result `{key}` is missing or has the wrong semantic type")]
+    MissingResult {
+        /// Debug-stable semantic manifest key; contains no provider data or secret.
+        key: String,
+    },
     /// Exact result contradicts static configuration or reconstructed topology.
     #[error("snapshot result contradicts configured or replayed identity")]
     IdentityMismatch,
@@ -1241,7 +1244,11 @@ fn assemble_snapshot(
     let accrued_total_assets = uint(&values, &SnapshotKey::ParentAccruedTotalAssets)?;
     let accrual = match values.get(&SnapshotKey::ParentAccrualView) {
         Some(DecodedValue::Accrual(value)) => *value,
-        _ => return Err(SnapshotError::MissingResult),
+        _ => {
+            return Err(SnapshotError::MissingResult {
+                key: format!("{:?}", SnapshotKey::ParentAccrualView),
+            });
+        }
     };
     if accrued_total_assets != accrual[0] {
         return Err(SnapshotError::IdentityMismatch);
@@ -1469,13 +1476,13 @@ fn assemble_snapshot(
             &values,
             &SnapshotKey::PositionAdapterAllocation(config.position_key),
         )?;
-        if adapter_reported_allocation != expected_assets {
-            return Err(SnapshotError::IdentityMismatch);
-        }
         let recorded_allocation = caps
             .get(&cap_refs[2])
             .map(|cap| cap.recorded_allocation)
             .ok_or(SnapshotError::IdentityMismatch)?;
+        if adapter_reported_allocation != recorded_allocation {
+            return Err(SnapshotError::IdentityMismatch);
+        }
         positions.insert(
             config.position_key,
             DirectMarketPositionState {
@@ -1620,7 +1627,7 @@ fn address(
 ) -> Result<Address, SnapshotError> {
     match values.get(key) {
         Some(DecodedValue::Address(value)) => Ok(*value),
-        _ => Err(SnapshotError::MissingResult),
+        _ => Err(missing_result(key, values.get(key))),
     }
 }
 fn boolean(
@@ -1629,7 +1636,7 @@ fn boolean(
 ) -> Result<bool, SnapshotError> {
     match values.get(key) {
         Some(DecodedValue::Bool(value)) => Ok(*value),
-        _ => Err(SnapshotError::MissingResult),
+        _ => Err(missing_result(key, values.get(key))),
     }
 }
 fn uint(
@@ -1638,7 +1645,7 @@ fn uint(
 ) -> Result<U256, SnapshotError> {
     match values.get(key) {
         Some(DecodedValue::Uint(value)) => Ok(*value),
-        _ => Err(SnapshotError::MissingResult),
+        _ => Err(missing_result(key, values.get(key))),
     }
 }
 fn int(
@@ -1647,7 +1654,7 @@ fn int(
 ) -> Result<I256, SnapshotError> {
     match values.get(key) {
         Some(DecodedValue::Int(value)) => Ok(*value),
-        _ => Err(SnapshotError::MissingResult),
+        _ => Err(missing_result(key, values.get(key))),
     }
 }
 fn bytes32(
@@ -1656,7 +1663,7 @@ fn bytes32(
 ) -> Result<B256, SnapshotError> {
     match values.get(key) {
         Some(DecodedValue::Bytes32(value)) => Ok(*value),
-        _ => Err(SnapshotError::MissingResult),
+        _ => Err(missing_result(key, values.get(key))),
     }
 }
 fn bytes(
@@ -1665,7 +1672,7 @@ fn bytes(
 ) -> Result<Bytes, SnapshotError> {
     match values.get(key) {
         Some(DecodedValue::Bytes(value)) => Ok(value.clone()),
-        _ => Err(SnapshotError::MissingResult),
+        _ => Err(missing_result(key, values.get(key))),
     }
 }
 fn bytes32_array(
@@ -1674,7 +1681,7 @@ fn bytes32_array(
 ) -> Result<Vec<B256>, SnapshotError> {
     match values.get(key) {
         Some(DecodedValue::Bytes32Array(value)) => Ok(value.clone()),
-        _ => Err(SnapshotError::MissingResult),
+        _ => Err(missing_result(key, values.get(key))),
     }
 }
 fn market(
@@ -1683,7 +1690,7 @@ fn market(
 ) -> Result<[U256; 6], SnapshotError> {
     match values.get(key) {
         Some(DecodedValue::Market(value)) => Ok(*value),
-        _ => Err(SnapshotError::MissingResult),
+        _ => Err(missing_result(key, values.get(key))),
     }
 }
 fn position(
@@ -1692,7 +1699,26 @@ fn position(
 ) -> Result<[U256; 3], SnapshotError> {
     match values.get(key) {
         Some(DecodedValue::Position(value)) => Ok(*value),
-        _ => Err(SnapshotError::MissingResult),
+        _ => Err(missing_result(key, values.get(key))),
+    }
+}
+fn missing_result(key: &SnapshotKey, actual: Option<&DecodedValue>) -> SnapshotError {
+    let actual = match actual {
+        None => "absent",
+        Some(DecodedValue::Address(_)) => "address",
+        Some(DecodedValue::Bool(_)) => "bool",
+        Some(DecodedValue::Uint(_)) => "uint",
+        Some(DecodedValue::Int(_)) => "int",
+        Some(DecodedValue::Bytes32(_)) => "bytes32",
+        Some(DecodedValue::Bytes(_)) => "bytes",
+        Some(DecodedValue::AddressArray(_)) => "address_array",
+        Some(DecodedValue::Bytes32Array(_)) => "bytes32_array",
+        Some(DecodedValue::Market(_)) => "market",
+        Some(DecodedValue::Position(_)) => "position",
+        Some(DecodedValue::Accrual(_)) => "accrual",
+    };
+    SnapshotError::MissingResult {
+        key: format!("{key:?}; actual={actual}"),
     }
 }
 fn u64_from_u256(value: U256) -> Result<u64, SnapshotError> {

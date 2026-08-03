@@ -335,8 +335,18 @@ independent-event persistent-unlock path still gate production Execute.
 - The live fixture exposed and fixed dynamic cap-ID ABI encoding: Solidity
   `abi.encode` argument sequences require Alloy `abi_encode_params`, not a
   dynamically nested tuple encoding.
+- The Base Sepolia fixture also exposed a source-semantic mismatch after a full
+  market exit. The fixture now matches the pinned adapter's swap-pop market-list
+  removal/re-add behavior, and `allocation(marketParams)` is verified against
+  the parent vault's recorded allocation rather than accrued adapter assets.
+  The local E2E explicitly proves those two values diverge after interest
+  accrues while exact snapshot construction remains valid.
+- Current-state reconciliation treats the bounded cursor-before-snapshot
+  publication window as retryable. It advances no transaction state until the
+  matching exact canonical checkpoint exists; all semantic reconciliation
+  failures remain terminal and fail closed.
 - The latest deterministic local rate transaction is
-  `0x40302f44e5fe875e74fbf90ecf1146e4e26baac9792cd38f7a4c46fa239fc41d`;
+  `0xfdd61c84311764f7c69f1a2224572549814a07cdb973bff33d8857ef1a0d6bcc`;
   its exact spot-rate spread improves from `20864935103` to approximately `18103017437`
   per-second WAD units. A later cap event forces an exact refreshed cap value;
   adapter removal hard-pauses projection, and re-addition restores capability
@@ -344,7 +354,7 @@ independent-event persistent-unlock path still gate production Execute.
   a new live episode on the next direct-parent block and publishes a durable,
   firewalled improving Shadow plan.
 - The same run's deposit-driven capital transaction is
-  `0xc2550672e53d65f760d66194a28b3b1dff12dd9f1cca7eed59d740cb01e00b44`;
+  `0x0975875bf331a1e029913eba29566b7ce99f9ff429f10c3c50dfd6db4c557186`;
   it deploys all `500000` newly deposited fixture asset units and reaches exact
   canonical receipt conformance and post-state reconciliation.
 - Base Sepolia subsequently completed five autonomous two-action rebalances
