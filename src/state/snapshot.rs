@@ -1403,13 +1403,21 @@ fn assemble_snapshot(
         {
             mode = MarketMode::SyncRequired;
         }
-        let recorded_allocation = uint(
+        let expected_assets = uint(
+            &values,
+            &SnapshotKey::PositionExpectedAssets(config.position_key),
+        )?;
+        let adapter_reported_allocation = uint(
             &values,
             &SnapshotKey::PositionAdapterAllocation(config.position_key),
         )?;
-        if caps.get(&cap_refs[2]).map(|cap| cap.recorded_allocation) != Some(recorded_allocation) {
+        if adapter_reported_allocation != expected_assets {
             return Err(SnapshotError::IdentityMismatch);
         }
+        let recorded_allocation = caps
+            .get(&cap_refs[2])
+            .map(|cap| cap.recorded_allocation)
+            .ok_or(SnapshotError::IdentityMismatch)?;
         positions.insert(
             config.position_key,
             DirectMarketPositionState {
@@ -1424,10 +1432,7 @@ fn assemble_snapshot(
                     &values,
                     &SnapshotKey::PositionDeadShares(config.position_key),
                 )?[0],
-                expected_assets: uint(
-                    &values,
-                    &SnapshotKey::PositionExpectedAssets(config.position_key),
-                )?,
+                expected_assets,
                 parent_recorded_market_allocation: recorded_allocation,
                 affected_caps: cap_refs,
                 mode,
