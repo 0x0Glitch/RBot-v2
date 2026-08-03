@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -95,6 +95,28 @@ pub struct RpcReceipt {
     pub gas_used: String,
     /// Ordered receipt logs.
     pub logs: Vec<RpcLog>,
+}
+
+/// Exact provider transaction response used for receipt identity conformance.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransaction {
+    /// Transaction hash.
+    pub hash: B256,
+    /// Recovered sender.
+    pub from: Address,
+    /// Contract target; routine transactions require a present call target.
+    pub to: Option<Address>,
+    /// Native value.
+    pub value: U256,
+    /// Complete input calldata.
+    pub input: Bytes,
+    /// Canonical inclusion block hash.
+    pub block_hash: Option<B256>,
+    /// Canonical inclusion block number quantity.
+    pub block_number: Option<String>,
+    /// Transaction index quantity.
+    pub transaction_index: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -239,6 +261,16 @@ pub trait ChainDataProvider: Send + Sync {
     ) -> Result<Vec<RpcLog>, ProviderError>;
     /// One receipt lookup for fallback ingestion and transaction recovery.
     async fn receipt_by_hash(&self, hash: B256) -> Result<Option<RpcReceipt>, ProviderError>;
+}
+
+/// Typed read-only transaction lookup required by receipt conformance.
+#[async_trait]
+pub trait TransactionLookupProvider: Send + Sync {
+    /// Fetches one exact transaction by hash.
+    async fn transaction_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<RpcTransaction>, ProviderError>;
 }
 
 /// Typed, read-only transaction simulation surface used by final preflight.
@@ -640,6 +672,18 @@ impl ChainDataProvider for HttpProvider {
     async fn receipt_by_hash(&self, hash: B256) -> Result<Option<RpcReceipt>, ProviderError> {
         self.require_any_role(&[ProviderRole::Receipt, ProviderRole::Checkpoint])?;
         self.request_unscoped("eth_getTransactionReceipt", json!([hash]))
+            .await
+    }
+}
+
+#[async_trait]
+impl TransactionLookupProvider for HttpProvider {
+    async fn transaction_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<RpcTransaction>, ProviderError> {
+        self.require_any_role(&[ProviderRole::Receipt, ProviderRole::Checkpoint])?;
+        self.request_unscoped("eth_getTransactionByHash", json!([hash]))
             .await
     }
 }

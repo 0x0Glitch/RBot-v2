@@ -10,7 +10,9 @@
 
 ## Later milestones
 
-Milestones 11–13 remain pending in normative order. Execute remains disabled.
+Milestone 11's receipt/conformance/current-state core is implemented. Its
+supervised runtime and operations surface plus Milestones 12–13 remain pending
+in normative order. Execute remains disabled.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 
@@ -225,3 +227,27 @@ Milestones 11–13 remain pending in normative order. Execute remains disabled.
   cancellation, attempt crash boundaries and three-attempt recovery.
 - The concrete supervised runtime source and receipt/reconciliation consumer are
   Milestones 11–12 work. Execute remains disabled.
+
+## Milestone 11 — Canonical Receipt And Current-State Reconciliation (Core)
+
+- Chain ingestion durably retains complete ordered canonical receipts, not only
+  watched logs. Receipt/block/log binding and transaction ordering are checked
+  before the block cursor advances, and reorg rewind removes orphaned receipts.
+- Final preflight now persists one exact simulator projection per ordered
+  action: direction, position/adapter/market, requested assets, minted or burned
+  shares, post-action adapter allocation, all three returned cap IDs, signed cap
+  delta and action-local positive loss.
+- Typed transaction lookup and strict receipt validation compare the canonical
+  sender, target, value, full calldata and inclusion identity, then require exact
+  ordered Vault V2, direct-adapter and Morpho action events plus vault-asset
+  transfers. Allocation and deallocation fixtures prove correct receipts and a
+  corruption matrix proves fail-closed behavior.
+- Conformance evidence is written atomically with `Confirmed ->
+  ConformanceValidated`; generic lifecycle transitions cannot bypass this gate.
+  Exact post-state snapshot/accounting, recalculated spread/service state,
+  confirmed episode movement and terminal reconciliation are likewise one JSON
+  commit.
+- Revert disposition autonomously refreshes only proven stale/read-disagreement
+  failures. Model, gas, dependency, role, liquidity and unknown failures pause.
+- The supervised receipt consumer, operational runtime/API/alerts, full shadow
+  E2E and deployment identities remain pending. Execute remains disabled.

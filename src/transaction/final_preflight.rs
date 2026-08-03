@@ -19,7 +19,10 @@ use crate::{
     storage::{
         StorageError,
         actor::StorageHandle,
-        models::{FinalPreflightRecord, TransactionState, TransactionTransition},
+        models::{
+            ExpectedActionKind, ExpectedActionRecord, FinalPreflightRecord, TransactionState,
+            TransactionTransition,
+        },
     },
     transaction::{
         encoder::encode_validated_plan,
@@ -33,6 +36,9 @@ use crate::{
         },
         signer::{RoutineSigner, SignedEnvelope},
     },
+};
+use crate::{
+    domain::V2Action, planner::simulator::ActionProjection, state::caps::direct_position_cap_data,
 };
 
 /// Stable inclusion scenario identity.
@@ -122,6 +128,15 @@ pub struct SubmittedPreflight {
     pub submitted_hash: B256,
 }
 
+/// Exact rebuilt semantic plan and its sequential simulator effects.
+#[derive(Clone, Debug)]
+pub struct PreparedPreflightPlan {
+    /// Independently validated semantic plan.
+    pub plan: ValidatedPlan,
+    /// One exact projection for every action in plan order.
+    pub action_projections: Vec<ActionProjection>,
+}
+
 /// Exact state/planner bridge. Implementations must persist the rebuilt exact snapshot.
 #[async_trait]
 pub trait ExactPreflightSource: Send + Sync {
@@ -132,7 +147,7 @@ pub trait ExactPreflightSource: Send + Sync {
         &self,
         head: BlockRef,
         scenarios: &[InclusionAssumption; 3],
-    ) -> Result<ValidatedPlan, PreflightSourceError>;
+    ) -> Result<PreparedPreflightPlan, PreflightSourceError>;
     /// Returns whether a planning-relevant invalidation is queued locally.
     async fn invalidation_queued(&self) -> Result<bool, PreflightSourceError>;
     /// Durably reserves plan movement after the unsigned plan is persisted.
@@ -342,10 +357,12 @@ pub async fn execute_one_head_preflight(
         config.app.execution.maximum_inclusion_fast_blocks,
         request.max_fee_per_gas,
     )?;
-    let plan = source.rebuild_plan(head, &scenarios).await?;
+    let prepared = source.rebuild_plan(head, &scenarios).await?;
+    let plan = prepared.plan;
     if plan.plan().snapshot.block != head || plan.plan().vault != vault.address {
         return Err(PreflightError::HeadChanged);
     }
+    let expected_actions = expected_action_records(&plan, &prepared.action_projections, vault)?;
     let calldata = encode_validated_plan(&plan);
     let calldata_hash = keccak256(&calldata);
     let simulation_before_hash = context_hash(&[
@@ -411,6 +428,7 @@ pub async fn execute_one_head_preflight(
             calldata_hash,
             gas_estimate,
             signed_gas_limit: gas_limit,
+            expected_actions,
             completed_monotonic_nanos: elapsed_nanos,
             created_at: request.created_at,
         })
@@ -516,6 +534,71 @@ pub async fn execute_one_head_preflight(
         submitted_hash,
         signed,
     })
+}
+
+fn expected_action_records(
+    plan: &ValidatedPlan,
+    projections: &[ActionProjection],
+    vault: &ValidatedVaultConfig,
+) -> Result<Vec<ExpectedActionRecord>, PreflightError> {
+    if plan.actions().len() != projections.len() {
+        return Err(PreflightError::Firewall(FirewallError::Action));
+    }
+    plan.actions()
+        .iter()
+        .zip(projections)
+        .map(|(action, projection)| {
+            let (kind, position, adapter, requested_assets) = match action {
+                V2Action::Allocate {
+                    position,
+                    adapter,
+                    requested_assets,
+                    ..
+                } => (
+                    ExpectedActionKind::Allocate,
+                    *position,
+                    *adapter,
+                    requested_assets.0,
+                ),
+                V2Action::Deallocate {
+                    position,
+                    adapter,
+                    requested_assets,
+                    ..
+                } => (
+                    ExpectedActionKind::Deallocate,
+                    *position,
+                    *adapter,
+                    requested_assets.0,
+                ),
+            };
+            if projection.position != position || projection.requested_assets != requested_assets {
+                return Err(PreflightError::Firewall(FirewallError::Action));
+            }
+            let configured = vault
+                .positions
+                .iter()
+                .find(|configured| configured.position_key == position)
+                .ok_or(PreflightError::Firewall(FirewallError::Action))?;
+            if configured.adapter != adapter {
+                return Err(PreflightError::Firewall(FirewallError::Action));
+            }
+            Ok(ExpectedActionRecord {
+                kind,
+                position,
+                adapter,
+                market: configured.market_id,
+                requested_assets,
+                changed_shares: projection.changed_shares,
+                expected_assets_after: projection.expected_assets_after,
+                returned_cap_ids: direct_position_cap_data(adapter, &configured.market_params)
+                    .ids()
+                    .map(|id| id.0),
+                allocation_change: projection.allocation_change,
+                positive_loss_assets: projection.positive_loss_assets,
+            })
+        })
+        .collect()
 }
 
 fn require_head(observed: BlockRef, expected: BlockRef) -> Result<(), PreflightError> {

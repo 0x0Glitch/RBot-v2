@@ -1,9 +1,11 @@
 //! Durable canonical-chain and transaction-lifecycle records.
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, I256, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{BlockRef, PlanId, TransactionId, VaultAddress};
+use crate::domain::{
+    AdapterAddress, BlockRef, MarketId, PlanId, PositionKey, TransactionId, VaultAddress,
+};
 
 /// Canonical block persisted with its parent relationship.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,6 +58,102 @@ pub struct CanonicalReceiptRecord {
     pub gas_used: u64,
     /// Complete ordered receipt logs.
     pub logs: Vec<CanonicalLogRecord>,
+}
+
+/// Direction of one exact expected Vault V2 routine action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedActionKind {
+    /// Vault V2 `allocate` action.
+    Allocate,
+    /// Vault V2 `deallocate` action.
+    Deallocate,
+}
+
+/// Exact simulator output retained for independent receipt conformance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExpectedActionRecord {
+    /// Ordered action direction.
+    pub kind: ExpectedActionKind,
+    /// Configured direct position.
+    pub position: PositionKey,
+    /// Direct adapter called by the vault.
+    pub adapter: AdapterAddress,
+    /// Morpho market ID encoded by the action data.
+    pub market: MarketId,
+    /// Requested vault asset units.
+    pub requested_assets: U256,
+    /// Exact Morpho shares minted or burned.
+    pub changed_shares: U256,
+    /// Exact adapter allocation after the action.
+    pub expected_assets_after: U256,
+    /// Adapter, collateral and exact-market cap IDs in contract order.
+    pub returned_cap_ids: [B256; 3],
+    /// Signed change returned to Vault V2 and applied to each cap.
+    pub allocation_change: I256,
+    /// Positive action-local loss in vault asset units.
+    pub positive_loss_assets: U256,
+}
+
+/// Durable receipt-conformance result written atomically with lifecycle advancement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConformanceRecord {
+    /// Stable lifecycle identity.
+    pub transaction_id: TransactionId,
+    /// Canonical signed-attempt hash.
+    pub transaction_hash: B256,
+    /// Canonical inclusion block number.
+    pub block_number: u64,
+    /// Canonical inclusion block hash.
+    pub block_hash: B256,
+    /// Number of exact routine actions validated.
+    pub action_count: u64,
+    /// Maximum of allocated and deallocated asset totals.
+    pub movement_assets: U256,
+    /// Sum of positive action-local loss units.
+    pub positive_loss_assets: U256,
+    /// Canonical conformance-report hash.
+    pub report_hash: B256,
+    /// Unix validation timestamp.
+    pub validated_at: u64,
+}
+
+/// Durable data required to independently validate a confirmed transaction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingConformance {
+    /// Complete firewalled transaction reservation.
+    pub reservation: NonceReservation,
+    /// Every signed attempt hash for the nonce lane.
+    pub known_transaction_hashes: Vec<B256>,
+    /// Canonical included block number.
+    pub included_block: u64,
+    /// Canonical included block hash.
+    pub included_block_hash: B256,
+    /// Exact ordered simulator effects retained before signing.
+    pub expected_actions: Vec<ExpectedActionRecord>,
+}
+
+/// Exact current-state reconciliation result written atomically with terminal advancement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReconciliationRecord {
+    /// Stable lifecycle identity.
+    pub transaction_id: TransactionId,
+    /// Exact current snapshot hash.
+    pub snapshot_hash: B256,
+    /// Exact current snapshot block.
+    pub block: BlockRef,
+    /// Current applicable spot-borrow-rate spread.
+    pub current_rate_spread: U256,
+    /// Whether current deposit/exit/reserve constraints pass.
+    pub service_constraints_met: bool,
+    /// Whether exact current state calls for another plan.
+    pub next_plan_needed: bool,
+    /// Whether any capital-deployment pending state was resolved.
+    pub pending_deployment_resolved: bool,
+    /// Canonical hash of the complete reconciliation report.
+    pub report_hash: B256,
+    /// Unix reconciliation timestamp.
+    pub reconciled_at: u64,
 }
 
 /// Durable transaction lifecycle state.
@@ -132,6 +230,7 @@ impl TransactionState {
                 Self::Replaced
                     | Self::CancellationSubmitted
                     | Self::Included
+                    | Self::Reverted
                     | Self::Orphaned
                     | Self::Failed
             ),
@@ -145,7 +244,11 @@ impl TransactionState {
             Self::Confirmed => matches!(next, Self::ConformanceValidated | Self::Failed),
             Self::Orphaned => matches!(
                 next,
-                Self::Submitted | Self::CancellationSubmitted | Self::Included | Self::Failed
+                Self::Submitted
+                    | Self::CancellationSubmitted
+                    | Self::Included
+                    | Self::Reverted
+                    | Self::Failed
             ),
             Self::ConformanceValidated => matches!(next, Self::Reconciled | Self::Failed),
             Self::AbortedBeforeSigning | Self::Reverted | Self::Reconciled | Self::Failed => false,
@@ -201,6 +304,9 @@ pub struct FinalPreflightRecord {
     pub gas_estimate: u64,
     /// Final ceil-headroom gas limit.
     pub signed_gas_limit: u64,
+    /// Exact ordered simulator effects required from the canonical receipt.
+    #[serde(default)]
+    pub expected_actions: Vec<ExpectedActionRecord>,
     /// Process-monotonic completion time.
     pub completed_monotonic_nanos: u64,
     /// Unix creation timestamp.

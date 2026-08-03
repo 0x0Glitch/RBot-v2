@@ -25,11 +25,12 @@ use morpho_v2_reallocator::{
         PlanId, PlanProjection, PlanReason, SolverCertificate, StateContext, TransactionId,
         V2Action, V2Plan, VaultCapabilities,
     },
+    planner::simulator::ActionProjection,
     storage::actor::StorageService,
     transaction::{
         final_preflight::{
             ExactPreflightSource, ExecutePreflightRequest, ExecutionReservationManager,
-            PlanMovementReservation, PreflightError, PreflightSourceError,
+            PlanMovementReservation, PreflightError, PreflightSourceError, PreparedPreflightPlan,
             execute_one_head_preflight,
         },
         firewall::{ValidatedPlan, canonical_plan_hash, validate_plan},
@@ -290,12 +291,35 @@ impl ExactPreflightSource for Source {
         &self,
         _head: BlockRef,
         _scenarios: &[morpho_v2_reallocator::transaction::final_preflight::InclusionAssumption; 3],
-    ) -> Result<ValidatedPlan, PreflightSourceError> {
+    ) -> Result<PreparedPreflightPlan, PreflightSourceError> {
         self.storage
             .persist_snapshot(self.snapshot.clone(), self.head.timestamp)
             .await
             .map_err(|_| PreflightSourceError::Failed)?;
-        Ok(self.plan.clone())
+        let (position, requested_assets) = match &self.plan.actions()[0] {
+            V2Action::Allocate {
+                position,
+                requested_assets,
+                ..
+            }
+            | V2Action::Deallocate {
+                position,
+                requested_assets,
+                ..
+            } => (*position, requested_assets.0),
+        };
+        Ok(PreparedPreflightPlan {
+            plan: self.plan.clone(),
+            action_projections: vec![ActionProjection {
+                position,
+                requested_assets,
+                changed_shares: requested_assets,
+                expected_assets_after: requested_assets,
+                allocation_change: I256::try_from(requested_assets)
+                    .map_err(|_| PreflightSourceError::Failed)?,
+                positive_loss_assets: U256::ZERO,
+            }],
+        })
     }
     async fn invalidation_queued(&self) -> Result<bool, PreflightSourceError> {
         Ok(false)

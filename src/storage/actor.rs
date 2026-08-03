@@ -22,9 +22,10 @@ use crate::{
 use super::{
     StorageError,
     models::{
-        CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, FinalPreflightRecord,
-        NonceReservation, RewindResult, SignedAttemptRecord, SignedTransactionRecord,
-        TransactionAttemptKind, TransactionState, TransactionTransition, UnresolvedTransaction,
+        CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
+        FinalPreflightRecord, NonceReservation, PendingConformance, ReconciliationRecord,
+        RewindResult, SignedAttemptRecord, SignedTransactionRecord, TransactionAttemptKind,
+        TransactionState, TransactionTransition, UnresolvedTransaction,
     },
 };
 
@@ -84,6 +85,10 @@ struct JsonState {
     transactions: Vec<TransactionRow>,
     #[serde(default)]
     transaction_attempts: Vec<SignedAttemptRecord>,
+    #[serde(default)]
+    conformance_records: Vec<ConformanceRecord>,
+    #[serde(default)]
+    reconciliation_records: Vec<ReconciliationRecord>,
     topology_history: Vec<TopologyRevision>,
     rate_episodes: Vec<TimedEpisode>,
 }
@@ -102,6 +107,8 @@ impl Default for JsonState {
             final_preflights: Vec::new(),
             transactions: Vec::new(),
             transaction_attempts: Vec::new(),
+            conformance_records: Vec::new(),
+            reconciliation_records: Vec::new(),
             topology_history: Vec::new(),
             rate_episodes: Vec::new(),
         }
@@ -279,6 +286,31 @@ pub enum StorageCommand {
         transition: TransactionTransition,
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Atomically persist conformance evidence and advance Confirmed state.
+    PersistConformance {
+        /// Complete canonical conformance record.
+        record: ConformanceRecord,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Atomically persist exact current state and terminal reconciliation evidence.
+    PersistReconciliation {
+        /// Complete reconciliation result.
+        record: ReconciliationRecord,
+        /// Exact current snapshot used by the result.
+        snapshot: Box<ExactVaultSnapshot>,
+        /// Optional rate episode with confirmed movement applied.
+        confirmed_episode: Option<Box<RateSignalEpisode>>,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Load exact data required to validate one confirmed transaction.
+    LoadPendingConformance {
+        /// Stable lifecycle identity.
+        transaction_id: crate::domain::TransactionId,
+        /// Pending conformance data.
+        reply: oneshot::Sender<Result<Option<PendingConformance>, StorageError>>,
     },
     /// Load the unique unresolved signer row.
     LoadUnresolved {
@@ -506,6 +538,40 @@ impl StorageHandle {
         self.request(|reply| StorageCommand::LoadCanonicalBlock {
             chain_id,
             number,
+            reply,
+        })
+        .await
+    }
+
+    /// Persists receipt-conformance proof and advances the lifecycle atomically.
+    pub async fn persist_conformance(&self, record: ConformanceRecord) -> Result<(), StorageError> {
+        self.request(|reply| StorageCommand::PersistConformance { record, reply })
+            .await
+    }
+
+    /// Persists exact state, confirmed episode movement and terminal reconciliation atomically.
+    pub async fn persist_reconciliation(
+        &self,
+        record: ReconciliationRecord,
+        snapshot: ExactVaultSnapshot,
+        confirmed_episode: Option<RateSignalEpisode>,
+    ) -> Result<(), StorageError> {
+        self.request(|reply| StorageCommand::PersistReconciliation {
+            record,
+            snapshot: Box::new(snapshot),
+            confirmed_episode: confirmed_episode.map(Box::new),
+            reply,
+        })
+        .await
+    }
+
+    /// Loads the immutable plan/envelope context for one confirmed transaction.
+    pub async fn load_pending_conformance(
+        &self,
+        transaction_id: crate::domain::TransactionId,
+    ) -> Result<Option<PendingConformance>, StorageError> {
+        self.request(|reply| StorageCommand::LoadPendingConformance {
+            transaction_id,
             reply,
         })
         .await
@@ -755,6 +821,30 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
             StorageCommand::TransitionTransaction { transition, reply } => {
                 let _ = reply.send(store.commit(|state| transition_transaction(state, transition)));
             }
+            StorageCommand::PersistConformance { record, reply } => {
+                let _ = reply.send(store.commit(|state| persist_conformance(state, record)));
+            }
+            StorageCommand::PersistReconciliation {
+                record,
+                snapshot,
+                confirmed_episode,
+                reply,
+            } => {
+                let _ = reply.send(store.commit(|state| {
+                    persist_reconciliation(
+                        state,
+                        record,
+                        *snapshot,
+                        confirmed_episode.map(|episode| *episode),
+                    )
+                }));
+            }
+            StorageCommand::LoadPendingConformance {
+                transaction_id,
+                reply,
+            } => {
+                let _ = reply.send(load_pending_conformance(&store.state, transaction_id));
+            }
             StorageCommand::LoadUnresolved { signer, reply } => {
                 let _ = reply.send(load_unresolved(&store.state, signer));
             }
@@ -935,6 +1025,12 @@ fn rewind(state: &mut JsonState, chain_id: u64, ancestor: BlockRef) -> RewindRes
     state
         .canonical_receipts
         .retain(|record| record.chain_id != chain_id || record.block_number <= ancestor.number);
+    state
+        .conformance_records
+        .retain(|record| record.block_number <= ancestor.number);
+    state
+        .reconciliation_records
+        .retain(|record| record.block.number <= ancestor.number);
     state
         .topology_history
         .retain(|entry| entry.block.number <= ancestor.number);
@@ -1130,6 +1226,14 @@ fn transition_transaction(
     state: &mut JsonState,
     transition: TransactionTransition,
 ) -> Result<(), StorageError> {
+    if matches!(
+        transition.next_state,
+        TransactionState::ConformanceValidated | TransactionState::Reconciled
+    ) {
+        return Err(StorageError::Invariant(
+            "terminal validation state requires an atomic evidence record",
+        ));
+    }
     if !transition.expected_state.permits(transition.next_state) {
         return Err(StorageError::InvalidTransition {
             from: transition.expected_state,
@@ -1182,6 +1286,145 @@ fn transition_transaction(
         row.included_block_hash = transition.included_block_hash;
     }
     row.updated_at = transition.updated_at;
+    Ok(())
+}
+
+fn load_pending_conformance(
+    state: &JsonState,
+    transaction_id: crate::domain::TransactionId,
+) -> Result<Option<PendingConformance>, StorageError> {
+    let Some(row) = state
+        .transactions
+        .iter()
+        .find(|row| row.reservation.transaction_id == transaction_id)
+    else {
+        return Ok(None);
+    };
+    if row.state != TransactionState::Confirmed {
+        return Ok(None);
+    }
+    let plan_id = row
+        .reservation
+        .plan_id
+        .ok_or(StorageError::Invariant("routine transaction has no plan"))?;
+    let preflight = state
+        .final_preflights
+        .iter()
+        .find(|preflight| preflight.plan_id == plan_id)
+        .ok_or(StorageError::Invariant(
+            "confirmed transaction has no final preflight",
+        ))?;
+    let included_block = row.included_block.ok_or(StorageError::Invariant(
+        "confirmed transaction has no included block",
+    ))?;
+    let included_block_hash = row.included_block_hash.ok_or(StorageError::Invariant(
+        "confirmed transaction has no included block hash",
+    ))?;
+    Ok(Some(PendingConformance {
+        reservation: row.reservation.clone(),
+        known_transaction_hashes: state
+            .transaction_attempts
+            .iter()
+            .filter(|attempt| attempt.transaction_id == transaction_id)
+            .map(|attempt| attempt.transaction_hash)
+            .collect(),
+        included_block,
+        included_block_hash,
+        expected_actions: preflight.expected_actions.clone(),
+    }))
+}
+
+fn persist_conformance(
+    state: &mut JsonState,
+    record: ConformanceRecord,
+) -> Result<(), StorageError> {
+    if record.report_hash == B256::ZERO
+        || state
+            .conformance_records
+            .iter()
+            .any(|existing| existing.transaction_id == record.transaction_id)
+    {
+        return Err(StorageError::Invariant(
+            "invalid or duplicate conformance record",
+        ));
+    }
+    let known_hash = state.transaction_attempts.iter().any(|attempt| {
+        attempt.transaction_id == record.transaction_id
+            && attempt.transaction_hash == record.transaction_hash
+    });
+    if !known_hash {
+        return Err(StorageError::Invariant(
+            "conformance hash is not a durable signed attempt",
+        ));
+    }
+    let row = state
+        .transactions
+        .iter_mut()
+        .find(|row| row.reservation.transaction_id == record.transaction_id)
+        .ok_or(StorageError::StaleTransition)?;
+    if row.state != TransactionState::Confirmed
+        || row.included_block != Some(record.block_number)
+        || row.included_block_hash != Some(record.block_hash)
+    {
+        return Err(StorageError::StaleTransition);
+    }
+    row.state = TransactionState::ConformanceValidated;
+    row.transaction_hash = Some(record.transaction_hash);
+    row.updated_at = record.validated_at;
+    state.conformance_records.push(record);
+    Ok(())
+}
+
+fn persist_reconciliation(
+    state: &mut JsonState,
+    record: ReconciliationRecord,
+    snapshot: ExactVaultSnapshot,
+    confirmed_episode: Option<RateSignalEpisode>,
+) -> Result<(), StorageError> {
+    if record.report_hash == B256::ZERO
+        || snapshot.snapshot_hash != record.snapshot_hash
+        || snapshot.context.block != record.block
+        || state
+            .reconciliation_records
+            .iter()
+            .any(|existing| existing.transaction_id == record.transaction_id)
+        || !state
+            .conformance_records
+            .iter()
+            .any(|existing| existing.transaction_id == record.transaction_id)
+    {
+        return Err(StorageError::Invariant(
+            "invalid or duplicate reconciliation record",
+        ));
+    }
+    let row = state
+        .transactions
+        .iter_mut()
+        .find(|row| row.reservation.transaction_id == record.transaction_id)
+        .ok_or(StorageError::StaleTransition)?;
+    if row.state != TransactionState::ConformanceValidated
+        || row
+            .included_block
+            .is_none_or(|included| record.block.number < included)
+    {
+        return Err(StorageError::StaleTransition);
+    }
+    row.state = TransactionState::Reconciled;
+    row.updated_at = record.reconciled_at;
+    if state
+        .exact_snapshots
+        .iter()
+        .all(|entry| entry.snapshot.snapshot_hash != snapshot.snapshot_hash)
+    {
+        state.exact_snapshots.push(TimedSnapshot {
+            snapshot,
+            created_at: record.reconciled_at,
+        });
+    }
+    if let Some(episode) = confirmed_episode {
+        persist_episode(state, episode, record.reconciled_at)?;
+    }
+    state.reconciliation_records.push(record);
     Ok(())
 }
 

@@ -15,9 +15,9 @@ use morpho_v2_reallocator::planner::episodes::RateSignalEpisode;
 use morpho_v2_reallocator::storage::StorageError;
 use morpho_v2_reallocator::storage::actor::StorageService;
 use morpho_v2_reallocator::storage::models::{
-    CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, NonceReservation,
-    SignedAttemptRecord, SignedTransactionRecord, TransactionAttemptKind, TransactionState,
-    TransactionTransition,
+    CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
+    NonceReservation, ReconciliationRecord, SignedAttemptRecord, SignedTransactionRecord,
+    TransactionAttemptKind, TransactionState, TransactionTransition,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -158,6 +158,14 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
         .as_object_mut()
         .ok_or("state is not an object")?
         .remove("canonical_receipts");
+    additive_upgrade
+        .as_object_mut()
+        .ok_or("state is not an object")?
+        .remove("conformance_records");
+    additive_upgrade
+        .as_object_mut()
+        .ok_or("state is not an object")?
+        .remove("reconciliation_records");
     std::fs::write(&path, serde_json::to_vec_pretty(&additive_upgrade)?)?;
     reopen(&path).await?.shutdown().await?;
     assert!(read_json(&path)?["transaction_attempts"].is_array());
@@ -377,29 +385,44 @@ async fn transaction_boundaries_recover_after_every_reopen()
         None,
     )
     .await?;
-    transition_and_recover(
-        &path,
-        signer,
-        TransactionState::Confirmed,
-        TransactionState::ConformanceValidated,
-        None,
-        None,
-    )
-    .await?;
-
     let service = reopen(&path).await?;
     service
         .handle()
-        .transition_transaction(TransactionTransition {
+        .persist_conformance(ConformanceRecord {
             transaction_id: TransactionId(B256::repeat_byte(0x71)),
-            expected_state: TransactionState::ConformanceValidated,
-            next_state: TransactionState::Reconciled,
-            transaction_hash: None,
-            submitted_at: None,
-            included_block: None,
-            included_block_hash: None,
-            updated_at: 1_800_000_010,
+            transaction_hash,
+            block_number: 20,
+            block_hash: B256::repeat_byte(0x20),
+            action_count: 1,
+            movement_assets: U256::from(10_u64),
+            positive_loss_assets: U256::ZERO,
+            report_hash: B256::repeat_byte(0xc1),
+            validated_at: 1_800_000_009,
         })
+        .await?;
+    service.shutdown().await?;
+    assert_recovered(&path, signer, TransactionState::ConformanceValidated).await?;
+
+    let service = reopen(&path).await?;
+    let mut reconciled_snapshot = sample_snapshot();
+    reconciled_snapshot.context.block = block(21, 0x21, 0x20);
+    service
+        .handle()
+        .persist_reconciliation(
+            ReconciliationRecord {
+                transaction_id: TransactionId(B256::repeat_byte(0x71)),
+                snapshot_hash: reconciled_snapshot.snapshot_hash,
+                block: reconciled_snapshot.context.block,
+                current_rate_spread: U256::from(1_u64),
+                service_constraints_met: true,
+                next_plan_needed: false,
+                pending_deployment_resolved: true,
+                report_hash: B256::repeat_byte(0xd1),
+                reconciled_at: 1_800_000_010,
+            },
+            reconciled_snapshot,
+            None,
+        )
         .await?;
     service.shutdown().await?;
     let service = reopen(&path).await?;

@@ -4,7 +4,7 @@
 | --- | --- | --- | --- | --- |
 | 3, 4, 30.1 | Pinned single-crate Rust 2024 workspace and CI | `Cargo.toml`, toolchain/lint files, `Makefile`, CI workflow | `make ci` | Implemented |
 | Milestone 0 | Build identity and fail-closed bootstrap binary | `src/lib.rs`, `src/main.rs`, `src/telemetry/metrics.rs` | unit test and CLI smoke | Implemented |
-| Milestones 10–13 | Final preflight through canary implementation | milestone modules and tests | milestone gates | Pending |
+| Milestones 10–13 | Final preflight through canary implementation | milestone modules and tests | milestone gates | Milestones 10 and reconciliation core implemented; supervised operations/E2E pending |
 | 5 | Semantic quantities, contexts, exact snapshot and plan types | `src/domain.rs` | unit and compile-fail tests | Implemented |
 | 6 | Strict TOML parsing, validation, APR conversion, canonical revision | `src/config.rs`, `config.example.toml` | `tests/config.rs` | Implemented |
 | 7.1 | Pinned source/runtime identity model and lock digest | `src/protocol_lock.rs`, `protocol-lock.toml` | `tests/protocol_lock.rs` | Implemented; deployment values pending |
@@ -53,6 +53,10 @@
 | 24.2–24.4 | Same-head simulation, gas bound, exclusive dependencies, durable movement/nonce/signing order and signed-byte submission | `src/transaction/final_preflight.rs`, `src/chain/provider.rs` | success and post-persistence head-move integration tests, reservation unit test | Implemented; concrete supervised source attaches in Milestone 12 |
 | 23.5–23.7, 24.5 | Fast-block plan-specific pending horizons, touched-state cancellation and strictly increasing fee attempts | `src/transaction/pending.rs`, `src/transaction/signer.rs` | fast-opportunity/material-invalidation tests and replacement/cancellation integration test | Implemented |
 | 23.3–23.6 | Every initial/replacement/cancellation signed attempt durable before broadcast and recoverable by hash | `src/storage/{actor,models}.rs` | three-attempt crash/reopen test | Implemented by JSON storage override |
+| 25.1, 20.1 | Complete canonical receipt persistence and typed transaction lookup | `src/chain/{heads,provider}.rs`, `src/storage/{actor,models}.rs` | chain-service receipt durability, ordering and rewind tests | Implemented |
+| 25.2–25.3, 20.1–20.2 | Exact bot-transaction sender/target/calldata and ordered Vault/adapter/Morpho/transfer conformance, isolated from later same-block activity | `src/reconciliation/conformance.rs`, `src/transaction/final_preflight.rs` | allocation/deallocation and corruption fixtures in `tests/reconciliation.rs` | Implemented; supervised consumer pending |
+| 25.4–25.5, 20.3 | Exact current snapshot, adapter/share accounting, current spread/service decision and atomic episode/reconciliation advancement | `src/reconciliation/current_state.rs`, `src/storage/{actor,models}.rs` | JSON terminal-boundary recovery and accounting validation | Core implemented; live state-source integration pending |
+| 25.6 | Conservative revert classification; only stale/read disagreement may autonomously replan | `src/reconciliation/classification.rs` | failure-disposition unit test | Implemented |
 
 ## Dependency policy notes
 
