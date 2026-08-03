@@ -32,4 +32,19 @@ pub enum Command {
         #[arg(long, default_value = "protocol-lock.toml")]
         protocol_lock: PathBuf,
     },
+    /// Apply and verify embedded SQLite migrations, then exit cleanly.
+    Migrate {
+        /// SQLite database path.
+        #[arg(long)]
+        database: PathBuf,
+    },
+    /// Create a durable online SQLite backup, then exit cleanly.
+    Backup {
+        /// SQLite database path.
+        #[arg(long)]
+        database: PathBuf,
+        /// Final backup destination.
+        #[arg(long)]
+        destination: PathBuf,
+    },
 }

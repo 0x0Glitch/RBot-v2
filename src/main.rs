@@ -7,8 +7,10 @@ use clap::Parser;
 use morpho_v2_reallocator::cli::{Cli, Command};
 use morpho_v2_reallocator::config::AppConfig;
 use morpho_v2_reallocator::protocol_lock::ProtocolLock;
+use morpho_v2_reallocator::storage::actor::{DEFAULT_STORAGE_CHANNEL_CAPACITY, StorageService};
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Status => {
@@ -51,7 +53,63 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Migrate { database } => match unix_timestamp().and_then(|timestamp| {
+            StorageService::start(&database, DEFAULT_STORAGE_CHANNEL_CAPACITY, timestamp)
+                .map(|service| (service, timestamp))
+        }) {
+            Ok((service, _)) => match service.shutdown().await {
+                Ok(()) => {
+                    println!("migrations=ok database={}", database.display());
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("migration shutdown failed: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(error) => {
+                eprintln!("migration failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Backup {
+            database,
+            destination,
+        } => match unix_timestamp().and_then(|timestamp| {
+            StorageService::start(&database, DEFAULT_STORAGE_CHANNEL_CAPACITY, timestamp)
+                .map(|service| (service, timestamp))
+        }) {
+            Ok((service, timestamp)) => {
+                let result = service
+                    .handle()
+                    .backup(destination.clone(), timestamp)
+                    .await;
+                let shutdown = service.shutdown().await;
+                match result.and(shutdown) {
+                    Ok(()) => {
+                        println!("backup=ok destination={}", destination.display());
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("backup failed: {error}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("backup failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
     }
+}
+
+fn unix_timestamp() -> Result<u64, morpho_v2_reallocator::storage::StorageError> {
+    u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).map_err(|_| {
+        morpho_v2_reallocator::storage::StorageError::NumericRange {
+            field: "system_timestamp",
+        }
+    })
 }
 
 fn static_doctor(
