@@ -15,8 +15,10 @@ are implemented. Milestone 12 hardening is in progress: a real Anvil/Forge
 fixture deploys Vault V2, a direct adapter, Morpho, IRM, token and Multicall3,
 reconstructs topology, builds an improving rate plan, signs and broadcasts it,
 confirms and validates the receipt, reconciles exact post-state, and restarts
-from terminal JSON state. Supervised live runtime composition and the remaining
-invalidation/crash matrix remain before production Execute can be enabled.
+from terminal JSON state. The live supervisor now composes provider identity,
+canonical ingestion, durable topology replay and exact snapshots. Planner,
+executor and reconciliation service composition plus the remaining crash matrix
+remain before production Execute can be enabled.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 
@@ -48,6 +50,9 @@ invalidation/crash matrix remain before production Execute can be enabled.
 - `storage-init` and `backup` bootstrap commands operate only on JSON files.
 - Typed-key maps are encoded as deterministic ordered entry arrays, so cap-rich
   topology and exact snapshots round-trip without relying on JSON object keys.
+- Canonical log-range and topology-checkpoint reads retain the exact covered
+  block, allowing restart/reorg replay from durable JSON rather than in-memory
+  messages.
 
 ## Milestone 3 — Bindings And Events
 
@@ -265,15 +270,21 @@ invalidation/crash matrix remain before production Execute can be enabled.
 - Typed P0/P1/P2 alerts have bounded history and deterministic deduplication.
   Real redacted Telegram and PagerDuty transports pass local HTTP delivery
   tests; neither transport accepts calldata or transaction objects.
-- The supervised chain→state→planner→executor composition, full shadow E2E and
-  deployment identities remain pending. Execute remains disabled.
+- The supervised `Run` command now validates configured identities against every
+  deployed runtime hash, starts role-scoped canonical polling, reconstructs
+  topology from acknowledged JSON logs/checkpoints, refreshes exact state at the
+  canonical head and publishes real runtime/API/health/metric state. The same
+  live state owner is exercised inside the signed Anvil E2E.
+- Idle-lock attribution is deliberately unverified in the live service until its
+  receipt-origin consumer is composed, so Execute cannot become ready or invoke
+  a signer. Live planner/executor/receipt-reconciliation composition remains.
 
 ## Milestone 12 — Hardening (In Progress)
 
 - A deterministic Solidity fixture exercises real EVM behavior for the vault,
   direct adapter, Morpho, Adaptive Curve IRM, ERC-20 and Multicall3 read surface.
 - The live slice proves empty JSON startup, deployment, deposit and initial
-  allocation, canonical backfill, strict event decoding, all-ever topology,
+  allocation, supervised canonical backfill, strict event decoding, all-ever topology,
   cap-data persistence, atomic exact state, an improving two-action bounded rate
   solution, independent firewall validation, real-EOA `eth_call`, restricted
   signing, raw submission, confirmation, exact event conformance, current-state
@@ -286,5 +297,5 @@ invalidation/crash matrix remain before production Execute can be enabled.
   its exact spot-rate spread improves from `20833333333` to `18065268066`
   per-second WAD units. A later cap event forces an exact refreshed cap value;
   adapter removal hard-pauses projection, and re-addition restores capability
-  and produces a fresh improving plan. Base Sepolia remains blocked on live
-  runtime composition and production deployment identities.
+  and produces a fresh improving plan. Base Sepolia remains blocked on the live
+  planning/execution owner and deployment-specific protocol identities.

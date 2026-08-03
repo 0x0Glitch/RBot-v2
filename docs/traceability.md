@@ -4,7 +4,7 @@
 | --- | --- | --- | --- | --- |
 | 3, 4, 30.1 | Pinned single-crate Rust 2024 workspace and CI | `Cargo.toml`, toolchain/lint files, `Makefile`, CI workflow | `make ci` | Implemented |
 | Milestone 0 | Build identity and fail-closed bootstrap binary | `src/lib.rs`, `src/main.rs`, `src/telemetry/metrics.rs` | unit test and CLI smoke | Implemented |
-| Milestones 10–13 | Final preflight through canary implementation | milestone modules and tests | milestone gates | Milestones 10–11 and operations implemented; real local E2E reaches terminal signed execution/reconciliation, invalidation/crash matrix and live composition pending |
+| Milestones 10–13 | Final preflight through canary implementation | milestone modules and tests | milestone gates | Milestones 10–11 and operations implemented; real local E2E reaches terminal signed execution/reconciliation; canonical live state composition implemented, live planner/executor and invalidation/crash matrix pending |
 | 5 | Semantic quantities, contexts, exact snapshot and plan types | `src/domain.rs` | unit and compile-fail tests | Implemented |
 | 6 | Strict TOML parsing, validation, APR conversion, canonical revision | `src/config.rs`, `config.example.toml` | `tests/config.rs` | Implemented |
 | 7.1 | Pinned source/runtime identity model and lock digest | `src/protocol_lock.rs`, `protocol-lock.toml` | `tests/protocol_lock.rs` | Implemented; deployment values pending |
@@ -14,7 +14,7 @@
 | 8.9 | Same-directory temporary file, file/directory fsync, atomic rename and backup | `src/storage/actor.rs` | state and backup parse/reopen tests | Implemented by explicit owner override |
 | 7.2–7.3 | Checked-in minimal official ABIs and generated selectors | `abi/*.sol`, `src/contracts/bindings.rs`, `src/contracts/selectors.rs` | selector/signature tests | Implemented |
 | 7.4 | Canonical full-consumption adapter data validation | `src/domain.rs` | adapter data rejection matrix | Implemented |
-| 7.1, 11.1 | Runtime bytecode identity and watched-address categories | `src/contracts/code_identity.rs`, `src/chain/logs.rs` | runtime mismatch tests | Implemented; dynamic RPC checks later |
+| 7.1, 11.1 | Runtime bytecode identity and watched-address categories | `src/contracts/code_identity.rs`, `src/runtime/identity.rs`, `src/chain/logs.rs` | runtime mismatch tests and local deployed-identity E2E | Implemented; `Run` checks every locked runtime before canonical state is trusted |
 | 11.2–11.4 | Strict watched event decoding, invalidations and transaction attribution | `src/chain/logs.rs` | 53 official event fixtures plus malformed/unknown tests | Implemented |
 | 11.5–11.6 | Exact pending calldata effect decoder | `src/state/pending_admin.rs` | cap/gate/adapter/unknown tests | Decoder implemented; durable index in milestone 5 |
 | 9.2–9.3 | Bounded typed chain messages and single-owner ChainService | `src/runtime/messages.rs`, `src/chain/heads.rs` | `tests/chain_service.rs` | Implemented |
@@ -57,12 +57,12 @@
 | 25.2–25.3, 20.1–20.2 | Exact bot-transaction sender/target/calldata and ordered Vault/adapter/Morpho/transfer conformance, isolated from later same-block activity | `src/reconciliation/conformance.rs`, `src/transaction/final_preflight.rs` | allocation/deallocation and corruption fixtures in `tests/reconciliation.rs` | Implemented; supervised consumer pending |
 | 25.4–25.5, 20.3 | Exact current snapshot, adapter/share accounting, current spread/service decision and atomic episode/reconciliation advancement | `src/reconciliation/current_state.rs`, `src/storage/{actor,models}.rs` | JSON terminal-boundary recovery and accounting validation | Core implemented; live state-source integration pending |
 | 25.6 | Conservative revert classification; only stale/read disagreement may autonomously replan | `src/reconciliation/classification.rs` | failure-disposition unit test | Implemented |
-| 26, 21 | Explicit per-vault runtime state graph and mode-aware fail-closed readiness | `src/runtime/{controller,readiness}.rs` | runtime transition/readiness tests in `tests/operations.rs` | Implemented; live service composition pending |
+| 26, 21 | Explicit per-vault runtime state graph and mode-aware fail-closed readiness | `src/runtime/{controller,readiness,state_service}.rs`, `src/main.rs` | runtime transition/readiness tests and local deployed-state E2E | Canonical chain/state/API composition implemented; signer remains false and idle locks unverified until execution services attach |
 | 26.4, 21 | Bounded fail-fast supervision and graceful shutdown deadline | `src/runtime/{supervisor,shutdown}.rs` | sibling cancellation test | Implemented |
 | 27.1 | Loopback-default GET-only health, metrics, vault, artifact, transaction and alert API | `src/api/{dto,routes}.rs` | live HTTP test including POST rejection | Implemented |
 | 27.3, 24.4 | Complete bounded-name Prometheus registration with no high-cardinality identifiers | `src/telemetry/metrics.rs` | registry text assertion for every metric name | Implemented; SQLite metric superseded by JSON format metric per SC-001 |
 | 27.4, 24.3 | Typed deduplicated alert history and redacted Telegram/PagerDuty transports | `src/telemetry/{alerts,telegram,pagerduty}.rs` | real local HTTP transport tests | Implemented |
-| Milestone 12 | Deterministic local-chain vertical slice through terminal reconciliation | `tests/fixtures/e2e`, `tests/local_e2e.rs` | Forge deployment; deposit/allocation; canonical replay; atomic snapshots; bounded rate solve; firewall, real-EOA call, signing and submission; confirmation; exact event conformance; improved rate; current-state reconciliation; cap refresh; adapter removal hard pause/re-add replanning; JSON restart | Implemented for the main rate and administration-invalidation paths; live composition pending |
+| Milestone 12 | Deterministic local-chain vertical slice through terminal reconciliation | `tests/fixtures/e2e`, `tests/local_e2e.rs` | Forge deployment; supervised deployed-identity/canonical-state path; deposit/allocation; atomic snapshots; bounded rate solve; firewall, real-EOA call, signing and submission; confirmation; exact event conformance; improved rate; current-state reconciliation; cap refresh; adapter removal hard pause/re-add replanning; JSON restart | Main rate and administration-invalidation paths implemented; supervised planner/executor and broader crash/reorg matrix pending |
 
 ## Dependency policy notes
 

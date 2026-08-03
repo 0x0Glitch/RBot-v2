@@ -20,10 +20,13 @@ cargo run -- config effective --config config.example.toml
 cargo run -- doctor --config config.example.toml --protocol-lock protocol-lock.toml
 ```
 
-`run` binds the GET-only health/metrics/operator API to `127.0.0.1:9090` by
-default. It deliberately reports not-ready until dynamic provider, canonical
-catch-up, exact-state and (for Execute) signer gates complete. `alerts-test`
-sends only a typed P2 delivery test; it cannot construct or sign a transaction.
+`run` validates configured deployment identities against live runtime bytecode,
+catches up and replays canonical events into the JSON state file, builds atomic
+exact snapshots, and serves the GET-only health/metrics/operator API on
+`127.0.0.1:9090` by default. Execute remains not-ready because live idle-lock
+attribution and the restricted signer/executor services are not yet composed.
+`alerts-test` sends only a typed P2 delivery test; it cannot construct or sign a
+transaction.
 
 The normative architecture and implementation roadmap live under
 `docs/normative/` and are protected by digest checks.

@@ -39,14 +39,29 @@ impl ApiDataStore {
             .insert(VaultAddress(snapshot.parent.vault), snapshot);
     }
 
+    /// Returns the latest exact snapshot for one configured vault.
+    pub async fn snapshot(&self, vault: VaultAddress) -> Option<ExactVaultSnapshot> {
+        self.snapshots.read().await.get(&vault).cloned()
+    }
+
     /// Replaces the latest semantic plan for one vault.
     pub async fn record_plan(&self, plan: V2Plan) {
         self.plans.write().await.insert(plan.vault, plan);
     }
 
+    /// Returns the latest semantic plan for one configured vault.
+    pub async fn plan(&self, vault: VaultAddress) -> Option<V2Plan> {
+        self.plans.read().await.get(&vault).cloned()
+    }
+
     /// Replaces the latest rate episode for one vault.
     pub async fn record_episode(&self, episode: RateSignalEpisode) {
         self.episodes.write().await.insert(episode.vault, episode);
+    }
+
+    /// Returns the latest rate episode for one configured vault.
+    pub async fn episode(&self, vault: VaultAddress) -> Option<RateSignalEpisode> {
+        self.episodes.read().await.get(&vault).cloned()
     }
 
     /// Replaces one transaction summary keyed only by a known signed hash.

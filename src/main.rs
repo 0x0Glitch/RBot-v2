@@ -1,16 +1,25 @@
-//! Binary entry point for read-only bootstrap commands.
+//! Binary entry point for supervised live operation and bounded bootstrap commands.
 #![forbid(unsafe_code)]
 
-use std::{path::Path, process::ExitCode, sync::Arc};
+use std::{path::Path, process::ExitCode, sync::Arc, time::Duration};
 
 use clap::Parser;
 use morpho_v2_reallocator::api::{ApiDataStore, ReadOnlyApiState, router};
+use morpho_v2_reallocator::chain::{
+    heads::{ChainService, ChainServiceConfig},
+    provider::{ChainDataProvider, HttpProvider},
+};
 use morpho_v2_reallocator::cli::{Cli, Command, ConfigCommand};
-use morpho_v2_reallocator::config::{AppConfig, ValidatedConfig};
+use morpho_v2_reallocator::config::{AppConfig, RpcRole, ValidatedConfig, ValidatedRpcConfig};
 use morpho_v2_reallocator::protocol_lock::ProtocolLock;
 use morpho_v2_reallocator::runtime::{
     controller::{RuntimeRegistry, RuntimeVaultState},
+    identity::RuntimeIdentities,
+    messages::{CHAIN_TO_STATE_CAPACITY, ChainUpdate},
     readiness::{ReadinessInputs, evaluate_readiness},
+    shutdown::{DEFAULT_SHUTDOWN_TIMEOUT, ShutdownSignal, install_os_shutdown},
+    state_service::{CanonicalStateService, EventSourceRegistry},
+    supervisor::{ServiceFailure, Supervisor},
 };
 use morpho_v2_reallocator::storage::actor::{DEFAULT_STORAGE_CHANNEL_CAPACITY, StorageService};
 use morpho_v2_reallocator::telemetry::{
@@ -37,7 +46,7 @@ async fn main() -> ExitCode {
             config,
             protocol_lock,
             bind,
-        } => match run_read_only_control_plane(&config, &protocol_lock, bind).await {
+        } => match run_supervised(&config, &protocol_lock, bind).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("run failed: {error}");
@@ -160,22 +169,50 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_read_only_control_plane(
+async fn run_supervised(
     config_path: &Path,
     lock_path: &Path,
     bind: std::net::SocketAddr,
 ) -> Result<(), String> {
-    let config = load_config(config_path)?;
+    let config = Arc::new(load_config(config_path)?);
     let lock = ProtocolLock::load(lock_path)
         .and_then(ProtocolLock::validate)
         .map_err(|error| error.to_string())?;
-    if config.app.chain.chain_id != lock.chain_id {
-        return Err("configuration chain ID differs from protocol lock".to_owned());
+    let identities =
+        RuntimeIdentities::from_config(&config, &lock).map_err(|error| error.to_string())?;
+    let primary_config =
+        provider_for_roles(&config, &[RpcRole::Head, RpcRole::Logs, RpcRole::Receipt])?;
+    let read_config = provider_for_roles(&config, &[RpcRole::Read])?;
+    let checkpoint_config = config
+        .app
+        .chain
+        .rpc
+        .iter()
+        .find(|provider| provider.roles.contains(&RpcRole::Checkpoint));
+    let primary =
+        Arc::new(HttpProvider::from_config(primary_config).map_err(|error| error.to_string())?);
+    let read = Arc::new(HttpProvider::from_config(read_config).map_err(|error| error.to_string())?);
+    let checkpoint = checkpoint_config
+        .map(HttpProvider::from_config)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .map(Arc::new);
+    let observed_read_chain = ChainDataProvider::chain_id(read.as_ref())
+        .await
+        .map_err(|error| error.to_string())?;
+    if observed_read_chain != config.app.chain.chain_id {
+        return Err("read provider chain ID differs from configuration".to_owned());
     }
+    identities
+        .verify_deployed(read.as_ref())
+        .await
+        .map_err(|error| error.to_string())?;
+
     let timestamp = unix_timestamp().map_err(|error| error.to_string())?;
     let state_path = Path::new(&config.app.node.data_dir).join("state.json");
     let storage = StorageService::start(&state_path, DEFAULT_STORAGE_CHANNEL_CAPACITY, timestamp)
         .map_err(|error| error.to_string())?;
+    let storage_handle = storage.handle();
     let runtime = RuntimeRegistry::default();
     runtime
         .initialize(config.app.vaults.iter().map(|vault| vault.address))
@@ -185,7 +222,7 @@ async fn run_read_only_control_plane(
             .update(vault.address, |status| {
                 status.transition(
                     RuntimeVaultState::CatchingUp,
-                    Some("chain/state services have not completed dynamic readiness".to_owned()),
+                    Some("canonical replay and exact refresh are starting".to_owned()),
                 )
             })
             .await
@@ -197,7 +234,7 @@ async fn run_read_only_control_plane(
             mode: config.app.node.mode,
             configuration_valid: true,
             protocol_identity_valid: true,
-            providers_ready: false,
+            providers_ready: true,
             chain_caught_up: false,
             storage_ready: true,
             exact_state_ready: false,
@@ -206,7 +243,7 @@ async fn run_read_only_control_plane(
             operator_paused: false,
         }))
         .await;
-    let metrics = OperationalMetrics::new();
+    let metrics = Arc::new(OperationalMetrics::new());
     metrics
         .set("reallocator_up", 1)
         .map_err(|error| error.to_string())?;
@@ -214,24 +251,146 @@ async fn run_read_only_control_plane(
         .set("reallocator_json_format_info", 1)
         .map_err(|error| error.to_string())?;
     let alerts = Arc::new(build_alert_dispatcher(&config)?);
+    let data = ApiDataStore::default();
+    let sources = EventSourceRegistry::from_config(&config).map_err(|error| error.to_string())?;
+    let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(CHAIN_TO_STATE_CAPACITY);
+    let chain = Arc::new(
+        ChainService::new(
+            primary,
+            checkpoint,
+            storage_handle.clone(),
+            updates_tx,
+            ChainServiceConfig {
+                chain_id: config.app.chain.chain_id,
+                event_start_block: config.app.chain.event_start_block,
+                maximum_log_range: config.app.chain.maximum_log_range,
+                reorg_rescan_blocks: config.app.chain.reorg_rescan_blocks,
+                watched_addresses: sources.watched_addresses(),
+            },
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    chain
+        .verify_provider_identity()
+        .await
+        .map_err(|error| error.to_string())?;
+    let state_service = CanonicalStateService::new(
+        Arc::clone(&config),
+        identities,
+        read,
+        storage_handle,
+        runtime.clone(),
+        data.clone(),
+        health.clone(),
+        Arc::clone(&metrics),
+    )
+    .map_err(|error| error.to_string())?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| error.to_string())?;
     let api_state = ReadOnlyApiState {
         health: health.clone(),
-        runtime,
-        data: ApiDataStore::default(),
+        runtime: runtime.clone(),
+        data,
         metrics: metrics.registry(),
         alerts,
     };
-    let server = axum::serve(listener, router(api_state));
-    tokio::select! {
-        result = server => result.map_err(|error| error.to_string())?,
-        result = tokio::signal::ctrl_c() => result.map_err(|error| error.to_string())?,
+    let shutdown = ShutdownSignal::default();
+    let mut supervisor =
+        Supervisor::new(shutdown.clone(), health.clone(), DEFAULT_SHUTDOWN_TIMEOUT);
+    let chain_shutdown = shutdown.clone();
+    supervisor
+        .spawn("chain", run_chain_service(chain, chain_shutdown))
+        .map_err(|error| error.to_string())?;
+    let state_shutdown = shutdown.clone();
+    supervisor
+        .spawn(
+            "state",
+            run_state_service(state_service, updates_rx, state_shutdown),
+        )
+        .map_err(|error| error.to_string())?;
+    let api_shutdown = shutdown.clone();
+    supervisor
+        .spawn("api", async move {
+            axum::serve(listener, router(api_state))
+                .with_graceful_shutdown(async move { api_shutdown.cancelled().await })
+                .await
+                .map_err(|_| ServiceFailure {
+                    reason: "read-only API server failed",
+                })
+        })
+        .map_err(|error| error.to_string())?;
+
+    let signal_shutdown = shutdown.clone();
+    let signal_task = tokio::spawn(async move {
+        tokio::select! {
+            result = install_os_shutdown(signal_shutdown.clone()) => {
+                if result.is_err() {
+                    signal_shutdown.cancel();
+                }
+            }
+            () = signal_shutdown.cancelled() => {}
+        }
+    });
+    let supervised = supervisor.run().await.map_err(|error| error.to_string());
+    let signal_joined = signal_task
+        .await
+        .map_err(|_| "OS shutdown task failed".to_owned());
+    let storage_stopped = storage.shutdown().await.map_err(|error| error.to_string());
+    supervised.and(signal_joined).and(storage_stopped)
+}
+
+fn provider_for_roles<'a>(
+    config: &'a ValidatedConfig,
+    roles: &[RpcRole],
+) -> Result<&'a ValidatedRpcConfig, String> {
+    config
+        .app
+        .chain
+        .rpc
+        .iter()
+        .find(|provider| roles.iter().all(|role| provider.roles.contains(role)))
+        .ok_or_else(|| "no single configured provider owns every required runtime role".to_owned())
+}
+
+async fn run_chain_service(
+    chain: Arc<ChainService<HttpProvider>>,
+    shutdown: ShutdownSignal,
+) -> Result<(), ServiceFailure> {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            _ = interval.tick() => {
+                if let Err(error) = chain.poll_once().await {
+                    tracing::error!(service = "chain", %error, "canonical chain service failed");
+                    return Err(ServiceFailure { reason: "canonical chain service failed" });
+                }
+            }
+        }
     }
-    health.begin_shutdown();
-    health.mark_stopped();
-    storage.shutdown().await.map_err(|error| error.to_string())
+}
+
+async fn run_state_service(
+    mut state: CanonicalStateService<HttpProvider>,
+    mut updates: tokio::sync::mpsc::Receiver<ChainUpdate>,
+    shutdown: ShutdownSignal,
+) -> Result<(), ServiceFailure> {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            update = updates.recv() => match update {
+                Some(update) => {
+                    if let Err(error) = state.apply_update(update).await {
+                        tracing::error!(service = "state", %error, "canonical state service failed");
+                        return Err(ServiceFailure { reason: "canonical state service failed" });
+                    }
+                }
+                None => return Err(ServiceFailure { reason: "canonical update channel closed" }),
+            }
+        }
+    }
 }
 
 fn build_alert_dispatcher(config: &ValidatedConfig) -> Result<AlertDispatcher, String> {
@@ -301,5 +460,6 @@ fn static_doctor(
     if config.app.chain.chain_id != lock.chain_id {
         return Err("configuration chain ID differs from protocol lock".to_owned());
     }
+    RuntimeIdentities::from_config(&config, &lock).map_err(|error| error.to_string())?;
     Ok((lock.chain_id, config.revision, lock.digest))
 }
