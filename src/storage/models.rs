@@ -436,6 +436,10 @@ pub struct UnresolvedTransaction {
     pub state: TransactionState,
     /// Known transaction hash.
     pub transaction_hash: Option<B256>,
+    /// Canonical inclusion block number, when observed.
+    pub included_block: Option<u64>,
+    /// Canonical inclusion block hash, when observed.
+    pub included_block_hash: Option<B256>,
     /// Signed bytes, when signing completed.
     pub raw_signed_transaction: Option<Bytes>,
     /// Validated calldata.

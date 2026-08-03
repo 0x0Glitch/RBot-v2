@@ -154,6 +154,7 @@ pub struct CanonicalStateService<P> {
     sources: EventSourceRegistry,
     vaults: BTreeMap<VaultAddress, VaultReplayState>,
     providers_ready: bool,
+    signer_ready: bool,
     last_exact_head: Option<BlockRef>,
 }
 
@@ -183,8 +184,16 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
             sources,
             vaults: BTreeMap::new(),
             providers_ready: true,
+            signer_ready: false,
             last_exact_head: None,
         })
+    }
+
+    /// Marks a previously identity-checked restricted signer as available to Execute mode.
+    #[must_use]
+    pub fn with_signer_ready(mut self, signer_ready: bool) -> Self {
+        self.signer_ready = signer_ready;
+        self
     }
 
     /// Applies one storage-acknowledged canonical update in strict publication order.
@@ -377,8 +386,23 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
                     .map(|market| &market.spot_borrow_rate),
             );
             self.api.record_snapshot(snapshot.clone()).await;
-            let desired = desired_runtime_state(self.config.app.node.mode, &snapshot);
-            let reason = runtime_reason(self.config.app.node.mode, &snapshot);
+            let pending_transaction = self
+                .storage
+                .load_unresolved(vault.signer_address)
+                .await?
+                .is_some();
+            let desired = desired_runtime_state(
+                self.config.app.node.mode,
+                &snapshot,
+                self.signer_ready,
+                pending_transaction,
+            );
+            let reason = runtime_reason(
+                self.config.app.node.mode,
+                &snapshot,
+                self.signer_ready,
+                pending_transaction,
+            );
             self.runtime
                 .update(vault.address, |status| {
                     status.canonical_head = Some(head);
@@ -454,7 +478,7 @@ impl<P: AtomicSnapshotProvider> CanonicalStateService<P> {
                 chain_caught_up: caught_up,
                 storage_ready: true,
                 exact_state_ready,
-                signer_ready: false,
+                signer_ready: self.signer_ready,
                 pending_transaction: pending,
                 operator_paused: false,
             }))
@@ -558,11 +582,17 @@ fn apply_log_to_topology(
 fn desired_runtime_state(
     mode: RuntimeMode,
     snapshot: &crate::domain::ExactVaultSnapshot,
+    signer_ready: bool,
+    pending_transaction: bool,
 ) -> RuntimeVaultState {
     match mode {
         RuntimeMode::Observe => RuntimeVaultState::Observe,
         RuntimeMode::Shadow if snapshot.capabilities.can_project => RuntimeVaultState::Shadow,
         RuntimeMode::Shadow => RuntimeVaultState::PausedUnsupportedConfiguration,
+        RuntimeMode::Execute if pending_transaction => RuntimeVaultState::PendingTransaction,
+        RuntimeMode::Execute if snapshot.capabilities.can_allocate && signer_ready => {
+            RuntimeVaultState::Automatic
+        }
         RuntimeMode::Execute if snapshot.capabilities.can_allocate => {
             RuntimeVaultState::PausedSignerFailure
         }
@@ -573,13 +603,19 @@ fn desired_runtime_state(
 fn runtime_reason(
     mode: RuntimeMode,
     snapshot: &crate::domain::ExactVaultSnapshot,
+    signer_ready: bool,
+    pending_transaction: bool,
 ) -> Option<String> {
     match mode {
         RuntimeMode::Observe => None,
         RuntimeMode::Shadow if snapshot.capabilities.can_project => None,
-        RuntimeMode::Execute if snapshot.capabilities.can_allocate => {
+        RuntimeMode::Execute if pending_transaction => {
+            Some("durable transaction lifecycle is unresolved".to_owned())
+        }
+        RuntimeMode::Execute if snapshot.capabilities.can_allocate && !signer_ready => {
             Some("restricted signer service is not composed".to_owned())
         }
+        RuntimeMode::Execute if snapshot.capabilities.can_allocate => None,
         RuntimeMode::Shadow | RuntimeMode::Execute => {
             Some("exact snapshot disables configured planning capability".to_owned())
         }

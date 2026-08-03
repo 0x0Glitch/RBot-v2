@@ -359,6 +359,22 @@ pub enum StorageCommand {
         /// Ordered receipts.
         reply: oneshot::Sender<Result<Vec<CanonicalReceiptRecord>, StorageError>>,
     },
+    /// Find the unique canonical receipt among known same-nonce attempts.
+    LoadCanonicalReceipt {
+        /// EVM chain ID.
+        chain_id: u64,
+        /// Exact durable attempt hashes.
+        transaction_hashes: Vec<B256>,
+        /// Unique matching receipt.
+        reply: oneshot::Sender<Result<Option<CanonicalReceiptRecord>, StorageError>>,
+    },
+    /// Load one durable conformance proof.
+    LoadConformance {
+        /// Stable transaction identity.
+        transaction_id: crate::domain::TransactionId,
+        /// Durable conformance result.
+        reply: oneshot::Sender<Result<Option<ConformanceRecord>, StorageError>>,
+    },
     /// Load canonical logs over one inclusive block interval.
     LoadCanonicalLogs {
         /// EVM chain ID.
@@ -637,6 +653,32 @@ impl StorageHandle {
         self.request(|reply| StorageCommand::LoadCanonicalReceipts {
             chain_id,
             number,
+            reply,
+        })
+        .await
+    }
+
+    /// Finds the unique canonical receipt among a transaction's known attempts.
+    pub async fn load_canonical_receipt(
+        &self,
+        chain_id: u64,
+        transaction_hashes: Vec<B256>,
+    ) -> Result<Option<CanonicalReceiptRecord>, StorageError> {
+        self.request(|reply| StorageCommand::LoadCanonicalReceipt {
+            chain_id,
+            transaction_hashes,
+            reply,
+        })
+        .await
+    }
+
+    /// Loads one durable receipt-conformance proof for crash recovery.
+    pub async fn load_conformance(
+        &self,
+        transaction_id: crate::domain::TransactionId,
+    ) -> Result<Option<ConformanceRecord>, StorageError> {
+        self.request(|reply| StorageCommand::LoadConformance {
+            transaction_id,
             reply,
         })
         .await
@@ -987,6 +1029,50 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                     .collect::<Vec<_>>();
                 receipts.sort_by_key(|receipt| receipt.transaction_index);
                 let _ = reply.send(Ok(receipts));
+            }
+            StorageCommand::LoadCanonicalReceipt {
+                chain_id,
+                transaction_hashes,
+                reply,
+            } => {
+                let matches = store
+                    .state
+                    .canonical_receipts
+                    .iter()
+                    .filter(|receipt| {
+                        receipt.chain_id == chain_id
+                            && transaction_hashes.contains(&receipt.transaction_hash)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let result = match matches.as_slice() {
+                    [] => Ok(None),
+                    [receipt] => Ok(Some(receipt.clone())),
+                    _ => Err(StorageError::Invariant(
+                        "multiple known attempts have canonical receipts",
+                    )),
+                };
+                let _ = reply.send(result);
+            }
+            StorageCommand::LoadConformance {
+                transaction_id,
+                reply,
+            } => {
+                let records = store
+                    .state
+                    .conformance_records
+                    .iter()
+                    .filter(|record| record.transaction_id == transaction_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let result = match records.as_slice() {
+                    [] => Ok(None),
+                    [record] => Ok(Some(record.clone())),
+                    _ => Err(StorageError::Invariant(
+                        "transaction has multiple conformance records",
+                    )),
+                };
+                let _ = reply.send(result);
             }
             StorageCommand::LoadCanonicalLogs {
                 chain_id,
@@ -1768,6 +1854,8 @@ fn load_unresolved(
             nonce: row.reservation.nonce,
             state: row.state,
             transaction_hash: row.transaction_hash,
+            included_block: row.included_block,
+            included_block_hash: row.included_block_hash,
             raw_signed_transaction: row.raw_signed_transaction.clone(),
             calldata: row.reservation.calldata.clone(),
             calldata_hash: row.reservation.calldata_hash,

@@ -10,10 +10,13 @@ use morpho_v2_reallocator::chain::{
     provider::{ChainDataProvider, HttpProvider},
 };
 use morpho_v2_reallocator::cli::{Cli, Command, ConfigCommand};
-use morpho_v2_reallocator::config::{AppConfig, RpcRole, ValidatedConfig, ValidatedRpcConfig};
+use morpho_v2_reallocator::config::{
+    AppConfig, RpcRole, RuntimeMode, SigningConfig, ValidatedConfig, ValidatedRpcConfig,
+};
 use morpho_v2_reallocator::protocol_lock::ProtocolLock;
 use morpho_v2_reallocator::runtime::{
     controller::{RuntimeRegistry, RuntimeVaultState},
+    execution_service::{ExecutionServiceError, LiveExecutionService},
     identity::RuntimeIdentities,
     messages::{CHAIN_TO_STATE_CAPACITY, ChainUpdate},
     readiness::{ReadinessInputs, evaluate_readiness},
@@ -28,6 +31,11 @@ use morpho_v2_reallocator::telemetry::{
     metrics::OperationalMetrics,
     pagerduty::PagerDutyTransport,
     telegram::TelegramTransport,
+};
+use morpho_v2_reallocator::transaction::{
+    final_preflight::{ExecutionReservationManager, PreflightError},
+    local_signer::LocalDevelopmentRoutineSigner,
+    signer::RoutineSigner,
 };
 
 #[tokio::main]
@@ -207,6 +215,8 @@ async fn run_supervised(
         .verify_deployed(read.as_ref())
         .await
         .map_err(|error| error.to_string())?;
+    let signer = build_execute_signer(&config)?;
+    let signer_ready = signer.is_some();
 
     let timestamp = unix_timestamp().map_err(|error| error.to_string())?;
     let state_path = Path::new(&config.app.node.data_dir).join("state.json");
@@ -238,7 +248,7 @@ async fn run_supervised(
             chain_caught_up: false,
             storage_ready: true,
             exact_state_ready: false,
-            signer_ready: false,
+            signer_ready,
             pending_transaction: false,
             operator_paused: false,
         }))
@@ -256,7 +266,7 @@ async fn run_supervised(
     let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(CHAIN_TO_STATE_CAPACITY);
     let chain = Arc::new(
         ChainService::new(
-            primary,
+            Arc::clone(&primary),
             checkpoint,
             storage_handle.clone(),
             updates_tx,
@@ -276,22 +286,23 @@ async fn run_supervised(
         .map_err(|error| error.to_string())?;
     let state_service = CanonicalStateService::new(
         Arc::clone(&config),
-        identities,
+        identities.clone(),
         read,
-        storage_handle,
+        storage_handle.clone(),
         runtime.clone(),
         data.clone(),
         health.clone(),
         Arc::clone(&metrics),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?
+    .with_signer_ready(signer_ready);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| error.to_string())?;
     let api_state = ReadOnlyApiState {
         health: health.clone(),
         runtime: runtime.clone(),
-        data,
+        data: data.clone(),
         metrics: metrics.registry(),
         alerts,
     };
@@ -302,6 +313,25 @@ async fn run_supervised(
     supervisor
         .spawn("chain", run_chain_service(chain, chain_shutdown))
         .map_err(|error| error.to_string())?;
+    if let Some(signer) = signer {
+        let execution = LiveExecutionService::new(
+            Arc::clone(&config),
+            identities,
+            Arc::clone(&primary),
+            storage_handle.clone(),
+            data.clone(),
+            runtime.clone(),
+            signer,
+            ExecutionReservationManager::default(),
+        );
+        let execution_shutdown = shutdown.clone();
+        supervisor
+            .spawn(
+                "execution",
+                run_execution_service(execution, execution_shutdown),
+            )
+            .map_err(|error| error.to_string())?;
+    }
     let state_shutdown = shutdown.clone();
     supervisor
         .spawn(
@@ -388,6 +418,65 @@ async fn run_state_service(
                     }
                 }
                 None => return Err(ServiceFailure { reason: "canonical update channel closed" }),
+            }
+        }
+    }
+}
+
+fn build_execute_signer(
+    config: &ValidatedConfig,
+) -> Result<Option<Arc<dyn RoutineSigner>>, String> {
+    if config.app.node.mode != RuntimeMode::Execute {
+        return Ok(None);
+    }
+    match &config.app.signing {
+        SigningConfig::LocalDevelopment { private_key_env } => {
+            if config.app.chain.chain_id == 999 {
+                return Err(
+                    "local-development signer is forbidden for HyperEVM mainnet Execute".to_owned(),
+                );
+            }
+            let vault = config
+                .app
+                .vaults
+                .first()
+                .filter(|_| config.app.vaults.len() == 1)
+                .ok_or_else(|| {
+                    "local-development Execute requires exactly one configured vault".to_owned()
+                })?;
+            LocalDevelopmentRoutineSigner::from_env(private_key_env, vault.signer_address)
+                .map(|signer| Some(Arc::new(signer) as Arc<dyn RoutineSigner>))
+                .map_err(|error| error.to_string())
+        }
+        SigningConfig::RemoteSigner { .. } => Err(
+            "remote production signer authentication is not yet composed; Execute stays disabled"
+                .to_owned(),
+        ),
+    }
+}
+
+async fn run_execution_service(
+    execution: LiveExecutionService<HttpProvider>,
+    shutdown: ShutdownSignal,
+) -> Result<(), ServiceFailure> {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            _ = interval.tick() => {
+                match execution.tick().await {
+                    Ok(())
+                    | Err(ExecutionServiceError::Preflight(
+                        PreflightError::HeadChanged
+                        | PreflightError::NonceBusy
+                        | PreflightError::Reservation(_)
+                    )) => {}
+                    Err(error) => {
+                        tracing::error!(service = "execution", %error, "execution service failed");
+                        return Err(ServiceFailure { reason: "execution service failed" });
+                    }
+                }
             }
         }
     }

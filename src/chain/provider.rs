@@ -305,6 +305,13 @@ pub trait SignedTransactionSubmitter: Send + Sync {
     async fn submit_signed_bytes(&self, signed: &Bytes) -> Result<B256, ProviderError>;
 }
 
+/// Typed latest-account-nonce surface owned by the execution controller.
+#[async_trait]
+pub trait AccountNonceProvider: Send + Sync {
+    /// Returns the latest canonical account nonce for one configured signer.
+    async fn account_nonce(&self, signer: Address) -> Result<u64, ProviderError>;
+}
+
 /// Role-scoped HTTP provider.
 pub struct HttpProvider {
     name: String,
@@ -744,6 +751,13 @@ impl TransactionSimulationProvider for HttpProvider {
 impl SignedTransactionSubmitter for HttpProvider {
     async fn submit_signed_bytes(&self, signed: &Bytes) -> Result<B256, ProviderError> {
         self.send_raw_transaction(signed).await
+    }
+}
+
+#[async_trait]
+impl AccountNonceProvider for HttpProvider {
+    async fn account_nonce(&self, signer: Address) -> Result<u64, ProviderError> {
+        self.transaction_count(signer).await
     }
 }
 

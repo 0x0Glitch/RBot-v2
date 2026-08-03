@@ -24,9 +24,14 @@ signer, without exposing generic transaction signing. The real one-head
 preflight source now reloads exact topology/state, requires the durable cursor
 at that head, rebuilds the rate plan, and validates its hard constraints at the
 earliest, expected and latest accepted inclusion scenarios. The local E2E uses
-this source rather than a fixed preflight mock. Live executor and reconciliation
-service composition plus the remaining crash matrix remain before production
-Execute can be enabled.
+this source rather than a fixed preflight mock. `Run` now composes a restricted
+single-vault local-development Execute controller on non-mainnet chains. It
+recovers signed bytes, observes canonical inclusion from JSON, waits for depth,
+validates receipt/event conformance and performs an exact current-state rebuild
+that atomically confirms episode movement. The real local E2E exercises that
+pending-to-reconciled controller. Production remote-signer authentication,
+replacement/cancellation automation and the remaining crash matrix still gate
+production Execute.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 

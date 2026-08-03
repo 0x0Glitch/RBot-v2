@@ -330,6 +330,19 @@ async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::erro
         )
         .await?;
     assert_eq!(handle.load_canonical_receipts(999, 11).await?.len(), 1);
+    assert_eq!(
+        handle
+            .load_canonical_receipt(999, vec![B256::repeat_byte(0x22)])
+            .await?
+            .map(|receipt| receipt.block_hash),
+        Some(second.hash)
+    );
+    assert!(
+        handle
+            .load_canonical_receipt(999, vec![B256::repeat_byte(0xff)])
+            .await?
+            .is_none()
+    );
     let replay_logs = handle.load_canonical_logs(999, 10, 11).await?;
     assert_eq!(replay_logs.len(), 1);
     assert_eq!(replay_logs[0].transaction_hash, B256::repeat_byte(0x22));
@@ -446,6 +459,15 @@ async fn transaction_boundaries_recover_after_every_reopen()
         Some((20, B256::repeat_byte(0x20))),
     )
     .await?;
+    let service = reopen(&path).await?;
+    let included = service
+        .handle()
+        .load_unresolved(signer)
+        .await?
+        .ok_or("included transaction disappeared")?;
+    assert_eq!(included.included_block, Some(20));
+    assert_eq!(included.included_block_hash, Some(B256::repeat_byte(0x20)));
+    service.shutdown().await?;
     transition_and_recover(
         &path,
         signer,
@@ -470,6 +492,14 @@ async fn transaction_boundaries_recover_after_every_reopen()
             validated_at: 1_800_000_009,
         })
         .await?;
+    assert_eq!(
+        service
+            .handle()
+            .load_conformance(TransactionId(B256::repeat_byte(0x71)))
+            .await?
+            .map(|record| record.report_hash),
+        Some(B256::repeat_byte(0xc1))
+    );
     service.shutdown().await?;
     assert_recovered(&path, signer, TransactionState::ConformanceValidated).await?;
 
