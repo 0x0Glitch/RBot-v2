@@ -49,6 +49,8 @@
 | 22.4–22.7, 16.1–16.3 | Capability-limited remote signer API, authenticated transport policy and full signed-envelope recovery/recheck | `src/transaction/{signer,remote_signer}.rs` | signed-field mutation matrix and authenticated local HTTP signer tests | Implemented; production mTLS identity is deployment input |
 | 23.1–23.4, 16.4–16.5 | One nonce lane, recovery classification and durable plan→nonce→sign→signed-bytes ordering | `src/transaction/{nonce,lifecycle}.rs`, `src/storage/actor.rs` | nonce/recovery and durable-boundary recovery tests | Implemented |
 | 23.5–23.6, 16.6 | Strictly higher identical-calldata replacement and known-nonce self-cancellation signing types | `src/transaction/{fees,signer}.rs` | replacement/cancellation signer tests | Signing boundary implemented; submission timing in milestone 10 |
+| 24.1 | Earliest, expected and latest accepted inclusion clocks with checked integer timestamps | `src/transaction/final_preflight.rs` | ordered, invalid-bound and overflow unit tests | Implemented |
+| 24.2–24.3 | Same-head simulation, gas bound, durable signing order and signed-byte submission | `src/transaction/final_preflight.rs`, `src/chain/provider.rs` | head/scenario unit tests plus existing firewall and durability tests | Core sequence implemented; runtime lock and episode reservation integration pending |
 
 ## Dependency policy notes
 

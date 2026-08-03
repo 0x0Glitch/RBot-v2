@@ -32,25 +32,56 @@ pub enum SigningBoundaryError {
     Identity,
 }
 
-/// Persists plan and nonce before signing, then signed bytes before returning them.
-///
-/// This function deliberately performs no broadcast. A caller can receive a
-/// [`SignedEnvelope`] only after the exact bytes are durable.
-pub async fn persist_then_sign_rebalance(
+/// Unsigned request whose exact plan and nonce reservation are already durable.
+#[derive(Clone, Debug)]
+pub struct DurableSigningRequest {
+    transaction_id: TransactionId,
+    transaction: ValidatedRoutineTransaction,
+    created_at: u64,
+}
+
+impl DurableSigningRequest {
+    /// Returns the exact firewalled transaction for simulation and final checks.
+    #[must_use]
+    pub fn transaction(&self) -> &ValidatedRoutineTransaction {
+        &self.transaction
+    }
+
+    /// Returns the durable lifecycle identity.
+    #[must_use]
+    pub fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+}
+
+/// Persists the snapshot-backed plan and nonce reservation before the signing gate.
+pub async fn persist_unsigned_rebalance(
     storage: &StorageHandle,
-    signer: &dyn RoutineSigner,
     plan: &ValidatedPlan,
     transaction: ValidatedRoutineTransaction,
     transaction_id: TransactionId,
-    request_id: B256,
     created_at: u64,
-) -> Result<SignedEnvelope, SigningBoundaryError> {
+) -> Result<DurableSigningRequest, SigningBoundaryError> {
     if transaction.plan_hash() != plan.plan().plan_hash {
         return Err(SigningBoundaryError::Identity);
     }
     storage
         .persist_plan(plan.plan().clone(), created_at)
         .await?;
+    reserve_durable_rebalance(storage, plan, transaction, transaction_id, created_at).await
+}
+
+/// Reserves a nonce after plan and final-preflight evidence are already durable.
+pub async fn reserve_durable_rebalance(
+    storage: &StorageHandle,
+    plan: &ValidatedPlan,
+    transaction: ValidatedRoutineTransaction,
+    transaction_id: TransactionId,
+    created_at: u64,
+) -> Result<DurableSigningRequest, SigningBoundaryError> {
+    if transaction.plan_hash() != plan.plan().plan_hash {
+        return Err(SigningBoundaryError::Identity);
+    }
     let fields = transaction.fields();
     storage
         .reserve_nonce(NonceReservation {
@@ -67,10 +98,48 @@ pub async fn persist_then_sign_rebalance(
             created_at,
         })
         .await?;
+    Ok(DurableSigningRequest {
+        transaction_id,
+        transaction,
+        created_at,
+    })
+}
+
+/// Durably aborts an unsigned reservation when the final head/latency gate moves.
+pub async fn abort_unsigned_rebalance(
+    storage: &StorageHandle,
+    request: &DurableSigningRequest,
+    updated_at: u64,
+) -> Result<(), SigningBoundaryError> {
+    storage
+        .transition_transaction(TransactionTransition {
+            transaction_id: request.transaction_id,
+            expected_state: TransactionState::NonceReserved,
+            next_state: TransactionState::AbortedBeforeSigning,
+            transaction_hash: None,
+            submitted_at: None,
+            included_block: None,
+            included_block_hash: None,
+            updated_at,
+        })
+        .await?;
+    Ok(())
+}
+
+/// Signs a durably reserved request and persists the returned bytes before returning them.
+///
+/// This function deliberately performs no broadcast. A caller can receive a
+/// [`SignedEnvelope`] only after the exact bytes are durable.
+pub async fn sign_durable_rebalance(
+    storage: &StorageHandle,
+    signer: &dyn RoutineSigner,
+    request: DurableSigningRequest,
+    request_id: B256,
+) -> Result<SignedEnvelope, SigningBoundaryError> {
     let signed = match signer
         .sign_rebalance(SignRebalanceRequest {
             request_id,
-            transaction,
+            transaction: request.transaction,
         })
         .await
     {
@@ -78,14 +147,14 @@ pub async fn persist_then_sign_rebalance(
         Err(error) => {
             storage
                 .transition_transaction(TransactionTransition {
-                    transaction_id,
+                    transaction_id: request.transaction_id,
                     expected_state: TransactionState::NonceReserved,
                     next_state: TransactionState::AbortedBeforeSigning,
                     transaction_hash: None,
                     submitted_at: None,
                     included_block: None,
                     included_block_hash: None,
-                    updated_at: created_at,
+                    updated_at: request.created_at,
                 })
                 .await?;
             return Err(SigningBoundaryError::Signer(error));
@@ -93,10 +162,10 @@ pub async fn persist_then_sign_rebalance(
     };
     storage
         .persist_signed_transaction(SignedTransactionRecord {
-            transaction_id,
+            transaction_id: request.transaction_id,
             transaction_hash: signed.transaction_hash,
             raw_signed_transaction: signed.raw_transaction.clone(),
-            updated_at: created_at,
+            updated_at: request.created_at,
         })
         .await?;
     Ok(signed)

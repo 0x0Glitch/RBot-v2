@@ -196,3 +196,19 @@ Milestones 10–13 remain pending in normative order. Execute remains disabled.
   replacement/cancellation, signer mutation and persistence ordering.
 - `make ci` passes with 79 positive/property/integration/differential tests and
   six compile-fail semantic-boundary cases.
+
+## Milestone 10 — One-Head Preflight And Submission (In Progress)
+
+- Typed provider surfaces now support canonical pinned `eth_call`, gas
+  estimation, HyperEVM lane checking and already-signed-byte submission without
+  exposing a generic transaction-object write API.
+- The preflight pipeline builds three checked inclusion clocks, rebuilds an
+  exact same-head plan, brackets simulation with head checks, independently
+  firewalls calldata, persists plan/preflight/nonce/signed bytes in order, and
+  broadcasts only durable signed bytes.
+- Signing is split into durable reservation, final gate, restricted signing and
+  durable signed-byte phases; moved heads and queued invalidations abort an
+  unsigned nonce reservation.
+- Runtime lock ownership, episode movement-reservation integration, replacement
+  scheduling and complete submit/receipt/reconciliation orchestration remain in
+  later Milestone 10–11 work. Execute remains disabled.

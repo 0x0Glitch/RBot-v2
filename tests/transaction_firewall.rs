@@ -29,8 +29,10 @@ use morpho_v2_reallocator::{
             FirewallError, RoutineTransactionFields, ValidatedPlan, canonical_plan_hash,
             validate_plan, validate_routine_transaction,
         },
-        lifecycle::persist_then_sign_rebalance,
-        lifecycle::{RecoveryClassification, RecoveryFacts, classify_recovery},
+        lifecycle::{
+            RecoveryClassification, RecoveryFacts, classify_recovery, persist_unsigned_rebalance,
+            sign_durable_rebalance,
+        },
         nonce::NonceLane,
         remote_signer::{RemoteRoutineSigner, RemoteSignerPolicy},
         signer::{
@@ -407,7 +409,7 @@ async fn plan_nonce_and_signed_bytes_are_durable_before_envelope_is_returned() {
         Err(error) => panic!("temporary directory must open: {error}"),
     };
     let service = match morpho_v2_reallocator::storage::actor::StorageService::start(
-        &directory.path().join("signing.sqlite"),
+        &directory.path().join("signing.json"),
         8,
         1_800_000_000,
     ) {
@@ -422,16 +424,20 @@ async fn plan_nonce_and_signed_bytes_are_durable_before_envelope_is_returned() {
         panic!("exact snapshot must be durable first: {error}");
     }
     let transaction_id = TransactionId(B256::repeat_byte(0xb0));
-    let signed = persist_then_sign_rebalance(
+    let durable = persist_unsigned_rebalance(
         &service.handle(),
-        &signer,
         &plan,
         transaction,
         transaction_id,
-        B256::repeat_byte(0xb1),
         1_800_000_001,
     )
     .await;
+    let durable = match durable {
+        Ok(durable) => durable,
+        Err(error) => panic!("unsigned boundary must persist: {error}"),
+    };
+    let signed =
+        sign_durable_rebalance(&service.handle(), &signer, durable, B256::repeat_byte(0xb1)).await;
     let signed = match signed {
         Ok(signed) => signed,
         Err(error) => panic!("durable signing boundary must pass: {error}"),

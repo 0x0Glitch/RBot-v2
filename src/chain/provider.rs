@@ -241,6 +241,38 @@ pub trait ChainDataProvider: Send + Sync {
     async fn receipt_by_hash(&self, hash: B256) -> Result<Option<RpcReceipt>, ProviderError>;
 }
 
+/// Typed, read-only transaction simulation surface used by final preflight.
+#[async_trait]
+pub trait TransactionSimulationProvider: Send + Sync {
+    /// Executes the exact zero-value call from the configured allocator at one canonical block.
+    async fn call_at(
+        &self,
+        from: Address,
+        target: Address,
+        data: &Bytes,
+        block: BlockRef,
+    ) -> Result<Bytes, ProviderError>;
+
+    /// Estimates the exact zero-value call from the configured allocator at one block number.
+    async fn estimate_gas_at(
+        &self,
+        from: Address,
+        target: Address,
+        data: &Bytes,
+        block: BlockRef,
+    ) -> Result<u64, ProviderError>;
+
+    /// Confirms the dedicated EOA remains on HyperEVM's fast-block lane.
+    async fn using_big_blocks(&self, signer: Address) -> Result<bool, ProviderError>;
+}
+
+/// Signed-byte-only submission surface.
+#[async_trait]
+pub trait SignedTransactionSubmitter: Send + Sync {
+    /// Broadcasts exact already-durable EIP-2718 bytes.
+    async fn submit_signed_bytes(&self, signed: &Bytes) -> Result<B256, ProviderError>;
+}
+
 /// Role-scoped HTTP provider.
 pub struct HttpProvider {
     name: String,
@@ -609,6 +641,65 @@ impl ChainDataProvider for HttpProvider {
         self.require_any_role(&[ProviderRole::Receipt, ProviderRole::Checkpoint])?;
         self.request_unscoped("eth_getTransactionReceipt", json!([hash]))
             .await
+    }
+}
+
+#[async_trait]
+impl TransactionSimulationProvider for HttpProvider {
+    async fn call_at(
+        &self,
+        from: Address,
+        target: Address,
+        data: &Bytes,
+        block: BlockRef,
+    ) -> Result<Bytes, ProviderError> {
+        self.request(
+            ProviderRole::Simulate,
+            "eth_call",
+            json!([{
+                "from": from,
+                "to": target,
+                "value": "0x0",
+                "data": data,
+            }, {
+                "blockHash": block.hash,
+                "requireCanonical": true,
+            }]),
+        )
+        .await
+    }
+
+    async fn estimate_gas_at(
+        &self,
+        from: Address,
+        target: Address,
+        data: &Bytes,
+        block: BlockRef,
+    ) -> Result<u64, ProviderError> {
+        let quantity: String = self
+            .request(
+                ProviderRole::Simulate,
+                "eth_estimateGas",
+                json!([{
+                    "from": from,
+                    "to": target,
+                    "value": "0x0",
+                    "data": data,
+                }, format_quantity(block.number)]),
+            )
+            .await?;
+        parse_quantity("eth_estimateGas", &quantity)
+    }
+
+    async fn using_big_blocks(&self, signer: Address) -> Result<bool, ProviderError> {
+        HttpProvider::using_big_blocks(self, signer).await
+    }
+}
+
+#[async_trait]
+impl SignedTransactionSubmitter for HttpProvider {
+    async fn submit_signed_bytes(&self, signed: &Bytes) -> Result<B256, ProviderError> {
+        self.send_raw_transaction(signed).await
     }
 }
 
