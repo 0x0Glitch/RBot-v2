@@ -808,6 +808,7 @@ pub enum V2Action {
 /// Applicable rate-spread objective branch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[repr(u8)]
 pub enum RateObjectiveBranch {
     /// Optimize spread over the full frozen evaluation set.
     Portfolio,

@@ -42,6 +42,11 @@
 | 17.1 | Monotonic maximum executable native-deposit simulation through liquidity adapter and all three caps | `src/state/projection.rs` | service-constraint fixture and nonzero-gate rejection | Implemented |
 | 17.2–17.4 | Exact liquidity-adapter exit coverage and source accounting/token/utilization floors | `src/state/projection.rs` | healthy and deficient-liquidity fixtures | Implemented |
 | 17.5 | One sequential shared Morpho loan-token balance | `src/planner/liquidity.rs` | double-registration and exhaustion tests | Implemented |
+| 11.1–11.8 | Strict action grammar, exact sequential simulation, cap/order search and same-set lexicographic objective | `src/planner/simulator.rs`, `src/planner/cap_order.rs`, `src/planner/objective.rs` | sequential funding/order and tiny-domain exhaustive tests | Implemented |
+| 11.9–11.17 | Frozen-direction rate episodes with non-rearming cumulative budgets and durable recovery | `src/planner/episodes.rs`, `migrations/0002_rate_signal_episode.sql`, `src/storage/{actor,queries}.rs` | budget, uniqueness, reopen and reorg-reversal tests | Implemented for release-one episode states |
+| 11.18–11.25 | Deterministic bounded rate, capital and liquidity builders with priority/resource scheduler | `src/planner/{rate,capital,liquidity,scheduler,candidates}.rs` | determinism, reservation, capital and rate solver tests | Implemented |
+| 11.26–11.28 | Exact immediate-loss and terminal existing-shareholder value guard, including fail-closed rewards | `src/planner/simulator.rs`, `src/morpho/rewards.rs`, `src/state/capability.rs` | protocol reward-policy and terminal projection tests | Implemented; approved modeled-reward module remains external |
+| 11.29 | Auditable bounded-search certificate; incomplete rate lattice cannot execute | `src/planner/certificate.rs`, `src/planner/rate.rs` | exhaustive comparator and node-budget tests | Implemented |
 
 ## Dependency policy notes
 

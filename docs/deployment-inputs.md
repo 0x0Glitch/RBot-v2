@@ -11,6 +11,8 @@ provided and verified:
 - vault allocator role and dedicated signer identity;
 - remote signer mTLS/HMAC identities or local development signer secret;
 - fee, confirmation, reconciliation and operational alert configuration;
+- an approved executable reward cash-flow module and revision when any position
+  uses `Modeled` reward policy (without one that position remains non-executable);
 - fork RPC credentials for deployment-specific differential and integration tests.
 
 With one primary provider and no quorum, the primary is an explicit correctness

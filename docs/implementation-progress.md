@@ -10,7 +10,7 @@
 
 ## Later milestones
 
-Pending in normative order. Execute remains disabled.
+Milestones 9–13 remain pending in normative order. Execute remains disabled.
 
 ## Milestone 1 — Domain, Config And Protocol Lock
 
@@ -139,4 +139,33 @@ Pending in normative order. Execute remains disabled.
   are checked explicitly; the shared token tracker registers one authoritative
   balance and consumes it once in sequential action order.
 - `make ci` passes with 66 positive/property/integration/differential tests and
+  six compile-fail semantic-boundary cases.
+
+## Milestone 8 — Deterministic Solver And Rate Episodes
+
+- Pure plan builders schedule liquidity maintenance before verified-idle capital
+  deployment and rate optimization, with explicit vault/position/market/cap and
+  shared-token resource reservations.
+- Candidate lattices and bounded allocation-order DFS are deterministic. Exact
+  sequential simulation enforces deallocation-first grammar, prefix funding,
+  cap catch-up/admission, position modes, shared token consumption, post-action
+  service floors and action-local rounding loss.
+- The same frozen evaluation and controllable market sets are used before and
+  after every rate candidate. Lexicographic ranking implements target-band,
+  terminal existing-shareholder value, secondary spread, movement and action
+  count priorities.
+- Rate episodes freeze direction/revisions and establish a one-time cumulative
+  immediate budget that cannot be rearmed. Complete episode JSON is stored by
+  the single-writer actor, one active vault/group row is enforced, and canonical
+  rewind discards episode state requiring replay.
+- Terminal-value comparison projects Morpho, Adaptive Curve, adapter internal
+  shares, parent max-rate and fee-share dilution to one benefit horizon.
+  Release-one accepts exactly zero rewards only under live reviewed evidence or
+  an explicit curator mandate; modeled rewards fail Execute readiness until an
+  approved executable cash-flow module is supplied.
+- Search certificates count every rejection and incomplete bounded rate search
+  is never executable. A tiny-domain exhaustive comparator proves the selected
+  rate candidate, and tests cover scheduling, episode budgets, capital
+  deployment, sequential ordering, storage recovery and reorg reversal.
+- `make ci` passes with 72 positive/property/integration/differential tests and
   six compile-fail semantic-boundary cases.

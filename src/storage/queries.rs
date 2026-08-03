@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use crate::domain::{
     BlockRef, ExactVaultSnapshot, PlanReason, TransactionId, V2Action, V2Plan, VaultAddress,
 };
+use crate::planner::episodes::{RateEpisodeState, RateSignalEpisode};
 use crate::state::snapshot::canonical_snapshot_json;
 use crate::state::topology::{TopologyIndex, pending_operation_id};
 
@@ -166,6 +167,31 @@ pub fn rewind_to_ancestor(
          WHERE block_number > ?1 AND canonical = 1",
         [ancestor_number],
     )?;
+    transaction.execute(
+        "DELETE FROM rate_signal_episode_movement
+         WHERE episode_id IN (
+             SELECT episode_id FROM rate_signal_episodes
+             WHERE detection_block > ?1
+                OR confirmation_block > ?1
+         )",
+        [ancestor_number],
+    )?;
+    transaction.execute(
+        "DELETE FROM rate_signal_episode_events
+         WHERE block_number > ?1
+            OR episode_id IN (
+                SELECT episode_id FROM rate_signal_episodes
+                WHERE detection_block > ?1
+                   OR confirmation_block > ?1
+            )",
+        [ancestor_number],
+    )?;
+    transaction.execute(
+        "DELETE FROM rate_signal_episodes
+         WHERE detection_block > ?1
+            OR confirmation_block > ?1",
+        [ancestor_number],
+    )?;
     let transactions = transaction.execute(
         "UPDATE transactions SET state = ?1, updated_at = ?2
          WHERE included_block > ?3 AND state IN (6,7,10,11)",
@@ -200,6 +226,114 @@ pub fn rewind_to_ancestor(
         logs_orphaned: usize_to_u64(logs)?,
         transactions_orphaned: usize_to_u64(transactions)?,
     })
+}
+
+/// Atomically stores the complete canonical rate episode and enforces one active row per group.
+pub fn persist_rate_episode(
+    connection: &mut Connection,
+    episode: &RateSignalEpisode,
+    updated_at: u64,
+) -> Result<(), StorageError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let active_conflict: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM rate_signal_episodes
+         WHERE vault = ?1 AND rate_group_id = ?2 AND state != 3 AND episode_id != ?3",
+        params![
+            encode_address(episode.vault.0).as_slice(),
+            encode_b256(episode.rate_group.0).as_slice(),
+            encode_b256(episode.episode_id.0).as_slice(),
+        ],
+        |row| row.get(0),
+    )?;
+    if active_conflict != 0 && episode.state != RateEpisodeState::Complete {
+        return Err(StorageError::Invariant(
+            "more than one active rate episode for vault and rate group",
+        ));
+    }
+    let state = rate_episode_state_code(episode.state);
+    let frozen_json = serde_json::to_string(episode)?;
+    transaction.execute(
+        "INSERT INTO rate_signal_episodes(
+            episode_id, vault, rate_group_id, state, objective_branch,
+            detection_block, confirmation_block, config_revision, topology_revision,
+            direction_hash, frozen_json, baseline_desired_movement, immediate_budget,
+            confirmed_movement, pending_movement, created_at, updated_at, terminal_reason
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+         ) ON CONFLICT(episode_id) DO UPDATE SET
+            state = excluded.state,
+            confirmation_block = excluded.confirmation_block,
+            frozen_json = excluded.frozen_json,
+            confirmed_movement = excluded.confirmed_movement,
+            pending_movement = excluded.pending_movement,
+            updated_at = excluded.updated_at,
+            terminal_reason = excluded.terminal_reason",
+        params![
+            encode_b256(episode.episode_id.0).as_slice(),
+            encode_address(episode.vault.0).as_slice(),
+            encode_b256(episode.rate_group.0).as_slice(),
+            state,
+            episode.objective_branch as i64,
+            u64_to_i64("episode.detection_block", episode.detection_block.number)?,
+            optional_u64_to_i64(
+                "episode.confirmation_block",
+                episode.confirmation_block.map(|block| block.number),
+            )?,
+            encode_b256(episode.config_revision).as_slice(),
+            encode_b256(episode.topology_revision).as_slice(),
+            encode_b256(episode.direction_hash).as_slice(),
+            frozen_json,
+            encode_u256(episode.baseline_desired_movement.0).as_slice(),
+            encode_u256(episode.immediate_budget.0).as_slice(),
+            encode_u256(episode.confirmed_movement.0).as_slice(),
+            encode_u256(episode.pending_movement.0).as_slice(),
+            u64_to_i64("episode.created_at", episode.started_at)?,
+            u64_to_i64("episode.updated_at", updated_at)?,
+            (episode.state == RateEpisodeState::Complete).then_some("complete"),
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Loads the unique active rate episode for one vault and configured rate group.
+pub fn load_active_rate_episode(
+    connection: &Connection,
+    vault: VaultAddress,
+    rate_group: crate::domain::RateGroupId,
+) -> Result<Option<RateSignalEpisode>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT frozen_json FROM rate_signal_episodes
+         WHERE vault = ?1 AND rate_group_id = ?2 AND state != 3
+         ORDER BY updated_at DESC",
+    )?;
+    let rows = statement.query_map(
+        params![
+            encode_address(vault.0).as_slice(),
+            encode_b256(rate_group.0).as_slice(),
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    let encoded = rows.collect::<Result<Vec<String>, _>>()?;
+    if encoded.len() > 1 {
+        return Err(StorageError::Invariant(
+            "multiple active rate episodes found during recovery",
+        ));
+    }
+    encoded
+        .into_iter()
+        .next()
+        .map(|json| serde_json::from_str(&json).map_err(StorageError::from))
+        .transpose()
+}
+
+fn rate_episode_state_code(state: RateEpisodeState) -> i64 {
+    match state {
+        RateEpisodeState::Detecting => 0,
+        RateEpisodeState::Immediate => 1,
+        RateEpisodeState::Persistent => 2,
+        RateEpisodeState::Complete => 3,
+    }
 }
 
 /// Persists one complete topology revision and rebuilds its derived live indexes atomically.

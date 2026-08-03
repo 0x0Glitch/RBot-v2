@@ -9,6 +9,7 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::domain::{BlockRef, ExactVaultSnapshot, V2Plan};
+use crate::planner::episodes::RateSignalEpisode;
 use crate::state::topology::TopologyIndex;
 
 use super::StorageError;
@@ -129,6 +130,24 @@ pub enum StorageCommand {
         through_block: u64,
         /// Canonical topology.
         reply: oneshot::Sender<Result<Option<TopologyIndex>, StorageError>>,
+    },
+    /// Persist one complete rate-signal episode atomically.
+    PersistRateEpisode {
+        /// Complete episode state.
+        episode: Box<RateSignalEpisode>,
+        /// Durable update timestamp.
+        updated_at: u64,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Recover the unique active rate-signal episode for one vault/group.
+    LoadActiveRateEpisode {
+        /// Parent vault.
+        vault: crate::domain::VaultAddress,
+        /// Configured rate group.
+        rate_group: crate::domain::RateGroupId,
+        /// Recovery result.
+        reply: oneshot::Sender<Result<Option<RateSignalEpisode>, StorageError>>,
     },
     /// Produce an online SQLite backup.
     Backup {
@@ -308,6 +327,38 @@ impl StorageHandle {
         self.send(StorageCommand::LoadTopology {
             vault,
             through_block,
+            reply,
+        })
+        .await?;
+        receive.await.map_err(|_| StorageError::ActorStopped)?
+    }
+
+    /// Persists one complete rate episode and waits for commit.
+    pub async fn persist_rate_episode(
+        &self,
+        episode: RateSignalEpisode,
+        updated_at: u64,
+    ) -> Result<(), StorageError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(StorageCommand::PersistRateEpisode {
+            episode: Box::new(episode),
+            updated_at,
+            reply,
+        })
+        .await?;
+        receive.await.map_err(|_| StorageError::ActorStopped)?
+    }
+
+    /// Loads the unique nonterminal episode for deterministic startup recovery.
+    pub async fn load_active_rate_episode(
+        &self,
+        vault: crate::domain::VaultAddress,
+        rate_group: crate::domain::RateGroupId,
+    ) -> Result<Option<RateSignalEpisode>, StorageError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(StorageCommand::LoadActiveRateEpisode {
+            vault,
+            rate_group,
             reply,
         })
         .await?;
@@ -517,6 +568,28 @@ fn run_actor(
                     &connection,
                     vault,
                     through_block,
+                ));
+            }
+            StorageCommand::PersistRateEpisode {
+                episode,
+                updated_at,
+                reply,
+            } => {
+                let _ = reply.send(super::queries::persist_rate_episode(
+                    &mut connection,
+                    &episode,
+                    updated_at,
+                ));
+            }
+            StorageCommand::LoadActiveRateEpisode {
+                vault,
+                rate_group,
+                reply,
+            } => {
+                let _ = reply.send(super::queries::load_active_rate_episode(
+                    &connection,
+                    vault,
+                    rate_group,
                 ));
             }
             StorageCommand::Backup {

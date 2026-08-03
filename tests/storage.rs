@@ -6,10 +6,12 @@ use std::path::Path;
 
 use alloy::primitives::{Address, B256, Bytes, I256, U256};
 use morpho_v2_reallocator::domain::{
-    BlockHashBinding, BlockRef, ExactVaultSnapshot, FeeShareProjection, IdleLockLedgerSnapshot,
-    ParentVaultState, PlanId, PlanProjection, PlanReason, SolverCertificate, StateContext,
-    TransactionId, V2Action, V2Plan, VaultAddress, VaultCapabilities,
+    Assets, BlockHashBinding, BlockRef, ExactVaultSnapshot, FeeShareProjection,
+    IdleLockLedgerSnapshot, MarketId, ParentVaultState, PlanId, PlanProjection, PlanReason,
+    RateGroupId, RateObjectiveBranch, SolverCertificate, StateContext, TransactionId, V2Action,
+    V2Plan, VaultAddress, VaultCapabilities,
 };
+use morpho_v2_reallocator::planner::episodes::RateSignalEpisode;
 use morpho_v2_reallocator::storage::StorageError;
 use morpho_v2_reallocator::storage::actor::StorageService;
 use morpho_v2_reallocator::storage::models::{
@@ -47,6 +49,83 @@ fn reservation(signer: Address) -> NonceReservation {
 
 async fn reopen(path: &Path) -> Result<StorageService, StorageError> {
     StorageService::start(path, 8, 1_800_000_000)
+}
+
+fn rate_episode(vault: VaultAddress, detection: BlockRef, salt: u8) -> RateSignalEpisode {
+    let source = MarketId(B256::repeat_byte(salt));
+    let destination = MarketId(B256::repeat_byte(salt.saturating_add(1)));
+    match RateSignalEpisode::start(
+        vault,
+        RateGroupId(B256::repeat_byte(0x77)),
+        RateObjectiveBranch::Portfolio,
+        detection,
+        B256::repeat_byte(0x31),
+        B256::repeat_byte(0x32),
+        BTreeSet::from([source, destination]),
+        BTreeSet::from([source, destination]),
+        BTreeSet::from([source]),
+        BTreeSet::from([destination]),
+        Assets(U256::from(1_000_u64)),
+        2_500,
+        detection.timestamp,
+        detection.timestamp + 600,
+    ) {
+        Ok(episode) => episode,
+        Err(error) => panic!("valid rate episode fixture: {error}"),
+    }
+}
+
+#[tokio::test]
+async fn rate_episode_is_durable_unique_and_reorg_reversible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("episodes.sqlite");
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let vault = VaultAddress(Address::with_last_byte(0x44));
+    let ancestor = block(10, 0x10, 0x09);
+    let detection = block(11, 0x11, 0x10);
+    handle
+        .apply_canonical_block(
+            CanonicalBlockRecord {
+                chain_id: 999,
+                block: ancestor,
+            },
+            vec![],
+            100,
+        )
+        .await?;
+    handle
+        .apply_canonical_block(
+            CanonicalBlockRecord {
+                chain_id: 999,
+                block: detection,
+            },
+            vec![],
+            101,
+        )
+        .await?;
+    let episode = rate_episode(vault, detection, 0x41);
+    handle.persist_rate_episode(episode.clone(), 102).await?;
+    assert_eq!(
+        handle
+            .load_active_rate_episode(vault, episode.rate_group)
+            .await?,
+        Some(episode.clone())
+    );
+
+    let conflict = rate_episode(vault, detection, 0x51);
+    assert!(handle.persist_rate_episode(conflict, 103).await.is_err());
+
+    handle.rewind_to_ancestor(999, ancestor, 104).await?;
+    assert!(
+        handle
+            .load_active_rate_episode(vault, episode.rate_group)
+            .await?
+            .is_none()
+    );
+    service.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]

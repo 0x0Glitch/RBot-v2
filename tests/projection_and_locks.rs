@@ -11,12 +11,23 @@ use morpho_v2_reallocator::{
     chain::logs::FlowOrigin,
     config::AppConfig,
     domain::{
-        BlockHashBinding, BlockRef, CapRef, CapState, DirectAdapterState,
+        Assets, BlockHashBinding, BlockRef, CapRef, CapState, DirectAdapterState,
         DirectMarketPositionState, ExactVaultSnapshot, IdleLockLedgerSnapshot, ParentVaultState,
-        StateContext, StoredMarketState, TokenAddress, VaultAddress, VaultCapabilities,
+        RateObjectiveBranch, RequestedAssets, StateContext, StoredMarketState, TokenAddress,
+        V2Action, VaultAddress, VaultCapabilities, derive_market_id, derive_position_key,
         encode_adapter_data,
     },
-    planner::liquidity::{LiquidityError, SharedTokenLiquidity},
+    planner::{
+        candidates::build_candidate_lattice,
+        cap_order::search_allocation_orders,
+        capital::solve_capital_deployment,
+        episodes::RateSignalEpisode,
+        liquidity::{LiquidityError, SharedTokenLiquidity},
+        objective::rate_spread,
+        rate::solve_rate_rebalance,
+        scheduler::{ResourceReservations, SchedulablePlan, select_next},
+        simulator::simulate_actions,
+    },
     state::{
         attribution::{OrderedAssetFlow, OrderedTransactionFlow},
         caps::direct_position_cap_data,
@@ -340,5 +351,379 @@ fn shared_token_balance_is_registered_once_and_consumed_sequentially() -> Result
         liquidity.register(token, U256::from(99)),
         Err(LiquidityError::InconsistentBalance)
     );
+    Ok(())
+}
+
+fn two_market_fixture() -> Result<
+    (
+        ExactVaultSnapshot,
+        morpho_v2_reallocator::config::ValidatedVaultConfig,
+        morpho_v2_reallocator::config::ValidatedConfig,
+    ),
+    Box<dyn Error>,
+> {
+    let (mut snapshot, mut vault) = projection_fixture()?;
+    let validated = config()?;
+    let first_market = vault.positions[0].market_id;
+    let mut second = vault.positions[0].clone();
+    second.market_params.collateral_token = Address::with_last_byte(0x31);
+    second.market_id = derive_market_id(&second.market_params);
+    second.position_key = derive_position_key(second.adapter, &second.market_params);
+    vault.positions.push(second.clone());
+    vault
+        .positions
+        .sort_by_key(|position| position.position_key);
+
+    let second_cap_ids = direct_position_cap_data(second.adapter, &second.market_params).ids();
+    let second_caps = second_cap_ids.map(|id| CapRef {
+        vault: vault.address,
+        id,
+    });
+    if let Some(adapter_cap) = snapshot.caps.get_mut(&second_caps[0]) {
+        adapter_cap.recorded_allocation = U256::from(1_000_000_000_000_u64);
+    }
+    for reference in second_caps.into_iter().skip(1) {
+        snapshot.caps.insert(
+            reference,
+            CapState {
+                reference,
+                id_data_hash: B256::repeat_byte(0x82),
+                absolute_cap: U256::from(2_000_000_000_000_u64),
+                relative_cap: U256::from(1_000_000_000_000_000_000_u64),
+                recorded_allocation: U256::from(500_000_000_000_u64),
+            },
+        );
+    }
+    snapshot.positions.insert(
+        second.position_key,
+        DirectMarketPositionState {
+            position_key: second.position_key,
+            adapter: second.adapter,
+            market_params: second.market_params,
+            market_id: second.market_id,
+            internal_supply_shares: U256::from(500_000_000_000_000_000_u64),
+            actual_morpho_supply_shares: U256::from(500_000_000_000_000_000_u64),
+            ignored_donation_shares: U256::ZERO,
+            market_dead_supply_shares: vault.minimum_market_dead_supply_shares,
+            expected_assets: U256::from(500_000_000_000_u64),
+            parent_recorded_market_allocation: U256::from(500_000_000_000_u64),
+            affected_caps: second_caps,
+            mode: second.mode,
+            reward_policy: second.reward_policy.clone(),
+        },
+    );
+    let first_stored = snapshot
+        .markets
+        .get_mut(&first_market)
+        .ok_or_else(|| std::io::Error::other("first market missing"))?;
+    first_stored.total_borrow_assets = U256::from(200_000_000_000_u64);
+    first_stored.total_borrow_shares = U256::from(200_000_000_000_000_000_u64);
+    first_stored.morpho_loan_token_balance = U256::from(1_000_000_000_000_u64);
+    snapshot.markets.insert(
+        second.market_id,
+        StoredMarketState {
+            market_id: second.market_id,
+            params: second.market_params,
+            total_supply_assets: U256::from(1_000_000_000_000_u64),
+            total_supply_shares: U256::from(1_000_000_000_000_000_000_u64),
+            total_borrow_assets: U256::from(900_000_000_000_u64),
+            total_borrow_shares: U256::from(900_000_000_000_000_000_u64),
+            last_update: snapshot.context.block.timestamp,
+            fee: U256::from(100_000_000_000_000_000_u64),
+            irm: second.market_params.irm,
+            stored_rate_at_target: U256::from(1_268_391_679_u64),
+            morpho_loan_token_balance: U256::from(1_000_000_000_000_u64),
+        },
+    );
+    let adapter = snapshot
+        .adapters
+        .get_mut(&second.adapter)
+        .ok_or_else(|| std::io::Error::other("adapter missing"))?;
+    adapter.current_market_ids = vec![first_market, second.market_id];
+    adapter.historical_market_ids.insert(second.market_id);
+    adapter.real_assets = U256::from(1_000_000_000_000_u64);
+    snapshot.parent.stored_total_assets = U256::from(1_100_000_000_000_u64);
+    snapshot.parent.total_supply = U256::from(1_100_000_000_000_000_000_u64);
+    Ok((snapshot, vault, validated))
+}
+
+#[test]
+fn rate_solver_matches_exhaustive_tiny_domain_and_episode_budget_never_rearms()
+-> Result<(), Box<dyn Error>> {
+    let (snapshot, mut vault, mut validated) = two_market_fixture()?;
+    vault.minimum_action_assets = U256::ONE;
+    vault.maximum_movement_per_transaction_assets = U256::from(10_u8);
+    vault.maximum_immediate_rebalance_loss_assets = U256::from(10_u8);
+    for position in &mut vault.positions {
+        position.maximum_action_assets = U256::from(10_u8);
+    }
+    validated.app.solver.maximum_amount_candidates_per_position = 32;
+    validated
+        .app
+        .strategy
+        .minimum_portfolio_improvement_rate_per_second
+        .0 = U256::ZERO;
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x11),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp + 12,
+    };
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let mut by_rate: Vec<_> = projection.markets.values().collect();
+    by_rate.sort_by_key(|market| market.spot_borrow_rate);
+    let source = by_rate[0].market_id;
+    let destination = by_rate[1].market_id;
+    let mut episode = RateSignalEpisode::start(
+        vault.address,
+        vault.rate_group.id,
+        RateObjectiveBranch::Portfolio,
+        snapshot.context.block,
+        snapshot.context.static_config_revision,
+        snapshot.context.dynamic_topology_revision,
+        BTreeSet::from([source, destination]),
+        BTreeSet::from([source, destination]),
+        BTreeSet::from([source]),
+        BTreeSet::from([destination]),
+        Assets(U256::from(10_u8)),
+        10_000,
+        head.timestamp,
+        head.timestamp + 1_000,
+    )?;
+    episode.confirm_short(head)?;
+    assert_eq!(episode.available_budget()?, U256::from(10_u8));
+    let solved = solve_rate_rebalance(
+        &snapshot,
+        &projection,
+        &vault,
+        &validated.app.strategy,
+        &validated.app.solver,
+        &episode,
+    );
+    assert!(solved.certificate.search_complete);
+    let best = solved
+        .best
+        .ok_or_else(|| std::io::Error::other("tiny solver found no candidate"))?;
+    assert!(best.objective.applicable_spread < best.before_spread);
+
+    let source_position = vault
+        .positions
+        .iter()
+        .find(|position| position.market_id == source)
+        .ok_or_else(|| std::io::Error::other("source missing"))?;
+    let destination_position = vault
+        .positions
+        .iter()
+        .find(|position| position.market_id == destination)
+        .ok_or_else(|| std::io::Error::other("destination missing"))?;
+    let mut exhaustive_best: Option<(U256, U256)> = None;
+    for amount in 1_u64..=10 {
+        let actions = vec![
+            V2Action::Deallocate {
+                position: source_position.position_key,
+                adapter: source_position.adapter,
+                data: encode_adapter_data(&source_position.market_params),
+                requested_assets: RequestedAssets(U256::from(amount)),
+            },
+            V2Action::Allocate {
+                position: destination_position.position_key,
+                adapter: destination_position.adapter,
+                data: encode_adapter_data(&destination_position.market_params),
+                requested_assets: RequestedAssets(U256::from(amount)),
+            },
+        ];
+        if let Ok(state) = simulate_actions(&snapshot, &projection, &vault, &actions) {
+            let spread = rate_spread(
+                state
+                    .markets
+                    .values()
+                    .map(|market| &market.spot_borrow_rate),
+            );
+            if exhaustive_best.is_none_or(|(best_spread, best_amount)| {
+                (spread, U256::from(amount)) < (best_spread, best_amount)
+            }) {
+                exhaustive_best = Some((spread, U256::from(amount)));
+            }
+        }
+    }
+    let exhaustive = exhaustive_best
+        .ok_or_else(|| std::io::Error::other("exhaustive search found no candidate"))?;
+    assert_eq!(
+        (
+            best.objective.applicable_spread,
+            best.objective.movement_assets
+        ),
+        exhaustive
+    );
+    episode.reserve_pending(U256::from(6_u8))?;
+    assert_eq!(episode.available_budget()?, U256::from(4_u8));
+    episode.confirm_pending(U256::from(6_u8))?;
+    assert_eq!(episode.available_budget()?, U256::from(4_u8));
+    assert!(episode.reserve_pending(U256::from(5_u8)).is_err());
+    Ok(())
+}
+
+#[test]
+fn lattice_and_scheduler_are_deterministic_and_resource_safe() {
+    let lattice = build_candidate_lattice(U256::from(2), U256::from(10), &[U256::from(7)], 32);
+    assert!(lattice.amounts.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(lattice.amounts.contains(&U256::ZERO));
+    assert!(lattice.amounts.contains(&U256::from(10)));
+    let vault_a = VaultAddress(Address::with_last_byte(1));
+    let vault_b = VaultAddress(Address::with_last_byte(2));
+    let plans = vec![
+        SchedulablePlan {
+            reason: morpho_v2_reallocator::domain::PlanReason::RateRebalance,
+            vault: vault_a,
+            service_deficit_assets: U256::ZERO,
+            unreserved_idle_assets: U256::ZERO,
+            spread_above_entry: U256::from(100),
+            eligible_since_block: 1,
+            resources: ResourceReservations {
+                vaults: BTreeSet::from([vault_a]),
+                ..Default::default()
+            },
+        },
+        SchedulablePlan {
+            reason: morpho_v2_reallocator::domain::PlanReason::LiquidityMaintenance,
+            vault: vault_b,
+            service_deficit_assets: U256::ONE,
+            unreserved_idle_assets: U256::ZERO,
+            spread_above_entry: U256::ZERO,
+            eligible_since_block: 2,
+            resources: ResourceReservations {
+                vaults: BTreeSet::from([vault_b]),
+                ..Default::default()
+            },
+        },
+    ];
+    assert_eq!(
+        select_next(&plans, &ResourceReservations::default()).map(|plan| plan.vault),
+        Some(vault_b)
+    );
+    let reserved = ResourceReservations {
+        vaults: BTreeSet::from([vault_b]),
+        ..Default::default()
+    };
+    assert_eq!(
+        select_next(&plans, &reserved).map(|plan| plan.vault),
+        Some(vault_a)
+    );
+}
+
+#[test]
+fn capital_solver_deploys_only_verified_unreserved_idle() -> Result<(), Box<dyn Error>> {
+    let (snapshot, vault) = projection_fixture()?;
+    let validated = config()?;
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x11),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp + 12,
+    };
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let result = solve_capital_deployment(
+        &snapshot,
+        &projection,
+        &vault,
+        &validated.app.solver,
+        validated.app.strategy.benefit_horizon_seconds,
+    );
+    assert_eq!(result.actions.len(), 1);
+    let state = result
+        .state
+        .ok_or_else(|| std::io::Error::other("capital result omitted state"))?;
+    assert!(state.unreserved_idle()? <= vault.maximum_rounding_dust_assets);
+    assert!(result.pending.is_none());
+
+    let mut locked = snapshot.clone();
+    locked
+        .idle_locks
+        .locks
+        .push(morpho_v2_reallocator::domain::IdleLockSnapshot {
+            lock_id: B256::repeat_byte(0xcc),
+            remaining_assets: locked.parent.idle_assets,
+            created_block: locked.context.block.number,
+            release_timestamp: None,
+        });
+    let locked_projection = project_snapshot_to_head(&locked, head, &vault)?;
+    let blocked = solve_capital_deployment(
+        &locked,
+        &locked_projection,
+        &vault,
+        &validated.app.solver,
+        validated.app.strategy.benefit_horizon_seconds,
+    );
+    assert!(blocked.actions.is_empty());
+    Ok(())
+}
+
+#[test]
+fn sequential_simulator_enforces_phase_funding_and_bounded_order_search()
+-> Result<(), Box<dyn Error>> {
+    let (snapshot, vault, _) = two_market_fixture()?;
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x11),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp + 12,
+    };
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let mut positions = vault.positions.iter();
+    let source = positions
+        .next()
+        .ok_or_else(|| std::io::Error::other("source missing"))?;
+    let destination = positions
+        .next()
+        .ok_or_else(|| std::io::Error::other("destination missing"))?;
+    let amount = U256::from(1_000_000_u64);
+    let deallocation = V2Action::Deallocate {
+        position: source.position_key,
+        adapter: source.adapter,
+        data: encode_adapter_data(&source.market_params),
+        requested_assets: RequestedAssets(amount),
+    };
+    let allocation = V2Action::Allocate {
+        position: destination.position_key,
+        adapter: destination.adapter,
+        data: encode_adapter_data(&destination.market_params),
+        requested_assets: RequestedAssets(amount),
+    };
+    assert!(
+        simulate_actions(
+            &snapshot,
+            &projection,
+            &vault,
+            &[allocation.clone(), deallocation.clone()]
+        )
+        .is_err()
+    );
+    let ordered = simulate_actions(
+        &snapshot,
+        &projection,
+        &vault,
+        &[deallocation.clone(), allocation.clone()],
+    )?;
+    assert_eq!(ordered.vault_idle, snapshot.parent.idle_assets);
+    let search = search_allocation_orders(
+        &snapshot,
+        &projection,
+        &vault,
+        std::slice::from_ref(&deallocation),
+        std::slice::from_ref(&allocation),
+        10,
+    )?;
+    assert!(search.complete);
+    assert_eq!(search.feasible.len(), 1);
+    let bounded = search_allocation_orders(
+        &snapshot,
+        &projection,
+        &vault,
+        &[deallocation],
+        &[allocation],
+        0,
+    )?;
+    assert!(!bounded.complete);
+    assert!(bounded.feasible.is_empty());
     Ok(())
 }

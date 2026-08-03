@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use alloy::primitives::{Address, B256, Bytes, U256, address};
 use morpho_v2_reallocator::{
-    domain::{CapId, CapRef, ParentVaultState, ProjectedMarketState, VaultAddress},
+    domain::{CapId, CapRef, ParentVaultState, ProjectedMarketState, RewardPolicy, VaultAddress},
     morpho::{
         MathError,
         blue_math::{
@@ -12,6 +12,7 @@ use morpho_v2_reallocator::{
             to_supply_shares_down, to_supply_shares_up,
         },
         market_adapter::{allocate, deallocate},
+        rewards::{RewardContribution, RewardError, release_one_reward_contribution},
         vault_v2::accrue_parent_view,
     },
 };
@@ -41,6 +42,33 @@ fn checked_math_rejects_zero_denominator_and_source_level_overflow() {
     assert!(mul_div_up(U256::ONE, U256::ONE, U256::ZERO).is_err());
     assert!(mul_div_down(U256::MAX, U256::from(2_u8), U256::MAX).is_err());
     assert!(mul_div_up(U256::MAX, U256::ONE, U256::from(2_u8)).is_err());
+}
+
+#[test]
+fn rewards_are_zero_only_with_live_evidence_and_models_fail_closed() {
+    let evidence = RewardPolicy::NoMaterialRewards {
+        checked_at_block: 42,
+        valid_until_timestamp: 2_000,
+        evidence_hash: B256::repeat_byte(0x44),
+    };
+    assert_eq!(
+        release_one_reward_contribution(&evidence, 1_999),
+        Ok(RewardContribution::ExplicitlyZero)
+    );
+    assert_eq!(
+        release_one_reward_contribution(&evidence, 2_001),
+        Err(RewardError::Expired)
+    );
+    assert_eq!(
+        release_one_reward_contribution(
+            &RewardPolicy::Modeled {
+                model_revision: B256::repeat_byte(0x55),
+                valid_until_timestamp: 3_000,
+            },
+            2_500,
+        ),
+        Err(RewardError::UnsupportedModel)
+    );
 }
 
 fn parent(real_idle: u64) -> ParentVaultState {

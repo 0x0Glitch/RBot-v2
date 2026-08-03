@@ -329,10 +329,9 @@ fn reward_policy_ready(policy: &RewardPolicy, required_through: u64) -> bool {
         RewardPolicy::IgnoreRewardsByCuratorMandate { policy_revision } => {
             !policy_revision.is_zero()
         }
-        RewardPolicy::Modeled {
-            model_revision,
-            valid_until_timestamp,
-        } => *valid_until_timestamp >= required_through && !model_revision.is_zero(),
+        // Release one has no approved reward cash-flow implementation. A revision alone
+        // cannot make an unimplemented model executable, so this remains fail closed.
+        RewardPolicy::Modeled { .. } => false,
         RewardPolicy::FixedUntilModeled => false,
     }
 }
