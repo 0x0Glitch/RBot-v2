@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::domain::BlockRef;
 use crate::runtime::messages::{ChainUpdate, ProviderStatus, ReceiptRecord};
 use crate::storage::actor::StorageHandle;
-use crate::storage::models::{CanonicalBlockRecord, CanonicalLogRecord};
+use crate::storage::models::{CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord};
 
 use super::ChainError;
 use super::provider::{ChainDataProvider, ProviderError, ProviderRole};
@@ -185,12 +185,25 @@ impl<P: ChainDataProvider> ChainService<P> {
             }
             let (receipts, logs) = self.block_bundle(block).await?;
             self.storage
-                .apply_canonical_block(
+                .apply_canonical_block_with_receipts(
                     CanonicalBlockRecord {
                         chain_id: self.config.chain_id,
                         block,
                     },
                     logs.clone(),
+                    receipts
+                        .iter()
+                        .map(|receipt| CanonicalReceiptRecord {
+                            chain_id: self.config.chain_id,
+                            transaction_hash: receipt.transaction_hash,
+                            block_number: receipt.block_number,
+                            block_hash: receipt.block_hash,
+                            transaction_index: receipt.transaction_index,
+                            status: receipt.status,
+                            gas_used: receipt.gas_used,
+                            logs: receipt.logs.clone(),
+                        })
+                        .collect(),
                     block.timestamp,
                 )
                 .await?;

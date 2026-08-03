@@ -22,9 +22,9 @@ use crate::{
 use super::{
     StorageError,
     models::{
-        CanonicalBlockRecord, CanonicalLogRecord, FinalPreflightRecord, NonceReservation,
-        RewindResult, SignedAttemptRecord, SignedTransactionRecord, TransactionAttemptKind,
-        TransactionState, TransactionTransition, UnresolvedTransaction,
+        CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, FinalPreflightRecord,
+        NonceReservation, RewindResult, SignedAttemptRecord, SignedTransactionRecord,
+        TransactionAttemptKind, TransactionState, TransactionTransition, UnresolvedTransaction,
     },
 };
 
@@ -75,6 +75,8 @@ struct JsonState {
     revision: u64,
     canonical_blocks: Vec<CanonicalBlockRecord>,
     canonical_logs: Vec<CanonicalLogRecord>,
+    #[serde(default)]
+    canonical_receipts: Vec<CanonicalReceiptRecord>,
     chain_cursors: BTreeMap<u64, BlockRef>,
     exact_snapshots: Vec<TimedSnapshot>,
     plans: Vec<TimedPlan>,
@@ -93,6 +95,7 @@ impl Default for JsonState {
             revision: 0,
             canonical_blocks: Vec::new(),
             canonical_logs: Vec::new(),
+            canonical_receipts: Vec::new(),
             chain_cursors: BTreeMap::new(),
             exact_snapshots: Vec::new(),
             plans: Vec::new(),
@@ -200,12 +203,14 @@ impl JsonStore {
 
 /// Single-writer actor command. Every critical mutation has an acknowledgment.
 pub enum StorageCommand {
-    /// Atomically apply a canonical block, logs, and cursor.
+    /// Atomically apply a canonical block, receipts, logs, and cursor.
     ApplyCanonicalBlock {
         /// Block record.
         block: CanonicalBlockRecord,
         /// Raw canonical logs.
         logs: Vec<CanonicalLogRecord>,
+        /// Complete canonical receipts in transaction order.
+        receipts: Vec<CanonicalReceiptRecord>,
         /// Durable update timestamp.
         updated_at: u64,
         /// Completion acknowledgment.
@@ -298,6 +303,15 @@ pub enum StorageCommand {
         /// Block result.
         reply: oneshot::Sender<Result<Option<BlockRef>, StorageError>>,
     },
+    /// Load complete canonical receipts for one block.
+    LoadCanonicalReceipts {
+        /// EVM chain ID.
+        chain_id: u64,
+        /// Block number.
+        number: u64,
+        /// Ordered receipts.
+        reply: oneshot::Sender<Result<Vec<CanonicalReceiptRecord>, StorageError>>,
+    },
     /// Persist a topology revision.
     PersistTopology {
         /// Topology.
@@ -364,9 +378,22 @@ impl StorageHandle {
         logs: Vec<CanonicalLogRecord>,
         updated_at: u64,
     ) -> Result<(), StorageError> {
+        self.apply_canonical_block_with_receipts(block, logs, Vec::new(), updated_at)
+            .await
+    }
+
+    /// Applies a canonical block and complete receipts after one atomic JSON commit.
+    pub async fn apply_canonical_block_with_receipts(
+        &self,
+        block: CanonicalBlockRecord,
+        logs: Vec<CanonicalLogRecord>,
+        receipts: Vec<CanonicalReceiptRecord>,
+        updated_at: u64,
+    ) -> Result<(), StorageError> {
         self.request(|reply| StorageCommand::ApplyCanonicalBlock {
             block,
             logs,
+            receipts,
             updated_at,
             reply,
         })
@@ -477,6 +504,20 @@ impl StorageHandle {
         number: u64,
     ) -> Result<Option<BlockRef>, StorageError> {
         self.request(|reply| StorageCommand::LoadCanonicalBlock {
+            chain_id,
+            number,
+            reply,
+        })
+        .await
+    }
+
+    /// Loads complete canonical receipts for one block in transaction order.
+    pub async fn load_canonical_receipts(
+        &self,
+        chain_id: u64,
+        number: u64,
+    ) -> Result<Vec<CanonicalReceiptRecord>, StorageError> {
+        self.request(|reply| StorageCommand::LoadCanonicalReceipts {
             chain_id,
             number,
             reply,
@@ -637,10 +678,11 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
             StorageCommand::ApplyCanonicalBlock {
                 block,
                 logs,
+                receipts,
                 updated_at: _,
                 reply,
             } => {
-                let _ = reply.send(store.commit(|state| apply_block(state, block, logs)));
+                let _ = reply.send(store.commit(|state| apply_block(state, block, logs, receipts)));
             }
             StorageCommand::RewindToAncestor {
                 chain_id,
@@ -732,6 +774,23 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                     .map(|record| record.block);
                 let _ = reply.send(Ok(block));
             }
+            StorageCommand::LoadCanonicalReceipts {
+                chain_id,
+                number,
+                reply,
+            } => {
+                let mut receipts = store
+                    .state
+                    .canonical_receipts
+                    .iter()
+                    .filter(|receipt| {
+                        receipt.chain_id == chain_id && receipt.block_number == number
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                receipts.sort_by_key(|receipt| receipt.transaction_index);
+                let _ = reply.send(Ok(receipts));
+            }
             StorageCommand::PersistTopology {
                 topology,
                 block,
@@ -813,6 +872,7 @@ fn apply_block(
     state: &mut JsonState,
     block: CanonicalBlockRecord,
     logs: Vec<CanonicalLogRecord>,
+    receipts: Vec<CanonicalReceiptRecord>,
 ) -> Result<(), StorageError> {
     if logs.iter().any(|log| {
         log.chain_id != block.chain_id
@@ -823,14 +883,42 @@ fn apply_block(
             "canonical log does not belong to block",
         ));
     }
+    if receipts.iter().any(|receipt| {
+        receipt.chain_id != block.chain_id
+            || receipt.block_number != block.block.number
+            || receipt.block_hash != block.block.hash
+            || receipt.logs.iter().any(|log| {
+                log.chain_id != receipt.chain_id
+                    || log.block_number != receipt.block_number
+                    || log.block_hash != receipt.block_hash
+                    || log.transaction_hash != receipt.transaction_hash
+                    || log.transaction_index != receipt.transaction_index
+            })
+    }) {
+        return Err(StorageError::Invariant(
+            "canonical receipt does not belong to block",
+        ));
+    }
+    if receipts
+        .windows(2)
+        .any(|pair| pair[0].transaction_index >= pair[1].transaction_index)
+    {
+        return Err(StorageError::Invariant(
+            "canonical receipts are not strictly ordered",
+        ));
+    }
     state.canonical_blocks.retain(|existing| {
         existing.chain_id != block.chain_id || existing.block.number != block.block.number
     });
     state.canonical_logs.retain(|existing| {
         existing.chain_id != block.chain_id || existing.block_number != block.block.number
     });
+    state.canonical_receipts.retain(|existing| {
+        existing.chain_id != block.chain_id || existing.block_number != block.block.number
+    });
     state.canonical_blocks.push(block);
     state.canonical_logs.extend(logs);
+    state.canonical_receipts.extend(receipts);
     state.chain_cursors.insert(block.chain_id, block.block);
     Ok(())
 }
@@ -843,6 +931,9 @@ fn rewind(state: &mut JsonState, chain_id: u64, ancestor: BlockRef) -> RewindRes
         .retain(|record| record.chain_id != chain_id || record.block.number <= ancestor.number);
     state
         .canonical_logs
+        .retain(|record| record.chain_id != chain_id || record.block_number <= ancestor.number);
+    state
+        .canonical_receipts
         .retain(|record| record.chain_id != chain_id || record.block_number <= ancestor.number);
     state
         .topology_history

@@ -15,8 +15,9 @@ use morpho_v2_reallocator::planner::episodes::RateSignalEpisode;
 use morpho_v2_reallocator::storage::StorageError;
 use morpho_v2_reallocator::storage::actor::StorageService;
 use morpho_v2_reallocator::storage::models::{
-    CanonicalBlockRecord, CanonicalLogRecord, NonceReservation, SignedAttemptRecord,
-    SignedTransactionRecord, TransactionAttemptKind, TransactionState, TransactionTransition,
+    CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, NonceReservation,
+    SignedAttemptRecord, SignedTransactionRecord, TransactionAttemptKind, TransactionState,
+    TransactionTransition,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -153,6 +154,10 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
         .as_object_mut()
         .ok_or("state is not an object")?
         .remove("transaction_attempts");
+    additive_upgrade
+        .as_object_mut()
+        .ok_or("state is not an object")?
+        .remove("canonical_receipts");
     std::fs::write(&path, serde_json::to_vec_pretty(&additive_upgrade)?)?;
     reopen(&path).await?.shutdown().await?;
     assert!(read_json(&path)?["transaction_attempts"].is_array());
@@ -220,26 +225,38 @@ async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::erro
             100,
         )
         .await?;
+    let log = CanonicalLogRecord {
+        chain_id: 999,
+        block_number: 11,
+        block_hash: second.hash,
+        transaction_hash: B256::repeat_byte(0x22),
+        transaction_index: 0,
+        log_index: 0,
+        address: Address::with_last_byte(1),
+        topics: [Some(B256::repeat_byte(1)), None, None, None],
+        data: Bytes::from_static(&[1, 2, 3]),
+    };
     handle
-        .apply_canonical_block(
+        .apply_canonical_block_with_receipts(
             CanonicalBlockRecord {
                 chain_id: 999,
                 block: second,
             },
-            vec![CanonicalLogRecord {
+            vec![log.clone()],
+            vec![CanonicalReceiptRecord {
                 chain_id: 999,
-                block_number: 11,
+                transaction_hash: log.transaction_hash,
+                block_number: second.number,
                 block_hash: second.hash,
-                transaction_hash: B256::repeat_byte(0x22),
                 transaction_index: 0,
-                log_index: 0,
-                address: Address::with_last_byte(1),
-                topics: [Some(B256::repeat_byte(1)), None, None, None],
-                data: Bytes::from_static(&[1, 2, 3]),
+                status: Some(1),
+                gas_used: 21_000,
+                logs: vec![log],
             }],
             101,
         )
         .await?;
+    assert_eq!(handle.load_canonical_receipts(999, 11).await?.len(), 1);
     let result = handle.rewind_to_ancestor(999, first, 102).await?;
     assert_eq!(result.blocks_orphaned, 1);
     assert_eq!(result.logs_orphaned, 1);
@@ -253,6 +270,56 @@ async fn canonical_apply_and_rewind_are_atomic() -> Result<(), Box<dyn std::erro
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0]["block"]["number"], 10);
     assert_eq!(state["canonical_logs"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        state["canonical_receipts"].as_array().map(Vec::len),
+        Some(0)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_receipts_reject_wrong_identity_and_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("receipt-validation.json");
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let canonical = block(20, 0x20, 0x19);
+    let make_receipt = |transaction_index| CanonicalReceiptRecord {
+        chain_id: 999,
+        transaction_hash: B256::repeat_byte(transaction_index as u8 + 1),
+        block_number: canonical.number,
+        block_hash: canonical.hash,
+        transaction_index,
+        status: Some(1),
+        gas_used: 21_000,
+        logs: Vec::new(),
+    };
+    let record = CanonicalBlockRecord {
+        chain_id: 999,
+        block: canonical,
+    };
+    assert!(
+        handle
+            .apply_canonical_block_with_receipts(
+                record,
+                Vec::new(),
+                vec![make_receipt(1), make_receipt(0)],
+                1,
+            )
+            .await
+            .is_err()
+    );
+    let mut wrong = make_receipt(0);
+    wrong.block_hash = B256::repeat_byte(0xff);
+    assert!(
+        handle
+            .apply_canonical_block_with_receipts(record, Vec::new(), vec![wrong], 2)
+            .await
+            .is_err()
+    );
+    assert!(handle.load_cursor(999).await?.is_none());
+    service.shutdown().await?;
     Ok(())
 }
 

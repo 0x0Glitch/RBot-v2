@@ -37,6 +37,27 @@ pub struct CanonicalLogRecord {
     pub data: Bytes,
 }
 
+/// Complete canonical receipt persisted before block publication.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalReceiptRecord {
+    /// EVM chain ID.
+    pub chain_id: u64,
+    /// Transaction hash.
+    pub transaction_hash: B256,
+    /// Canonical block number.
+    pub block_number: u64,
+    /// Canonical block hash.
+    pub block_hash: B256,
+    /// Transaction index within the block.
+    pub transaction_index: u64,
+    /// EVM receipt status.
+    pub status: Option<u64>,
+    /// Gas used.
+    pub gas_used: u64,
+    /// Complete ordered receipt logs.
+    pub logs: Vec<CanonicalLogRecord>,
+}
+
 /// Durable transaction lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

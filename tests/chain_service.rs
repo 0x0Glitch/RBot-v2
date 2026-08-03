@@ -242,6 +242,10 @@ async fn catch_up_persists_each_block_before_publication() -> Result<(), Box<dyn
                 .await?
                 .is_some()
         );
+        let durable_receipts = handle.load_canonical_receipts(CHAIN_ID, expected).await?;
+        assert_eq!(durable_receipts.len(), 1);
+        assert_eq!(durable_receipts[0].transaction_index, 0);
+        assert_eq!(durable_receipts[0].logs.len(), 1);
     }
     assert!(matches!(
         receive.recv().await,
