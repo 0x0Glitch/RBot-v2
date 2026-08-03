@@ -47,6 +47,10 @@
 | 11.18–11.25 | Deterministic bounded rate, capital and liquidity builders with priority/resource scheduler | `src/planner/{rate,capital,liquidity,scheduler,candidates}.rs` | determinism, reservation, capital and rate solver tests | Implemented |
 | 11.26–11.28 | Exact immediate-loss and terminal existing-shareholder value guard, including fail-closed rewards | `src/planner/simulator.rs`, `src/morpho/rewards.rs`, `src/state/capability.rs` | protocol reward-policy and terminal projection tests | Implemented; approved modeled-reward module remains external |
 | 11.29 | Auditable bounded-search certificate; incomplete rate lattice cannot execute | `src/planner/certificate.rs`, `src/planner/rate.rs` | exhaustive comparator and node-budget tests | Implemented |
+| 22.1–22.3, 16.1–16.2 | Private validated-plan boundary, typed one-call/restricted-multicall encoder and independent canonical decoder/firewall | `src/transaction/{encoder,decoder,firewall}.rs` | raw plan compile-fail plus target/value/selector/data/order/amount mutation matrix | Implemented |
+| 22.4–22.7, 16.1–16.3 | Capability-limited remote signer API, authenticated transport policy and full signed-envelope recovery/recheck | `src/transaction/{signer,remote_signer}.rs` | signed-field mutation matrix and authenticated local HTTP signer tests | Implemented; production mTLS identity is deployment input |
+| 23.1–23.4, 16.4–16.5 | One nonce lane, recovery classification and durable plan→nonce→sign→signed-bytes ordering | `src/transaction/{nonce,lifecycle}.rs`, `src/storage/{actor,queries}.rs` | nonce/recovery and durable-boundary recovery tests | Implemented |
+| 23.5–23.6, 16.6 | Strictly higher identical-calldata replacement and known-nonce self-cancellation signing types | `src/transaction/{fees,signer}.rs` | replacement/cancellation signer tests | Signing boundary implemented; submission timing in milestone 10 |
 
 ## Dependency policy notes
 

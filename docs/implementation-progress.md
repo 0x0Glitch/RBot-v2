@@ -169,3 +169,28 @@ Milestones 9–13 remain pending in normative order. Execute remains disabled.
   deployment, sequential ordering, storage recovery and reorg reversal.
 - `make ci` passes with 72 positive/property/integration/differential tests and
   six compile-fail semantic-boundary cases.
+
+## Milestone 9 — Transaction Firewall, Restricted Signer And Nonce Lane
+
+- Only a privately constructed `ValidatedPlan` can enter the typed Vault V2
+  encoder. One action is encoded directly; multiple actions use one outer
+  multicall containing only allocate/deallocate calls.
+- A separate raw-byte decoder requires full canonical ABI consumption and
+  reconstructs configured position identities. The firewall rechecks chain,
+  signer, vault, zero value, EIP-1559 gas/fees, selector grammar, canonical
+  adapter data, nonzero amounts, phase order, duplicate positions, movement
+  totals and the exact semantic action list.
+- The signer trait exposes only initial rebalance, identical-calldata fee
+  replacement and same-nonce self-cancellation methods. The authenticated
+  remote client enforces a signer/vault routing table and hard chain/gas/fee
+  bounds, then decodes returned EIP-2718 bytes, recovers the signer and compares
+  every signed field and claimed hash.
+- The single nonce lane rejects overlap and classifies startup recovery without
+  guessing. The durable signing boundary commits the exact snapshot-backed
+  plan and nonce reservation before signing, and commits verified signed bytes
+  before returning an envelope that submission code can use.
+- Compile-fail tests prove raw plans cannot call the encoder and raw bytes cannot
+  call the signer. Runtime tests cover every transaction field, selector/data,
+  replacement/cancellation, signer mutation and persistence ordering.
+- `make ci` passes with 79 positive/property/integration/differential tests and
+  six compile-fail semantic-boundary cases.

@@ -1,11 +1,6 @@
-use morpho_v2_reallocator::domain::V2Plan;
-
-struct ValidatedV2Plan(V2Plan);
-
-fn encode(_: &ValidatedV2Plan) {}
+use morpho_v2_reallocator::{domain::V2Plan, transaction::encoder::encode_validated_plan};
 
 fn main() {
     let raw: V2Plan = todo!();
-    encode(&raw);
+    encode_validated_plan(&raw);
 }
-

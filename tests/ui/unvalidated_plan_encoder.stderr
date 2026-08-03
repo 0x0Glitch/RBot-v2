@@ -1,25 +1,25 @@
 warning: unreachable statement
- --> tests/ui/unvalidated_plan_encoder.rs:9:5
+ --> tests/ui/unvalidated_plan_encoder.rs:5:5
   |
-8 |     let raw: V2Plan = todo!();
+4 |     let raw: V2Plan = todo!();
   |                       ------- any code following this expression is unreachable
-9 |     encode(&raw);
-  |     ^^^^^^^^^^^^^ unreachable statement
+5 |     encode_validated_plan(&raw);
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
   |
   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
 
 error[E0308]: mismatched types
- --> tests/ui/unvalidated_plan_encoder.rs:9:12
+ --> tests/ui/unvalidated_plan_encoder.rs:5:27
   |
-9 |     encode(&raw);
-  |     ------ ^^^^ expected `&ValidatedV2Plan`, found `&V2Plan`
+5 |     encode_validated_plan(&raw);
+  |     --------------------- ^^^^ expected `&ValidatedPlan`, found `&V2Plan`
   |     |
   |     arguments to this function are incorrect
   |
-  = note: expected reference `&ValidatedV2Plan`
+  = note: expected reference `&ValidatedPlan`
              found reference `&V2Plan`
 note: function defined here
- --> tests/ui/unvalidated_plan_encoder.rs:5:4
+ --> src/transaction/encoder.rs
   |
-5 | fn encode(_: &ValidatedV2Plan) {}
-  |    ^^^^^^ -------------------
+  | pub fn encode_validated_plan(plan: &ValidatedPlan) -> Bytes {
+  |        ^^^^^^^^^^^^^^^^^^^^^

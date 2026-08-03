@@ -9,7 +9,8 @@ provided and verified:
 - runtime code identities for every managed vault, direct adapter, asset token,
   Adaptive Curve IRM, Morpho singleton, Multicall3 and any nonzero gate;
 - vault allocator role and dedicated signer identity;
-- remote signer mTLS/HMAC identities or local development signer secret;
+- remote signer mTLS/HMAC identities, bearer/request credential, isolated
+  allowlist and signer-to-vault routing table, or local development signer secret;
 - fee, confirmation, reconciliation and operational alert configuration;
 - an approved executable reward cash-flow module and revision when any position
   uses `Modeled` reward policy (without one that position remains non-executable);
