@@ -1,0 +1,1 @@
+//! Single-owner nonce lane.

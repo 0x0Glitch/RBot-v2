@@ -1,0 +1,1 @@
+//! Bounded candidate lattice construction.

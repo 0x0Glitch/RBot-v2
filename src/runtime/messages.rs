@@ -1,0 +1,1 @@
+//! Bounded runtime message contracts.

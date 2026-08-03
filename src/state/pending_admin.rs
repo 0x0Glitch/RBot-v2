@@ -1,0 +1,1 @@
+//! Pending administration index.

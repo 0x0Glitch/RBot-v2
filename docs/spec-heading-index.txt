@@ -1,0 +1,449 @@
+2:## Engineering Roadmap and Normative Technical Implementation Specification
+17:## 0. How To Use This Document
+55:### 0.1 Source Priority
+68:### 0.2 Normative Language
+72:### 0.3 Initial Product Boundary
+105:### 0.4 Direct-EOA Limitation
+109:## 1. Final System Behavior
+111:### 1.1 Routine Control Loop
+159:### 1.2 Strategy Priority
+179:### 1.3 Transaction Grammar
+204:### 1.4 Strict Capital Deployment
+224:## 2. Delivery Roadmap
+248:### 2.1 Fast Vertical Slice
+269:### 2.2 Suggested Critical Path
+281:## 3. Toolchain And Dependency Lock
+283:### 3.1 Rust Toolchain
+297:### 3.2 Required Dependencies
+352:### 3.3 Build And Quality Configuration
+394:### 3.4 Coding Rules
+423:### 3.5 Repository Agent Instructions
+436:## 4. Repository Layout
+623:### 4.1 Dependency Direction
+647:## 5. Core Domain Model
+699:### 5.1 Required Identifiers
+726:### 5.2 Market Parameters
+759:### 5.3 Market And Reward Modes
+791:### 5.4 Exact Snapshot Types
+813:### 5.5 Projected State Types
+845:### 5.6 Plans And Actions
+889:### 5.7 Compile-Fail Tests
+902:## 6. Configuration Implementation
+904:### 6.1 Parsing Rules
+934:### 6.2 Top-Level Types
+955:### 6.3 Validated Configuration
+970:### 6.4 APR Conversion
+998:### 6.5 Configuration Validation Checklist
+1027:### 6.6 Configuration Hash
+1037:## 7. Protocol Lock And Contract Bindings
+1039:### 7.1 Protocol Lock File
+1072:### 7.2 ABI Bindings
+1133:### 7.3 Selector Constants
+1147:### 7.4 Adapter Data Canonicalization
+1165:### 7.5 Protocol-Lock Verification Command
+1193:## 8. SQLite Storage
+1195:### 8.1 Storage Ownership
+1203:### 8.2 Connection Configuration
+1224:### 8.3 Storage Encodings
+1240:### 8.4 Migration 0001
+1396:### 8.5 Rate Episode Tables
+1441:### 8.6 Transaction Tables
+1509:### 8.7 Idle Lock Tables
+1551:### 8.8 Storage Commands
+1593:### 8.9 Backup
+1597:## 9. Runtime Services And Messages
+1612:### 9.1 Ownership
+1623:### 9.2 Channel Capacities
+1638:### 9.3 Shared Messages
+1693:### 9.4 Supervision
+1729:## 10. Provider And HyperEVM Implementation
+1731:### 10.1 Provider Roles
+1750:### 10.2 Startup Capability Tests
+1777:### 10.3 Canonical Head Polling
+1789:### 10.4 Block Catch-Up
+1803:### 10.5 Reorg Algorithm
+1821:### 10.6 Raw HyperEVM Replay
+1834:### 10.7 Provider Trust
+1848:## 11. Event Decoding And Causal Attribution
+1850:### 11.1 Watched Addresses
+1866:### 11.2 Watched Event Families
+1946:### 11.3 Event Output
+1966:### 11.4 Transaction Attribution
+2006:### 11.5 Pending Administration Index
+2024:### 11.6 Effect Decoder
+2045:## 12. Exact Atomic Snapshot
+2047:### 12.1 Snapshot Contract
+2051:### 12.2 AtomicLatest Algorithm
+2071:### 12.3 Multicall Context Calls
+2084:### 12.4 Query Manifest
+2113:### 12.5 Complete Read Set
+2179:### 12.6 Snapshot Hash
+2189:## 13. Exact Protocol Math
+2191:### 13.1 General Rules
+2206:### 13.2 Morpho Share Conversions
+2221:### 13.3 Morpho Accrual
+2247:### 13.4 Adaptive Curve IRM
+2269:### 13.5 Vault V2 Parent Accrual
+2301:### 13.6 Direct Adapter Expected Assets
+2312:### 13.7 Adapter Allocation
+2330:### 13.8 Adapter Deallocation
+2342:### 13.9 Differential Tests
+2360:## 14. Per-Head Projection
+2362:### 14.1 Projection Input
+2376:### 14.2 Projected Values
+2394:### 14.3 Exact Refresh Thresholds
+2412:### 14.4 Projection Staleness
+2426:## 15. Topology, Caps, Seeding, Rewards And Capabilities
+2428:### 15.1 All-Ever Topology
+2443:### 15.2 Removed Adapter Rule
+2465:### 15.3 Share Mismatch
+2478:### 15.4 BurnShares
+2491:### 15.5 Cap Semantics
+2522:### 15.6 Pending Administration
+2534:### 15.7 Gates
+2547:### 15.8 Parent Dead Deposit
+2551:### 15.9 Market Seeding
+2563:### 15.10 Reward Policy
+2577:## 16. Unified Idle-Lock Ledger
+2579:### 16.1 Lock Types
+2604:### 16.2 Lock Creation
+2625:### 16.3 Ordered Accounting
+2643:### 16.4 Consumption Order
+2656:### 16.5 Release
+2668:### 16.6 Uncertainty
+2688:## 17. Deposit And Withdrawal Service Constraints
+2690:### 17.1 Maximum Executable Deposit
+2723:### 17.2 Atomic Exit Coverage
+2741:### 17.3 Liquidity Adapter Floor
+2749:### 17.4 Source Free Liquidity
+2759:### 17.5 Shared Loan Token
+2765:## 18. Plan Classes And Scheduler
+2767:### 18.1 Plan Eligibility
+2778:### 18.2 LiquidityMaintenance
+2791:### 18.3 CapitalDeployment
+2810:### 18.4 RateRebalance
+2824:### 18.5 PositionSyncRequired
+2828:### 18.6 Scheduling
+2857:## 19. Rate Signal Episodes
+2859:### 19.1 Episode State
+2886:### 19.2 Start Rule
+2899:### 19.3 Immediate Budget
+2915:### 19.4 Persistent Confirmation
+2938:### 19.5 Direction Compatibility
+2954:### 19.6 Completion
+2970:## 20. Candidate Generation And Deterministic Solver
+2972:### 20.1 Planning Input
+2986:### 20.2 Frozen Sets
+3001:### 20.3 Candidate Amount Lattice
+3022:### 20.4 Source And Destination Sets
+3037:### 20.5 Sequential Simulation
+3057:### 20.6 Allocation Order Search
+3095:### 20.7 Objective Ranking
+3124:### 20.8 Terminal Existing-Shareholder Value
+3149:### 20.9 Solver Certificate
+3165:### 20.10 Exhaustive Small-Domain Validation
+3169:## 21. Exact Sequential Action Simulation
+3171:### 21.1 Deallocation
+3205:### 21.2 First Parent Accrual
+3220:### 21.3 Allocation
+3247:### 21.4 Action-Local Loss
+3263:### 21.5 Funding Identity
+3279:### 21.6 Interleaving Diagnostic
+3283:## 22. Transaction Encoder And Firewall
+3285:### 22.1 Validated Plan Types
+3295:### 22.2 Encoding
+3311:### 22.3 Independent Decoder
+3334:### 22.4 Signer API Boundary
+3359:### 22.5 Remote Signer Request
+3393:### 22.6 Remote Signer Authentication
+3411:### 22.7 Local Development Signer
+3415:## 23. Nonce And Transaction Lifecycle
+3417:### 23.1 One Lane Per Vault Signer
+3423:### 23.2 Transaction States
+3443:### 23.3 Persistence Order
+3457:### 23.4 Nonce Recovery
+3478:### 23.5 Fee Replacement
+3489:### 23.6 Cancellation
+3502:### 23.7 HyperEVM Fast-Block Clocks
+3517:## 24. Inclusion Scenarios And One-Head Final Preflight
+3519:### 24.1 Inclusion Scenarios
+3539:### 24.2 Final Preflight Algorithm
+3577:### 24.3 Gas Limit
+3592:### 24.4 Pending Administration
+3596:### 24.5 Material Pending-State Invalidation
+3622:## 25. Receipt Conformance And Reconciliation
+3624:### 25.1 Receipt Tracking
+3635:### 25.2 Execution Conformance
+3658:### 25.3 Same-Block Activity
+3662:### 25.4 Current-State Reconciliation
+3675:### 25.5 Hard Mismatch
+3691:### 25.6 Transaction Failure
+3711:## 26. Runtime States And Error Taxonomy
+3713:### 26.1 Vault States
+3732:### 26.2 Plan States
+3752:### 26.3 Rate Episode States
+3768:### 26.4 Error Classes
+3804:## 27. Read-Only API, CLI And Telemetry
+3806:### 27.1 API
+3838:### 27.2 CLI
+3855:### 27.3 Metrics
+3880:### 27.4 Alerts
+3926:## 28. Testing Specification
+3930:### 28.1 Unit Tests
+3948:### 28.2 Property Tests
+3966:### 28.3 Differential Tests
+3984:### 28.4 Fork Tests
+4006:### 28.5 Exhaustive Solver Tests
+4010:### 28.6 Reorg Tests
+4023:### 28.7 Crash Tests
+4041:### 28.8 Firewall Tests
+4063:### 28.9 Load Tests
+4076:### 28.10 User-Path Gas Tests
+4092:### 28.11 Shadow E2E Test
+4116:## 29. Milestone-by-Milestone Implementation Tasks
+4118:### Milestone 0 — Bootstrap
+4147:### Milestone 1 — Domain, Config And Protocol Lock
+4169:### Milestone 2 — Storage
+4191:### Milestone 3 — Bindings And Events
+4212:### Milestone 4 — Chain Service
+4233:### Milestone 5 — Snapshot And State Service
+4256:### Milestone 6 — Protocol Math
+4276:### Milestone 7 — Projection, Locks And Service Constraints
+4298:### Milestone 8 — Solver
+4321:### Milestone 9 — Transaction Firewall And Signer
+4342:### Milestone 10 — Final Preflight And Submission
+4363:### Milestone 11 — Reconciliation And Operations
+4385:### Milestone 12 — Hardening
+4407:### Milestone 13 — Shadow And Canary
+4430:## 30. CI And Release Gates
+4432:### 30.1 Pull Request CI
+4446:### 30.2 Nightly CI
+4460:### 30.3 Observe Gate
+4472:### 30.4 Shadow Gate
+4484:### 30.5 Canary Gate
+4500:### 30.6 Production Gate
+4514:## 31. Deployment And Operations
+4516:### 31.1 Process Isolation
+4522:### 31.2 Systemd Example
+4550:### 31.3 Filesystem
+4568:### 31.4 Startup Readiness
+4587:### 31.5 Runbook Minimums
+4606:### 31.6 No Hot Reload
+4610:## 32. Deployment Inputs The Junior Must Not Invent
+4643:## 33. Definition Of Done
+4647:### 33.1 Code
+4658:### 33.2 State And Protocol
+4670:### 33.3 Planning
+4683:### 33.4 Execution
+4694:### 33.5 Reconciliation
+4703:### 33.6 Operations
+4713:### 33.7 Handoff Report
+4732:## 34. Instructions To The Junior Implementation Agent
+4749:## 35. Official Research References
+4787:## 0. v1.6 Resolution Summary
+4851:## 1. Strategy Overview
+4853:### 1.1 Working Mechanism
+4897:### 1.2 Strategy Priority
+4913:### 1.3 Formal Rate Objective
+5029:### 1.4 Solver Guarantee
+5065:## 2. Protocol Model
+5067:### 2.1 Role Model
+5090:### 2.2 Deposit Routing
+5110:### 2.3 Withdrawal Routing
+5134:### 2.4 Direct Adapter Accounting
+5178:### 2.5 Positive Assets Can Reduce Recorded Cap Usage
+5203:### 2.6 Cap Checks On Allocation And Deallocation
+5243:## 3. Deployment And Runtime Architecture
+5245:### 3.1 Production Deployment Unit
+5262:### 3.2 High-Level Architecture
+5301:### 3.3 Runtime Services
+5325:### 3.4 Shared Dependency Coordination
+5359:## 4. Event-Driven State Ingestion
+5361:### 4.1 Events As Triggers
+5371:### 4.2 Canonical Heads As Events
+5395:### 4.3 Exact Refresh Triggers
+5412:### 4.4 Watched Vault V2 Events
+5447:### 4.5 Watched Adapter Events
+5463:### 4.6 Watched Morpho Events
+5480:### 4.7 Watched ERC-20 Transfers
+5494:### 4.8 Event Coalescing
+5500:### 4.9 Causal Transaction Attribution
+5533:### 4.10 Idle-Lock Classification
+5557:### 4.11 External Action Intents
+5585:### 4.12 Reorganizations
+5599:## 5. RPC And Snapshot Architecture
+5601:### 5.1 Production Provider Requirement
+5622:### 5.2 HyperEVM Request Budget
+5645:### 5.3 Snapshot Modes
+5674:### 5.4 Planning Snapshot Versus Signing Snapshot
+5692:### 5.5 Multicall Query Manifest
+5726:### 5.6 Snapshot Failure
+5743:## 6. Exact State Model
+5745:### 6.1 Semantic State Types And Context
+5795:### 6.2 Parent Vault State
+5839:### 6.3 Adapter State
+5861:### 6.4 Position State
+5884:### 6.5 Market Mode And Reward Policy
+5966:### 6.6 Morpho Market State
+5987:### 6.7 Cap State
+6006:### 6.8 Pending Administration
+6038:### 6.9 Capability State
+6057:## 7. Exact Time Projection And Rate Engine
+6059:### 7.1 Stored, Accrued And Projected State
+6075:### 7.2 Per-Head Projection
+6098:### 7.3 Morpho Accrual Order
+6112:### 7.4 Average Rate Versus Spot Rate
+6129:### 7.5 Exact Arithmetic
+6147:### 7.6 Parent Accrual
+6168:## 8. Strict Capital Deployment And Idle Policy
+6170:### 8.1 Unified Idle State
+6205:### 8.2 Felix Production Profile
+6226:### 8.3 Funding Identity
+6260:### 8.4 AllocationCapacityExhausted
+6288:### 8.5 PendingDeployment
+6309:### 8.6 No Routine Deallocation Into Idle
+6317:### 8.7 Lock-Uncertainty Behavior
+6331:## 9. Deposit And Withdrawal Service Constraints
+6333:### 9.1 Maximum Executable Deposit Headroom
+6384:### 9.2 Deposit Capacity Maintenance
+6400:### 9.3 Atomic Exit Coverage
+6422:### 9.4 Liquidity Adapter Position Floor
+6434:### 9.5 Source Market Liquidity Floor
+6453:### 9.6 Shared Loan-Token Liquidity
+6459:## 10. Cap Graph And Sequential Action Simulation
+6461:### 10.1 Canonical Deallocation Order
+6477:### 10.2 Deallocation Simulation
+6503:### 10.3 `firstTotalAssets`
+6528:### 10.4 Allocation Simulation
+6551:### 10.5 Sequential Cap Ledger
+6562:### 10.6 Allocation Ordering
+6578:### 10.7 Feasible Allocation-Order Search
+6620:### 10.8 Destination Cap Bound
+6635:## 11. Same-Set Rate Objective, Signal Episodes And Deterministic Solver
+6637:### 11.1 Frozen Pre-Plan Rate Set
+6664:### 11.2 Candidate Touched And Evaluation Sets
+6688:### 11.3 Candidate Controllable Set
+6709:### 11.4 Same-Set Spread Definitions
+6751:### 11.5 Position Disposition
+6800:### 11.6 Relevance Hysteresis Across Cycles
+6812:### 11.7 Rate Objective Branches
+6847:### 11.8 Target Spread And Candidate Ranking
+6888:### 11.9 Durable Rate Signal Episode
+6966:### 11.10 Episode Start
+6998:### 11.11 One-Time Immediate Budget
+7030:### 11.12 Persistent Confirmation
+7065:### 11.13 Qualifying Independent Events
+7094:### 11.14 Direction Compatibility
+7123:### 11.15 Episode Movement Limit
+7151:### 11.16 Episode Completion And Reset
+7175:### 11.17 Rate Groups
+7181:### 11.18 Terminal Existing-Shareholder Value Guard
+7253:### 11.19 Amount Candidate Generation
+7287:### 11.20 Validation Against Exhaustive Search
+7302:### 11.21 Annualized Threshold Unit
+7342:## 12. Plan Classes And Scheduling
+7344:### 12.1 Plan Reasons
+7357:### 12.2 Scheduling Priority
+7367:### 12.3 LiquidityMaintenance
+7380:### 12.4 CapitalDeployment
+7388:### 12.5 RateRebalance
+7423:### 12.6 PositionSyncRequired
+7439:### 12.7 Pending Deployment
+7449:## 13. Action Grammar
+7451:### 13.1 Semantic Actions
+7472:### 13.2 Grammar Rules
+7487:### 13.3 Movement Definition
+7527:### 13.4 Ordering And Optimality Limitation
+7551:## 14. Inclusion-Time Scenarios And Final Preflight
+7553:### 14.1 Inclusion Scenarios
+7581:### 14.2 Pending Administrative Window
+7598:### 14.3 One-Head Final Preflight
+7662:### 14.4 Snapshot And Sign Latency Gates
+7677:### 14.5 Material Pending-State Invalidation
+7712:### 14.6 Accepted Stale-Execution Risk
+7733:## 15. HyperEVM Execution Profile
+7735:### 15.1 Fast-Block Lane
+7747:### 15.2 Fast-Block Opportunity Clock
+7775:### 15.3 Exact Gas Formula
+7804:### 15.4 Gas Release Tests
+7816:### 15.5 User-Path Gas
+7834:## 16. Transaction Firewall And Signer
+7836:### 16.1 Semantic Signing API
+7855:### 16.2 Independent Decoder
+7878:### 16.3 Key Management
+7890:### 16.4 Nonce Lanes
+7898:### 16.5 Persistence Order
+7914:### 16.6 Replacement And Cancellation
+7936:## 17. Adapter Topology, Seeding And Accounting Anomalies
+7938:### 17.1 Current Accounted Markets
+7942:### 17.2 Historical Markets
+7957:### 17.3 Share Mismatch Rules
+7999:### 17.4 BurnShares
+8010:### 17.5 Removed Parent Adapters
+8053:### 17.6 Parent Vault Dead Deposit
+8074:### 17.7 Market Dead Deposit
+8084:### 17.8 Destination Seed Requirements
+8103:### 17.9 Allocation-Dependent Rewards
+8126:## 18. Unified Idle-Lock Ledger
+8128:### 18.1 Lock Types
+8161:### 18.2 Mutually Exclusive Creation
+8182:### 18.3 Ordered Transaction Accounting
+8203:### 18.4 Consumption Rules
+8229:### 18.5 Release Authorization
+8254:### 18.6 Pre-Authorized Redeployment Intent
+8272:### 18.7 Verification And Uncertainty
+8304:### 18.8 Persistence
+8319:## 19. Pending Administration And Configuration Changes
+8321:### 19.1 Event-Driven Refresh
+8335:### 19.2 Pending Operation Index
+8341:### 19.3 Capability Changes
+8362:### 19.4 Gates
+8377:## 20. Reconciliation
+8379:### 20.1 Execution Conformance
+8398:### 20.2 Same-Block Activity
+8409:### 20.3 Current-State Reconciliation
+8427:## 21. Runtime State Machines
+8429:### 21.1 Vault Automation State
+8449:### 21.2 Transaction State
+8473:### 21.3 Plan State
+8494:### 21.4 Rate Signal Episode State
+8524:### 21.5 Capability State
+8543:## 22. Configuration
+8545:### 22.1 Configuration Principles
+8557:### 22.2 Representative Configuration
+8742:### 22.3 Configuration Validation
+8783:## 23. Storage
+8858:## 24. Monitoring And Alerts
+8860:### 24.1 P0 Alerts
+8882:### 24.2 P1 Alerts
+8903:### 24.3 P2 Events
+8922:### 24.4 Prometheus Metrics
+8998:## 25. Implementation Structure
+9064:## 26. Required Tests
+9066:### 26.1 Protocol Differential Tests
+9077:### 26.2 Cap And Ordering Tests
+9093:### 26.3 Idle And Capacity Tests
+9105:### 26.4 Deposit And Withdrawal Tests
+9118:### 26.5 Attribution And Unified Lock Tests
+9138:### 26.6 Time Projection Tests
+9149:### 26.7 Same-Set Rate Objective Tests
+9163:### 26.8 Entry And Target Tests
+9178:### 26.9 Rate Signal Episode Tests
+9204:### 26.10 Economic Guard And Rewards Tests
+9221:### 26.11 Solver Tests
+9232:### 26.12 Snapshot And Final-Preflight Tests
+9252:### 26.13 Topology, Seed And Share Tests
+9266:### 26.14 Transaction Firewall Tests
+9280:### 26.15 HyperEVM Timing And Gas Tests
+9296:### 26.16 Recovery Tests
+9313:### 26.17 Reconciliation Tests
+9324:### 26.18 User-Path Gas Tests
+9335:## 27. Release Gates
+9337:### 27.1 Observe
+9350:### 27.2 Shadow
+9367:### 27.3 Low-Value Canary
+9400:### 27.4 Full Production
+9420:## 28. Final Operational Invariant
+9473:## 29. Explicit Residual Risks
+9495:## 30. Future Oracle Module Boundary
+9542:## 31. Official Implementation References

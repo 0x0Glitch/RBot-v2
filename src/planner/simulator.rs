@@ -1,0 +1,1 @@
+//! Exact sequential action simulation.

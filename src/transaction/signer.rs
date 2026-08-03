@@ -1,0 +1,1 @@
+//! Capability-limited signing boundary.

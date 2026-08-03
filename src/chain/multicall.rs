@@ -1,0 +1,1 @@
+//! Atomic block-context reads.

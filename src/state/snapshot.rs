@@ -1,0 +1,1 @@
+//! Atomic exact snapshot construction.

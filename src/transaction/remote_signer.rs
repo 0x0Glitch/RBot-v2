@@ -1,0 +1,1 @@
+//! Authenticated remote signer client.
