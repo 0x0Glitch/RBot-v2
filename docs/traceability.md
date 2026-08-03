@@ -62,7 +62,7 @@
 | 27.1 | Loopback-default GET-only health, metrics, vault, artifact, transaction and alert API | `src/api/{dto,routes}.rs` | live HTTP test including POST rejection | Implemented |
 | 27.3, 24.4 | Complete bounded-name Prometheus registration with no high-cardinality identifiers | `src/telemetry/metrics.rs` | registry text assertion for every metric name | Implemented; SQLite metric superseded by JSON format metric per SC-001 |
 | 27.4, 24.3 | Typed deduplicated alert history and redacted Telegram/PagerDuty transports | `src/telemetry/{alerts,telegram,pagerduty}.rs` | real local HTTP transport tests | Implemented |
-| Milestone 12 | Deterministic local-chain vertical slice through terminal reconciliation | `tests/fixtures/e2e`, `tests/local_e2e.rs` | Forge deployment; deposit/allocation; canonical replay; atomic snapshots; bounded rate solve; firewall, real-EOA call, signing and submission; confirmation; exact event conformance; improved rate; current-state reconciliation; JSON restart | Implemented for the main rate path; cap/queue replanning and crash matrix pending |
+| Milestone 12 | Deterministic local-chain vertical slice through terminal reconciliation | `tests/fixtures/e2e`, `tests/local_e2e.rs` | Forge deployment; deposit/allocation; canonical replay; atomic snapshots; bounded rate solve; firewall, real-EOA call, signing and submission; confirmation; exact event conformance; improved rate; current-state reconciliation; cap refresh; adapter removal hard pause/re-add replanning; JSON restart | Implemented for the main rate and administration-invalidation paths; live composition pending |
 
 ## Dependency policy notes
 

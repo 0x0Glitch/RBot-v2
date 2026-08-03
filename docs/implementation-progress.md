@@ -282,7 +282,9 @@ invalidation/crash matrix remain before production Execute can be enabled.
   `abi.encode` argument sequences require Alloy `abi_encode_params`, not a
   dynamically nested tuple encoding.
 - The deterministic local transaction is
-  `0x86b9ba8cfeb3781eec926b54847aad291ba036920734207c6f62b68f172fb325`;
+  `0x6f82ceadd58398c817d82acaa744a5f6b7fb53776c30f4d3b1343ece08827640`;
   its exact spot-rate spread improves from `20833333333` to `18065268066`
-  per-second WAD units. Base Sepolia remains blocked on the remaining local
-  invalidation/crash gates and production deployment identities.
+  per-second WAD units. A later cap event forces an exact refreshed cap value;
+  adapter removal hard-pauses projection, and re-addition restores capability
+  and produces a fresh improving plan. Base Sepolia remains blocked on live
+  runtime composition and production deployment identities.
