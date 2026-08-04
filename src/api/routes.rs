@@ -14,7 +14,7 @@ use prometheus_client::{encoding::text::encode, registry::Registry};
 use tokio::sync::RwLock;
 
 use crate::{
-    api::dto::{ErrorResponse, TransactionView, VaultView},
+    api::dto::{ErrorResponse, RateSnapshotView, TransactionView, VaultView},
     domain::{ExactVaultSnapshot, V2Plan, VaultAddress},
     planner::episodes::RateSignalEpisode,
     runtime::controller::RuntimeRegistry,
@@ -25,6 +25,7 @@ use crate::{
 #[derive(Clone, Default)]
 pub struct ApiDataStore {
     snapshots: Arc<RwLock<BTreeMap<VaultAddress, ExactVaultSnapshot>>>,
+    rates: Arc<RwLock<BTreeMap<VaultAddress, RateSnapshotView>>>,
     plans: Arc<RwLock<BTreeMap<VaultAddress, V2Plan>>>,
     episodes: Arc<RwLock<BTreeMap<VaultAddress, RateSignalEpisode>>>,
     transactions: Arc<RwLock<BTreeMap<B256, TransactionView>>>,
@@ -42,6 +43,16 @@ impl ApiDataStore {
     /// Returns the latest exact snapshot for one configured vault.
     pub async fn snapshot(&self, vault: VaultAddress) -> Option<ExactVaultSnapshot> {
         self.snapshots.read().await.get(&vault).cloned()
+    }
+
+    /// Replaces the latest immutable rate view for one vault.
+    pub async fn record_rates(&self, rates: RateSnapshotView) {
+        self.rates.write().await.insert(rates.vault, rates);
+    }
+
+    /// Returns the latest immutable rate view for one configured vault.
+    pub async fn rates(&self, vault: VaultAddress) -> Option<RateSnapshotView> {
+        self.rates.read().await.get(&vault).cloned()
     }
 
     /// Replaces the latest semantic plan for one vault.
@@ -102,6 +113,7 @@ pub fn router(state: ReadOnlyApiState) -> Router {
         .route("/v1/vaults", get(vaults))
         .route("/v1/vaults/{address}", get(vault))
         .route("/v1/vaults/{address}/snapshot", get(snapshot))
+        .route("/v1/vaults/{address}/rates", get(rates))
         .route("/v1/vaults/{address}/plan", get(plan))
         .route("/v1/vaults/{address}/episode", get(episode))
         .route("/v1/transactions", get(transactions))
@@ -168,6 +180,7 @@ async fn vault(State(state): State<ReadOnlyApiState>, Path(address): Path<String
             .await
             .get(&vault_address)
             .cloned(),
+        rates: state.data.rates.read().await.get(&vault_address).cloned(),
         plan: state.data.plans.read().await.get(&vault_address).cloned(),
         episode: state
             .data
@@ -182,6 +195,10 @@ async fn vault(State(state): State<ReadOnlyApiState>, Path(address): Path<String
 
 async fn snapshot(State(state): State<ReadOnlyApiState>, Path(address): Path<String>) -> Response {
     artifact(address, &state.data.snapshots).await
+}
+
+async fn rates(State(state): State<ReadOnlyApiState>, Path(address): Path<String>) -> Response {
+    artifact(address, &state.data.rates).await
 }
 
 async fn plan(State(state): State<ReadOnlyApiState>, Path(address): Path<String>) -> Response {

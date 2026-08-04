@@ -6,13 +6,16 @@ use alloy::primitives::{Address, U256};
 use thiserror::Error;
 
 use crate::{
-    api::ApiDataStore,
+    api::{
+        ApiDataStore,
+        dto::{MarketRateView, RateSnapshotView},
+    },
     chain::{
         logs::{EventDecodeError, EventSource, RawEventLog, decode_event},
         multicall::{AtomicSnapshotProvider, MulticallError},
         provider::TransactionLookupProvider,
     },
-    config::{RuntimeMode, ValidatedConfig, ValidatedVaultConfig},
+    config::{RuntimeMode, SECONDS_PER_YEAR, ValidatedConfig, ValidatedVaultConfig, WAD},
     domain::{BlockRef, IdleLockLedgerSnapshot, TokenAddress, VaultAddress},
     planner::objective::rate_spread,
     runtime::{
@@ -467,7 +470,26 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                     .values()
                     .map(|market| &market.spot_borrow_rate),
             );
+            let rate_snapshot = RateSnapshotView {
+                vault: vault.address,
+                snapshot_hash: snapshot.snapshot_hash,
+                block: projection.head,
+                spread_rate_per_second_wad: spread,
+                spread_apr_bps: rate_per_second_to_apr_bps_down(spread),
+                markets: projection
+                    .markets
+                    .values()
+                    .map(|market| MarketRateView {
+                        market_id: market.market_id,
+                        spot_borrow_rate_per_second_wad: market.spot_borrow_rate,
+                        spot_supply_rate_per_second_wad: market.spot_supply_rate,
+                        utilization_wad: market.utilization,
+                    })
+                    .collect(),
+            };
             self.api.record_snapshot(snapshot.clone()).await;
+            self.api.record_rates(rate_snapshot.clone()).await;
+            self.metrics.record_rate_snapshot(&rate_snapshot);
             let pending_transaction = self.storage.load_unresolved(vault.signer_address).await?;
             let desired = desired_runtime_state(
                 self.config.app.node.mode,
@@ -623,6 +645,14 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             .await;
         Ok(())
     }
+}
+
+fn rate_per_second_to_apr_bps_down(rate: U256) -> u64 {
+    rate.checked_mul(U256::from(SECONDS_PER_YEAR))
+        .and_then(|annual| annual.checked_mul(U256::from(10_000_u64)))
+        .map(|scaled| scaled / U256::from(WAD))
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(u64::MAX)
 }
 
 fn runtime_unix_timestamp() -> u64 {

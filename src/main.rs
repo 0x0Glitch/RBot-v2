@@ -495,6 +495,7 @@ async fn run_chain_service(
             _ = fallback.tick() => poll_canonical_chain(&chain).await?,
             hint = hints.next() => match hint {
                 Some(_) => poll_canonical_chain(&chain).await?,
+                None if shutdown.is_cancelled() => return Ok(()),
                 None => return Err(ServiceFailure { reason: "WebSocket head subscription ended" }),
             },
         }
@@ -543,6 +544,7 @@ async fn run_state_service(
                         return Err(ServiceFailure { reason: "canonical state service failed" });
                     }
                 }
+                None if shutdown.is_cancelled() => return Ok(()),
                 None => return Err(ServiceFailure { reason: "canonical update channel closed" }),
             }
         }
@@ -634,9 +636,10 @@ async fn run_execution_service(
     execution: LiveExecutionService<HttpProvider>,
     shutdown: ShutdownSignal,
 ) -> Result<(), ServiceFailure> {
-    // Base publishes sealed L2 blocks on roughly two-second cadence. Polling the signer lane
-    // faster does not improve canonical resolution and amplifies provider/mempool races.
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    // The shared allocator is deliberately serviced on a conservative cadence. Canonical state
+    // ingestion remains event-driven, while this five-second interval gives the one durable nonce
+    // lane time to observe propagation or inclusion before making another lifecycle decision.
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
