@@ -14,7 +14,7 @@ use crate::{
     },
     planner::{
         capital::solve_capital_deployment,
-        episodes::{EpisodeError, RateEpisodeState, RateSignalEpisode},
+        episodes::{EpisodeError, RateEpisodeState, RateEpisodeStopReason, RateSignalEpisode},
         liquidity::solve_liquidity_maintenance,
         objective::rate_spread,
         rate::solve_rate_rebalance,
@@ -116,14 +116,21 @@ pub async fn refresh_rate_plan(
             || active.topology_revision != snapshot.context.dynamic_topology_revision;
         let expired = projection.head.timestamp >= active.expires_at;
         let incompatible_signal = signal.as_ref().is_none_or(|current| {
-            !signal_matches_episode(
-                active,
-                current,
-                config.app.strategy.target_spread_rate_per_second.0,
-            )
+            !signal_matches_episode(active, current, convergence_threshold(config))
         });
         if incompatible_revision || expired || incompatible_signal {
-            active.complete();
+            let reason = if incompatible_revision {
+                RateEpisodeStopReason::ConfigOrTopologyChanged
+            } else if expired {
+                RateEpisodeStopReason::ExpiredStalled
+            } else if projected_controllable_spread(projection, vault)
+                <= convergence_threshold(config)
+            {
+                RateEpisodeStopReason::TargetReached
+            } else {
+                RateEpisodeStopReason::DirectionChanged
+            };
+            active.complete(reason);
             storage
                 .persist_rate_episode(active.clone(), projection.head.timestamp)
                 .await?;
@@ -187,7 +194,7 @@ pub async fn refresh_rate_plan(
                     .await?;
             }
             Err(EpisodeError::NonConsecutiveObservation) => {
-                episode.complete();
+                episode.complete(RateEpisodeStopReason::NonConsecutiveObservation);
                 storage
                     .persist_rate_episode(episode.clone(), projection.head.timestamp)
                     .await?;
@@ -213,11 +220,7 @@ pub async fn refresh_rate_plan(
         let persistent_signal = detect_rate_signal(snapshot, projection, vault, true);
         if projection.head.timestamp >= persistent_at
             && persistent_signal.as_ref().is_some_and(|current| {
-                signal_matches_episode(
-                    &episode,
-                    current,
-                    config.app.strategy.target_spread_rate_per_second.0,
-                )
+                signal_matches_episode(&episode, current, convergence_threshold(config))
             })
         {
             episode.unlock_persistent()?;
@@ -261,6 +264,16 @@ fn signal_matches_episode(
             .is_ok()
 }
 
+fn convergence_threshold(config: &ValidatedConfig) -> U256 {
+    config
+        .app
+        .strategy
+        .target_spread_rate_per_second
+        .0
+        .checked_add(config.app.strategy.target_tolerance_rate_per_second.0)
+        .unwrap_or(U256::MAX)
+}
+
 /// Rebuilds one exact rate plan from a frozen, already-confirmed episode.
 pub fn build_validated_rate_plan(
     config: &ValidatedConfig,
@@ -283,6 +296,9 @@ pub fn build_validated_rate_plan(
     let Some(best) = solved.best else {
         return Ok(None);
     };
+    if best.actions.len() > config.app.execution.maximum_actions {
+        return Ok(None);
+    }
     let action_projections = best.state.actions.clone();
     let mut plan = V2Plan {
         plan_id: PlanId(B256::ZERO),
@@ -307,8 +323,7 @@ pub fn build_validated_rate_plan(
             rate_episode_id: Some(episode.episode_id.0),
             objective_branch: Some(episode.objective_branch),
             target_reachable: solved.target_reachable,
-            target_reached: best.objective.applicable_spread
-                <= config.app.strategy.target_spread_rate_per_second.0,
+            target_reached: best.objective.applicable_spread <= convergence_threshold(config),
         },
         episode_id: Some(episode.episode_id),
         plan_hash: B256::ZERO,
@@ -333,7 +348,7 @@ pub fn build_validated_liquidity_plan(
     let Some(state) = solved.state else {
         return Ok(None);
     };
-    if solved.actions.is_empty() {
+    if solved.actions.is_empty() || solved.actions.len() > config.app.execution.maximum_actions {
         return Ok(None);
     }
     build_validated_non_rate_plan(
@@ -367,7 +382,10 @@ pub fn build_validated_capital_plan(
     let Some(state) = solved.state else {
         return Ok(None);
     };
-    if solved.actions.is_empty() || !solved.certificate.search_complete {
+    if solved.actions.is_empty()
+        || solved.actions.len() > config.app.execution.maximum_actions
+        || !solved.certificate.search_complete
+    {
         return Ok(None);
     }
     build_validated_non_rate_plan(
@@ -514,7 +532,7 @@ async fn terminate_rate_episode(
     {
         // A higher-priority plan changes the comparison state. Complete the frozen episode so
         // its immediate budget and direction can never be reused after that transaction.
-        episode.complete();
+        episode.complete(RateEpisodeStopReason::HigherPriorityPlan);
         storage
             .persist_rate_episode(episode.clone(), projection.head.timestamp)
             .await?;
@@ -624,35 +642,37 @@ fn detect_rate_signal(
     if maximum <= minimum {
         return None;
     }
+    let midpoint = minimum + (maximum - minimum) / U256::from(2_u8);
     let source_markets = candidates
         .iter()
-        .filter(|candidate| candidate.can_source && candidate.rate == minimum)
+        .filter(|candidate| candidate.can_source && candidate.rate <= midpoint)
         .map(|candidate| candidate.market)
         .collect::<BTreeSet<_>>();
     let destination_markets = candidates
         .iter()
-        .filter(|candidate| candidate.can_destination && candidate.rate == maximum)
+        .filter(|candidate| candidate.can_destination && candidate.rate > midpoint)
         .map(|candidate| candidate.market)
         .collect::<BTreeSet<_>>();
     if source_markets.is_empty() || destination_markets.is_empty() {
         return None;
     }
-    let desired_movement = candidates
+    let source_capacity = candidates
         .iter()
         .filter(|source| source_markets.contains(&source.market))
-        .flat_map(|source| {
-            candidates
-                .iter()
-                .filter(|destination| destination_markets.contains(&destination.market))
-                .map(move |destination| {
-                    source
-                        .source_capacity
-                        .min(destination.destination_capacity)
-                        .min(vault.maximum_movement_per_transaction_assets)
-                })
+        .try_fold(U256::ZERO, |total, source| {
+            total.checked_add(source.source_capacity)
         })
-        .max()
         .unwrap_or(U256::ZERO);
+    let destination_capacity = candidates
+        .iter()
+        .filter(|destination| destination_markets.contains(&destination.market))
+        .try_fold(U256::ZERO, |total, destination| {
+            total.checked_add(destination.destination_capacity)
+        })
+        .unwrap_or(U256::ZERO);
+    let desired_movement = source_capacity
+        .min(destination_capacity)
+        .min(vault.maximum_movement_per_transaction_assets);
     Some(RateSignal {
         branch: if evaluation_markets == controllable_markets {
             RateObjectiveBranch::Portfolio
@@ -666,6 +686,19 @@ fn detect_rate_signal(
         spread,
         desired_movement,
     })
+}
+
+fn projected_controllable_spread(
+    projection: &ProjectedVaultView,
+    vault: &ValidatedVaultConfig,
+) -> U256 {
+    let rates = vault.positions.iter().filter_map(|position| {
+        projection
+            .markets
+            .get(&position.market_id)
+            .map(|market| &market.spot_borrow_rate)
+    });
+    rate_spread(rates)
 }
 
 async fn clear_plan(

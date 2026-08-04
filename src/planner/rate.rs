@@ -1,11 +1,14 @@
 //! Deterministic rate-rebalance candidate search.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use alloy::primitives::{B256, I256, U256, keccak256};
 
 use crate::{
-    config::{SolverConfigCanonical, ValidatedStrategyConfig, ValidatedVaultConfig},
+    config::{
+        SolverConfigCanonical, ValidatedPositionConfig, ValidatedStrategyConfig,
+        ValidatedVaultConfig,
+    },
     domain::{ExactVaultSnapshot, PlanReason, RequestedAssets, V2Action},
     planner::{
         CandidatePlanSet, PlanBuilder, PlanningError, PlanningInput,
@@ -125,7 +128,58 @@ fn metrics(
     })
 }
 
-/// Searches all configured source/destination pairs over a frozen bounded amount lattice.
+fn bounded_distributions(
+    positions: &[(&ValidatedPositionConfig, U256)],
+    lattices: &[Vec<U256>],
+    total: U256,
+    minimum_action: U256,
+    limit: u64,
+) -> Option<Vec<Vec<U256>>> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut unique = BTreeSet::new();
+    for sink in 0..positions.len() {
+        let mut partials = vec![(vec![U256::ZERO; positions.len()], U256::ZERO)];
+        for (index, amounts) in lattices.iter().enumerate() {
+            if index == sink {
+                continue;
+            }
+            let mut next = Vec::new();
+            for (selected, subtotal) in partials {
+                for amount in amounts {
+                    let Some(updated) = subtotal.checked_add(*amount) else {
+                        continue;
+                    };
+                    if updated > total || next.len() >= limit {
+                        continue;
+                    }
+                    let mut candidate = selected.clone();
+                    candidate[index] = *amount;
+                    next.push((candidate, updated));
+                }
+            }
+            partials = next;
+        }
+        for (mut selected, subtotal) in partials {
+            let residual = total.saturating_sub(subtotal);
+            if residual > positions[sink].1
+                || (!residual.is_zero() && residual < minimum_action)
+                || selected
+                    .iter()
+                    .any(|amount| !amount.is_zero() && *amount < minimum_action)
+            {
+                continue;
+            }
+            selected[sink] = residual;
+            unique.insert(selected);
+            if unique.len() >= limit {
+                return None;
+            }
+        }
+    }
+    Some(unique.into_iter().collect())
+}
+
+/// Searches complete multi-source/multi-destination final allocations on one bounded lattice.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_rate_rebalance(
     snapshot: &ExactVaultSnapshot,
@@ -199,86 +253,153 @@ pub fn solve_rate_rebalance(
             };
         }
     };
-    let mut candidates = Vec::new();
-    let mut hashes = Vec::new();
-    'pairs: for source_market in &episode.source_markets {
-        let Some(source) = vault
-            .positions
-            .iter()
-            .find(|position| position.market_id == *source_market)
-        else {
-            certificate.reject(RejectionReason::Episode);
-            continue;
-        };
-        let Some(source_assets) = projection
-            .vault
-            .position_expected_assets
-            .get(&source.position_key)
-        else {
-            certificate.reject(RejectionReason::Simulation);
-            continue;
-        };
-        for destination_market in &episode.destination_markets {
-            let Some(destination) = vault
+    let sources = episode
+        .source_markets
+        .iter()
+        .filter_map(|market| {
+            let position = vault
                 .positions
                 .iter()
-                .find(|position| position.market_id == *destination_market)
-            else {
-                certificate.reject(RejectionReason::Episode);
-                continue;
-            };
-            if source.position_key == destination.position_key {
-                continue;
-            }
-            let Some(destination_assets) = projection
+                .find(|position| position.market_id == *market)?;
+            let current = projection
                 .vault
                 .position_expected_assets
-                .get(&destination.position_key)
-            else {
-                certificate.reject(RejectionReason::Simulation);
-                continue;
-            };
-            let source_maximum = source_assets.saturating_sub(source.minimum_position_assets);
-            let destination_maximum = destination
+                .get(&position.position_key)?;
+            let maximum = current
+                .saturating_sub(position.minimum_position_assets)
+                .min(position.maximum_action_assets);
+            (!maximum.is_zero()).then_some((position, maximum))
+        })
+        .collect::<Vec<_>>();
+    let destinations = episode
+        .destination_markets
+        .iter()
+        .filter_map(|market| {
+            let position = vault
+                .positions
+                .iter()
+                .find(|position| position.market_id == *market)?;
+            let current = projection
+                .vault
+                .position_expected_assets
+                .get(&position.position_key)?;
+            let maximum = position
                 .maximum_position_assets
-                .saturating_sub(*destination_assets);
-            let maximum = source_maximum
-                .min(destination_maximum)
-                .min(source.maximum_action_assets)
-                .min(destination.maximum_action_assets)
-                .min(vault.maximum_movement_per_transaction_assets)
-                .min(budget);
+                .saturating_sub(*current)
+                .min(position.maximum_action_assets);
+            (!maximum.is_zero()).then_some((position, maximum))
+        })
+        .collect::<Vec<_>>();
+    let source_total = sources
+        .iter()
+        .try_fold(U256::ZERO, |total, (_, maximum)| {
+            total.checked_add(*maximum)
+        })
+        .unwrap_or(U256::ZERO);
+    let destination_total = destinations
+        .iter()
+        .try_fold(U256::ZERO, |total, (_, maximum)| {
+            total.checked_add(*maximum)
+        })
+        .unwrap_or(U256::ZERO);
+    let maximum = source_total
+        .min(destination_total)
+        .min(vault.maximum_movement_per_transaction_assets)
+        .min(budget);
+    let movement_lattice = build_candidate_lattice(
+        vault.minimum_action_assets,
+        maximum,
+        &[budget, source_total, destination_total],
+        solver.maximum_amount_candidates_per_position,
+    );
+    let mut hashes = movement_lattice.hash.as_slice().to_vec();
+    let source_lattices = sources
+        .iter()
+        .map(|(_, maximum)| {
             let lattice = build_candidate_lattice(
                 vault.minimum_action_assets,
-                maximum,
-                &[budget, source_maximum, destination_maximum],
+                *maximum,
+                &[budget, source_total],
                 solver.maximum_amount_candidates_per_position,
             );
             hashes.extend_from_slice(lattice.hash.as_slice());
-            for amount in lattice
-                .amounts
-                .into_iter()
-                .filter(|amount| *amount >= vault.minimum_action_assets)
-            {
+            lattice.amounts
+        })
+        .collect::<Vec<_>>();
+    let destination_lattices = destinations
+        .iter()
+        .map(|(_, maximum)| {
+            let lattice = build_candidate_lattice(
+                vault.minimum_action_assets,
+                *maximum,
+                &[budget, destination_total],
+                solver.maximum_amount_candidates_per_position,
+            );
+            hashes.extend_from_slice(lattice.hash.as_slice());
+            lattice.amounts
+        })
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    'search: for amount in movement_lattice
+        .amounts
+        .into_iter()
+        .filter(|amount| *amount >= vault.minimum_action_assets)
+    {
+        let remaining_nodes = certificate
+            .node_limit
+            .saturating_sub(certificate.nodes_evaluated);
+        let Some(source_distributions) = bounded_distributions(
+            &sources,
+            &source_lattices,
+            amount,
+            vault.minimum_action_assets,
+            remaining_nodes,
+        ) else {
+            certificate.search_complete = false;
+            break;
+        };
+        let Some(destination_distributions) = bounded_distributions(
+            &destinations,
+            &destination_lattices,
+            amount,
+            vault.minimum_action_assets,
+            remaining_nodes,
+        ) else {
+            certificate.search_complete = false;
+            break;
+        };
+        for source_amounts in &source_distributions {
+            for destination_amounts in &destination_distributions {
                 if certificate.nodes_evaluated >= certificate.node_limit {
                     certificate.search_complete = false;
-                    break 'pairs;
+                    break 'search;
                 }
                 certificate.nodes_evaluated += 1;
-                let actions = vec![
-                    V2Action::Deallocate {
+                let actions = sources
+                    .iter()
+                    .zip(source_amounts)
+                    .filter(|(_, amount)| !amount.is_zero())
+                    .map(|((source, _), amount)| V2Action::Deallocate {
                         position: source.position_key,
                         adapter: source.adapter,
                         data: crate::domain::encode_adapter_data(&source.market_params),
-                        requested_assets: RequestedAssets(amount),
-                    },
-                    V2Action::Allocate {
-                        position: destination.position_key,
-                        adapter: destination.adapter,
-                        data: crate::domain::encode_adapter_data(&destination.market_params),
-                        requested_assets: RequestedAssets(amount),
-                    },
-                ];
+                        requested_assets: RequestedAssets(*amount),
+                    })
+                    .chain(
+                        destinations
+                            .iter()
+                            .zip(destination_amounts)
+                            .filter(|(_, amount)| !amount.is_zero())
+                            .map(|((destination, _), amount)| V2Action::Allocate {
+                                position: destination.position_key,
+                                adapter: destination.adapter,
+                                data: crate::domain::encode_adapter_data(
+                                    &destination.market_params,
+                                ),
+                                requested_assets: RequestedAssets(*amount),
+                            }),
+                    )
+                    .collect::<Vec<_>>();
                 let state = match simulate_actions(snapshot, projection, vault, &actions) {
                     Ok(state) => state,
                     Err(_) => {
@@ -359,15 +480,6 @@ pub fn solve_rate_rebalance(
                     certificate.reject(RejectionReason::SpreadWorsening);
                     continue;
                 }
-                let sources = std::collections::BTreeSet::from([*source_market]);
-                let destinations = std::collections::BTreeSet::from([*destination_market]);
-                if episode
-                    .validate_direction(episode.objective_branch, &sources, &destinations)
-                    .is_err()
-                {
-                    certificate.reject(RejectionReason::Episode);
-                    continue;
-                }
                 candidates.push(SolvedRateCandidate {
                     actions,
                     state,
@@ -378,7 +490,11 @@ pub fn solve_rate_rebalance(
         }
     }
     certificate.candidate_lattice_hash = keccak256(hashes);
-    let target = strategy.target_spread_rate_per_second.0;
+    let target = strategy
+        .target_spread_rate_per_second
+        .0
+        .checked_add(strategy.target_tolerance_rate_per_second.0)
+        .unwrap_or(U256::MAX);
     let target_reachable = candidates
         .iter()
         .any(|candidate| candidate.objective.applicable_spread <= target);

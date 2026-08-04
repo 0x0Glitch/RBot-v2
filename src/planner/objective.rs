@@ -37,12 +37,14 @@ pub fn ranks_before(
             (
                 candidate.final_unreserved_idle,
                 std::cmp::Reverse(candidate.deployed_assets),
+                candidate.applicable_spread,
                 std::cmp::Reverse(candidate.terminal_value_delta),
                 candidate.movement_assets,
                 candidate.action_count,
             ) < (
                 current.final_unreserved_idle,
                 std::cmp::Reverse(current.deployed_assets),
+                current.applicable_spread,
                 std::cmp::Reverse(current.terminal_value_delta),
                 current.movement_assets,
                 current.action_count,

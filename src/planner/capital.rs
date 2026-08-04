@@ -11,7 +11,7 @@ use crate::{
         CandidatePlanSet, PlanBuilder, PlanningError, PlanningInput,
         candidates::build_candidate_lattice,
         certificate::{RejectionReason, SearchCertificate},
-        objective::{ObjectiveMetrics, ranks_before},
+        objective::{ObjectiveMetrics, ranks_before, rate_spread},
         simulator::{
             SimulationState, no_plan_terminal_existing_shareholder_assets, simulate_actions,
         },
@@ -137,50 +137,102 @@ pub fn solve_capital_deployment(
             };
         }
     };
-    let mut best: Option<(Vec<V2Action>, SimulationState, ObjectiveMetrics)> = None;
-    let mut hashes = Vec::new();
-    for destination in vault
+    let destinations = vault
         .positions
         .iter()
         .filter(|position| position.mode == MarketMode::Active)
-    {
-        let Some(current) = projection
-            .vault
-            .position_expected_assets
-            .get(&destination.position_key)
-            .copied()
-        else {
-            certificate.reject(RejectionReason::Simulation);
-            continue;
-        };
-        let position_maximum = destination.maximum_position_assets.saturating_sub(current);
-        let action_maximum = maximum
-            .min(position_maximum)
-            .min(destination.maximum_action_assets);
-        let lattice = build_candidate_lattice(
-            vault.minimum_action_assets,
-            action_maximum,
-            &[available, position_maximum],
-            solver.maximum_amount_candidates_per_position,
-        );
-        hashes.extend_from_slice(lattice.hash.as_slice());
-        for amount in lattice
-            .amounts
-            .into_iter()
-            .rev()
-            .filter(|amount| *amount >= vault.minimum_action_assets)
-        {
+        .filter_map(|destination| {
+            let current = projection
+                .vault
+                .position_expected_assets
+                .get(&destination.position_key)
+                .copied()?;
+            let position_maximum = destination.maximum_position_assets.saturating_sub(current);
+            let action_maximum = maximum
+                .min(position_maximum)
+                .min(destination.maximum_action_assets);
+            (!action_maximum.is_zero()).then_some((destination, action_maximum))
+        })
+        .collect::<Vec<_>>();
+    let deploy_target = destinations
+        .iter()
+        .try_fold(U256::ZERO, |total, (_, action_maximum)| {
+            total.checked_add(*action_maximum)
+        })
+        .unwrap_or(U256::MAX)
+        .min(maximum);
+    let mut hashes = Vec::new();
+    hashes.extend_from_slice(&deploy_target.to_be_bytes::<32>());
+    let lattices = destinations
+        .iter()
+        .map(|(_, action_maximum)| {
+            let lattice = build_candidate_lattice(
+                vault.minimum_action_assets,
+                *action_maximum,
+                &[deploy_target, available],
+                solver.maximum_amount_candidates_per_position,
+            );
+            hashes.extend_from_slice(lattice.hash.as_slice());
+            lattice.amounts
+        })
+        .collect::<Vec<_>>();
+    let mut best: Option<(Vec<V2Action>, SimulationState, ObjectiveMetrics)> = None;
+    'sinks: for sink in 0..destinations.len() {
+        let mut partials = vec![(vec![U256::ZERO; destinations.len()], U256::ZERO)];
+        for (index, amounts) in lattices.iter().enumerate() {
+            if index == sink {
+                continue;
+            }
+            let mut next = Vec::new();
+            for (selected, total) in partials {
+                for amount in amounts {
+                    let Some(updated) = total.checked_add(*amount) else {
+                        continue;
+                    };
+                    if updated > deploy_target {
+                        continue;
+                    }
+                    if next.len() >= usize::try_from(certificate.node_limit).unwrap_or(usize::MAX) {
+                        certificate.search_complete = false;
+                        break 'sinks;
+                    }
+                    let mut candidate = selected.clone();
+                    candidate[index] = *amount;
+                    next.push((candidate, updated));
+                }
+            }
+            partials = next;
+        }
+        for (mut selected, total) in partials {
             if certificate.nodes_evaluated >= certificate.node_limit {
                 certificate.search_complete = false;
-                break;
+                break 'sinks;
+            }
+            let residual = deploy_target.saturating_sub(total);
+            if residual > destinations[sink].1
+                || (!residual.is_zero() && residual < vault.minimum_action_assets)
+                || selected
+                    .iter()
+                    .any(|amount| !amount.is_zero() && *amount < vault.minimum_action_assets)
+            {
+                continue;
+            }
+            selected[sink] = residual;
+            let actions = destinations
+                .iter()
+                .zip(selected)
+                .filter(|(_, amount)| !amount.is_zero())
+                .map(|((destination, _), amount)| V2Action::Allocate {
+                    position: destination.position_key,
+                    adapter: destination.adapter,
+                    data: crate::domain::encode_adapter_data(&destination.market_params),
+                    requested_assets: RequestedAssets(amount),
+                })
+                .collect::<Vec<_>>();
+            if actions.is_empty() || actions.len() > vault.positions.len() {
+                continue;
             }
             certificate.nodes_evaluated += 1;
-            let actions = vec![V2Action::Allocate {
-                position: destination.position_key,
-                adapter: destination.adapter,
-                data: crate::domain::encode_adapter_data(&destination.market_params),
-                requested_assets: RequestedAssets(amount),
-            }];
             let state = match simulate_actions(snapshot, projection, vault, &actions) {
                 Ok(state) => state,
                 Err(_) => {
@@ -233,12 +285,17 @@ pub fn solve_capital_deployment(
                         continue;
                     }
                 },
-                deployed_assets: amount,
-                applicable_spread: U256::ZERO,
+                deployed_assets: deploy_target,
+                applicable_spread: rate_spread(vault.positions.iter().filter_map(|position| {
+                    state
+                        .markets
+                        .get(&position.market_id)
+                        .map(|market| &market.spot_borrow_rate)
+                })),
                 secondary_spread: U256::ZERO,
                 terminal_value_delta,
-                movement_assets: amount,
-                action_count: 1,
+                movement_assets: deploy_target,
+                action_count: actions.len(),
             };
             if best.as_ref().is_none_or(|(_, _, current)| {
                 ranks_before(

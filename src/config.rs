@@ -27,6 +27,10 @@ const fn default_identical_rebroadcast_after_fast_blocks() -> u64 {
     1
 }
 
+const fn default_target_tolerance_apr_bps() -> u32 {
+    1
+}
+
 /// Returns whether a chain is explicitly allowed to use the test-only local signer.
 #[must_use]
 pub const fn is_test_chain_id(chain_id: u64) -> bool {
@@ -261,6 +265,9 @@ pub struct StrategyConfig {
     pub entry_spread_apr_bps: u32,
     /// Target spread in simple APR basis points.
     pub target_spread_apr_bps: u32,
+    /// Integer-rounding tolerance above the target spread.
+    #[serde(default = "default_target_tolerance_apr_bps")]
+    pub target_tolerance_apr_bps: u32,
     /// Required portfolio improvement.
     pub minimum_portfolio_improvement_apr_bps: u32,
     /// Required controllable-set improvement.
@@ -680,6 +687,8 @@ pub struct ValidatedStrategyConfig {
     pub entry_spread_rate_per_second: RatePerSecond,
     /// Upper-bound target rate rounded down.
     pub target_spread_rate_per_second: RatePerSecond,
+    /// Convergence tolerance rounded down.
+    pub target_tolerance_rate_per_second: RatePerSecond,
     /// Minimum portfolio improvement rounded up.
     pub minimum_portfolio_improvement_rate_per_second: RatePerSecond,
     /// Minimum controllable improvement rounded up.
@@ -977,6 +986,9 @@ impl AppConfig {
             target_spread_rate_per_second: apr_bps_to_rate_per_second_down(AprBps(
                 self.strategy.target_spread_apr_bps,
             ))?,
+            target_tolerance_rate_per_second: apr_bps_to_rate_per_second_down(AprBps(
+                self.strategy.target_tolerance_apr_bps,
+            ))?,
             minimum_portfolio_improvement_rate_per_second: apr_bps_to_rate_per_second_up(AprBps(
                 self.strategy.minimum_portfolio_improvement_apr_bps,
             ))?,
@@ -1232,10 +1244,15 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "must be positive and no later than fee replacement",
         ));
     }
-    if config.strategy.entry_spread_apr_bps <= config.strategy.target_spread_apr_bps {
+    if config
+        .strategy
+        .target_spread_apr_bps
+        .checked_add(config.strategy.target_tolerance_apr_bps)
+        .is_none_or(|convergence| config.strategy.entry_spread_apr_bps <= convergence)
+    {
         return Err(validation(
             "strategy.entry_spread_apr_bps",
-            "entry spread must exceed target spread",
+            "entry spread must exceed target plus convergence tolerance",
         ));
     }
     if config.strategy.minimum_portfolio_improvement_apr_bps == 0

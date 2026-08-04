@@ -132,6 +132,7 @@ fn gas_and_pending_horizons_are_rejected() {
     );
 
     let mut config = raw_example();
+    config.execution.maximum_inclusion_fast_blocks = 2;
     config.execution.maximum_rate_rebalance_pending_fast_blocks = 3;
     assert_field(
         match config.validate() {

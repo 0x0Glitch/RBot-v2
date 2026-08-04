@@ -27,6 +27,24 @@ pub enum RateEpisodeState {
     Complete,
 }
 
+/// Typed terminal reason for a rate episode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateEpisodeStopReason {
+    /// The configured target plus integer tolerance was reached.
+    TargetReached,
+    /// Static configuration or dynamic topology changed.
+    ConfigOrTopologyChanged,
+    /// The profitable source/destination direction changed or became infeasible.
+    DirectionChanged,
+    /// The bounded episode lifetime expired without convergence.
+    ExpiredStalled,
+    /// Exact observations were not consecutive across canonical blocks.
+    NonConsecutiveObservation,
+    /// A higher-priority safety or capital plan changed the comparison state.
+    HigherPriorityPlan,
+}
+
 /// Immutable direction and cumulative movement accounting for one episode.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +57,9 @@ pub struct RateSignalEpisode {
     pub rate_group: RateGroupId,
     /// Current lifecycle state.
     pub state: RateEpisodeState,
+    /// Typed terminal reason, populated exactly when state becomes complete.
+    #[serde(default)]
+    pub stop_reason: Option<RateEpisodeStopReason>,
     /// Frozen objective branch.
     pub objective_branch: RateObjectiveBranch,
     /// Detection block.
@@ -160,6 +181,7 @@ impl RateSignalEpisode {
             vault,
             rate_group,
             state: RateEpisodeState::Detecting,
+            stop_reason: None,
             objective_branch,
             detection_block,
             confirmation_block: None,
@@ -302,7 +324,8 @@ impl RateSignalEpisode {
     }
 
     /// Terminates the episode; completion never rearms budgets.
-    pub fn complete(&mut self) {
+    pub fn complete(&mut self, reason: RateEpisodeStopReason) {
         self.state = RateEpisodeState::Complete;
+        self.stop_reason = Some(reason);
     }
 }

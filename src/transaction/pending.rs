@@ -452,6 +452,7 @@ mod tests {
         config
             .execution
             .maximum_liquidity_maintenance_pending_fast_blocks = 6;
+        config.execution.identical_rebroadcast_after_fast_blocks = 1;
         config.execution.replacement_after_fast_blocks = 2;
         config.execution.cancel_when_fast_blocks_remaining = 1;
         config.validate().ok()
