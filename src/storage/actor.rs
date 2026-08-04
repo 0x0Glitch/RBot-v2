@@ -514,9 +514,11 @@ fn compact_hot_state(state: &mut JsonState) {
         state
             .canonical_blocks
             .retain(|record| record.block.number >= retain_from);
-        state
-            .canonical_logs
-            .retain(|record| record.block_number >= retain_from);
+        // Canonical protocol logs are the all-ever topology source. They cannot be discarded
+        // merely because their blocks age out of the hot header window: a long first backfill can
+        // complete before the state owner has persisted its first topology checkpoint. Keeping
+        // this sparse event set is correctness-critical and remains far smaller than retaining
+        // every canonical header.
     }
     if state.exact_snapshots.len() > HOT_SNAPSHOT_RETENTION {
         state
@@ -2781,4 +2783,47 @@ fn persist_episode(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod compaction_tests {
+    use alloy::primitives::{Address, B256, Bytes};
+
+    use super::{HOT_BLOCK_RETENTION, JsonState, compact_hot_state};
+    use crate::{
+        domain::BlockRef,
+        storage::models::{CanonicalBlockRecord, CanonicalLogRecord},
+    };
+
+    #[test]
+    fn long_initial_backfill_retains_early_topology_logs() {
+        let mut state = JsonState::default();
+        state.canonical_logs.push(CanonicalLogRecord {
+            chain_id: 84532,
+            block_number: 10,
+            block_hash: B256::repeat_byte(10),
+            transaction_hash: B256::repeat_byte(11),
+            transaction_index: 0,
+            log_index: 0,
+            address: Address::with_last_byte(12),
+            topics: [Some(B256::repeat_byte(13)), None, None, None],
+            data: Bytes::new(),
+        });
+        state.canonical_blocks.push(CanonicalBlockRecord {
+            chain_id: 84532,
+            block: BlockRef {
+                number: HOT_BLOCK_RETENTION.saturating_add(100),
+                hash: B256::repeat_byte(14),
+                parent_hash: B256::repeat_byte(15),
+                timestamp: 100,
+                gas_limit: 30_000_000,
+            },
+        });
+
+        compact_hot_state(&mut state);
+
+        assert_eq!(state.canonical_logs.len(), 1);
+        assert_eq!(state.canonical_logs[0].block_number, 10);
+    }
 }
