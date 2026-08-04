@@ -344,6 +344,19 @@ pub enum StorageCommand {
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
+    /// Record a submission attempt for exact already-durable bytes.
+    RecordAttemptBroadcast {
+        /// Stable lifecycle identity.
+        transaction_id: crate::domain::TransactionId,
+        /// Exact locally-derived attempt hash.
+        transaction_hash: B256,
+        /// Unix submission-attempt timestamp.
+        broadcast_at: u64,
+        /// Canonical block used as the rebroadcast clock.
+        broadcast_block: u64,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
     /// Compare-and-set a transaction lifecycle state.
     TransitionTransaction {
         /// Checked transition.
@@ -673,6 +686,24 @@ impl StorageHandle {
     ) -> Result<(), StorageError> {
         self.request(|reply| StorageCommand::PersistSignedAttempt { attempt, reply })
             .await
+    }
+
+    /// Records a submission attempt without changing signed bytes or nonce ownership.
+    pub async fn record_attempt_broadcast(
+        &self,
+        transaction_id: crate::domain::TransactionId,
+        transaction_hash: B256,
+        broadcast_at: u64,
+        broadcast_block: u64,
+    ) -> Result<(), StorageError> {
+        self.request(|reply| StorageCommand::RecordAttemptBroadcast {
+            transaction_id,
+            transaction_hash,
+            broadcast_at,
+            broadcast_block,
+            reply,
+        })
+        .await
     }
 
     /// Applies one compare-and-set lifecycle transition.
@@ -1142,6 +1173,23 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
             }
             StorageCommand::PersistSignedAttempt { attempt, reply } => {
                 let _ = reply.send(store.commit(|state| persist_signed_attempt(state, attempt)));
+            }
+            StorageCommand::RecordAttemptBroadcast {
+                transaction_id,
+                transaction_hash,
+                broadcast_at,
+                broadcast_block,
+                reply,
+            } => {
+                let _ = reply.send(store.commit(|state| {
+                    record_attempt_broadcast(
+                        state,
+                        transaction_id,
+                        transaction_hash,
+                        broadcast_at,
+                        broadcast_block,
+                    )
+                }));
             }
             StorageCommand::TransitionTransaction { transition, reply } => {
                 let _ = reply.send(store.commit(|state| transition_transaction(state, transition)));
@@ -1837,6 +1885,7 @@ fn persist_signed(
         signed_at: signed.updated_at,
         signed_block: row.reservation.created_block,
         broadcast_at: None,
+        last_broadcast_block: None,
     });
     Ok(())
 }
@@ -1878,6 +1927,32 @@ fn persist_signed_attempt(
     row.raw_signed_transaction = Some(attempt.raw_signed_transaction.clone());
     row.updated_at = attempt.signed_at;
     state.transaction_attempts.push(attempt);
+    Ok(())
+}
+
+fn record_attempt_broadcast(
+    state: &mut JsonState,
+    transaction_id: crate::domain::TransactionId,
+    transaction_hash: B256,
+    broadcast_at: u64,
+    broadcast_block: u64,
+) -> Result<(), StorageError> {
+    let attempt = state
+        .transaction_attempts
+        .iter_mut()
+        .find(|attempt| {
+            attempt.transaction_id == transaction_id && attempt.transaction_hash == transaction_hash
+        })
+        .ok_or(StorageError::StaleTransition)?;
+    if broadcast_block < attempt.signed_block
+        || attempt
+            .last_broadcast_block
+            .is_some_and(|previous| broadcast_block < previous)
+    {
+        return Err(StorageError::StaleTransition);
+    }
+    attempt.broadcast_at = Some(broadcast_at);
+    attempt.last_broadcast_block = Some(broadcast_block);
     Ok(())
 }
 
@@ -2303,6 +2378,7 @@ fn load_unresolved(
             .find(|attempt| attempt.transaction_id == row.reservation.transaction_id);
         UnresolvedTransaction {
             transaction_id: row.reservation.transaction_id,
+            vault: row.reservation.vault,
             signer,
             nonce: row.reservation.nonce,
             state: row.state,
@@ -2340,6 +2416,7 @@ fn load_unresolved(
             last_attempt_block: latest_attempt.map_or(row.reservation.created_block, |attempt| {
                 attempt.signed_block
             }),
+            last_broadcast_block: latest_attempt.and_then(|attempt| attempt.last_broadcast_block),
             last_attempt_kind: latest_attempt
                 .map_or(TransactionAttemptKind::Initial, |attempt| attempt.kind),
         }

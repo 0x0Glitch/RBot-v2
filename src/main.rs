@@ -608,12 +608,13 @@ fn build_execute_signer(
                 .map_err(|_| "remote signer authenticated client cannot be built".to_owned())?;
             let maximum_fee_per_gas = u128::try_from(config.app.execution.maximum_fee_per_gas_wei)
                 .map_err(|_| "remote signer fee bound exceeds u128".to_owned())?;
-            let signer_vaults = config
-                .app
-                .vaults
-                .iter()
-                .map(|vault| (vault.signer_address, vault.address.0))
-                .collect::<BTreeMap<_, _>>();
+            let mut signer_vaults = BTreeMap::<_, BTreeSet<_>>::new();
+            for vault in &config.app.vaults {
+                signer_vaults
+                    .entry(vault.signer_address)
+                    .or_default()
+                    .insert(vault.address.0);
+            }
             Ok(Some(Arc::new(RemoteRoutineSigner::new(
                 client,
                 endpoint,
@@ -633,7 +634,9 @@ async fn run_execution_service(
     execution: LiveExecutionService<HttpProvider>,
     shutdown: ShutdownSignal,
 ) -> Result<(), ServiceFailure> {
-    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    // Base publishes sealed L2 blocks on roughly two-second cadence. Polling the signer lane
+    // faster does not improve canonical resolution and amplifies provider/mempool races.
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -646,10 +649,13 @@ async fn run_execution_service(
                         | PreflightError::NonceBusy
                         | PreflightError::Reservation(_)
                     )) => {}
-                    Err(error) => {
+                    Err(error) if error.is_process_fatal() => {
                         tracing::error!(service = "execution", %error, "execution service failed");
                         eprintln!("execution service failed: {error}");
                         return Err(ServiceFailure { reason: "execution service failed" });
+                    }
+                    Err(error) => {
+                        tracing::warn!(service = "execution", %error, "allocator lane remains fail-closed; retrying after the next sealed-block interval");
                     }
                 }
             }

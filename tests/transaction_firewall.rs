@@ -36,7 +36,8 @@ use morpho_v2_reallocator::{
         },
         nonce::NonceLane,
         pending::{
-            CancellationReason, PendingAttemptRequest, PendingDecision, execute_pending_attempt,
+            CancellationReason, PendingAttemptOutcome, PendingAttemptRequest, PendingDecision,
+            execute_pending_attempt,
         },
         remote_signer::{RemoteRoutineSigner, RemoteSignerPolicy},
         signer::{
@@ -428,6 +429,19 @@ impl SignedTransactionSubmitter for HashingSubmitter {
     }
 }
 
+struct IndeterminateSubmitter;
+
+#[async_trait::async_trait]
+impl SignedTransactionSubmitter for IndeterminateSubmitter {
+    async fn submit_signed_bytes(&self, _signed: &Bytes) -> Result<B256, ProviderError> {
+        Err(ProviderError::Rpc {
+            method: "eth_sendRawTransaction",
+            code: -32_000,
+            category: morpho_v2_reallocator::chain::provider::RpcErrorCategory::Unknown,
+        })
+    }
+}
+
 #[tokio::test]
 async fn plan_nonce_and_signed_bytes_are_durable_before_envelope_is_returned() {
     let signer = LocalTestRoutineSigner(PrivateKeySigner::random());
@@ -577,7 +591,7 @@ async fn replacement_and_cancellation_are_durable_before_each_broadcast() {
     let replacement = execute_pending_attempt(
         &service.handle(),
         &signer,
-        &HashingSubmitter,
+        &IndeterminateSubmitter,
         &config.app.execution,
         PendingAttemptRequest {
             pending,
@@ -592,7 +606,21 @@ async fn replacement_and_cancellation_are_durable_before_each_broadcast() {
         },
     )
     .await;
-    assert!(replacement.is_ok(), "replacement failed: {replacement:?}");
+    assert!(matches!(
+        replacement,
+        Ok(PendingAttemptOutcome::SubmissionIndeterminate { .. })
+    ));
+    let unresolved_after_rejection = service.handle().load_unresolved(signer.0.address()).await;
+    let unresolved_after_rejection = match unresolved_after_rejection {
+        Ok(Some(unresolved)) => unresolved,
+        Ok(None) => panic!("indeterminate replacement must retain the nonce lane"),
+        Err(error) => panic!("recovery query must pass: {error}"),
+    };
+    assert_eq!(
+        unresolved_after_rejection.state,
+        morpho_v2_reallocator::storage::models::TransactionState::Submitted
+    );
+    assert_eq!(unresolved_after_rejection.known_transaction_hashes.len(), 2);
 
     let replaced_pending = match ValidatedPendingTransaction::from_recovered_attempt(
         transaction_id,
@@ -610,7 +638,7 @@ async fn replacement_and_cancellation_are_durable_before_each_broadcast() {
         &config.app.execution,
         PendingAttemptRequest {
             pending: replaced_pending,
-            expected_state: morpho_v2_reallocator::storage::models::TransactionState::Replaced,
+            expected_state: morpho_v2_reallocator::storage::models::TransactionState::Submitted,
             decision: PendingDecision::Cancel(CancellationReason::PendingHorizon),
             signer_request_id: B256::repeat_byte(0xc3),
             max_fee_per_gas: 4_000_000_000,
@@ -730,7 +758,10 @@ async fn remote_signer_response_is_recovered_and_every_signed_field_is_checked()
         .await;
     let policy = RemoteSignerPolicy {
         chain_id: config.app.chain.chain_id,
-        signer_vaults: BTreeMap::from([(signer.address(), config.app.vaults[0].address.0)]),
+        signer_vaults: BTreeMap::from([(
+            signer.address(),
+            BTreeSet::from([config.app.vaults[0].address.0]),
+        )]),
         maximum_gas_limit: config.app.execution.maximum_signed_transaction_gas,
         maximum_fee_per_gas: u128::MAX,
     };
@@ -809,7 +840,10 @@ async fn signer_allows_only_identical_replacement_and_known_nonce_cancellation()
     );
     let policy = RemoteSignerPolicy {
         chain_id: config.app.chain.chain_id,
-        signer_vaults: BTreeMap::from([(signer.address(), config.app.vaults[0].address.0)]),
+        signer_vaults: BTreeMap::from([(
+            signer.address(),
+            BTreeSet::from([config.app.vaults[0].address.0]),
+        )]),
         maximum_gas_limit: config.app.execution.maximum_signed_transaction_gas,
         maximum_fee_per_gas: u128::MAX,
     };

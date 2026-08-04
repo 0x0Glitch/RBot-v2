@@ -23,6 +23,10 @@ pub const SECONDS_PER_YEAR: u64 = 31_536_000;
 /// Exact fixed-point scale.
 pub const WAD: u64 = 1_000_000_000_000_000_000;
 
+const fn default_identical_rebroadcast_after_fast_blocks() -> u64 {
+    1
+}
+
 /// Returns whether a chain is explicitly allowed to use the test-only local signer.
 #[must_use]
 pub const fn is_test_chain_id(chain_id: u64) -> bool {
@@ -202,6 +206,9 @@ pub struct ExecutionConfig {
     pub maximum_capital_deployment_pending_fast_blocks: u64,
     /// Liquidity-plan pending horizon.
     pub maximum_liquidity_maintenance_pending_fast_blocks: u64,
+    /// Delay before rebroadcasting byte-identical durable signed bytes.
+    #[serde(default = "default_identical_rebroadcast_after_fast_blocks")]
+    pub identical_rebroadcast_after_fast_blocks: u64,
     /// Replacement delay in fast blocks.
     pub replacement_after_fast_blocks: u64,
     /// Cancellation threshold in remaining fast blocks.
@@ -629,6 +636,8 @@ pub struct ValidatedExecutionConfig {
     pub maximum_capital_deployment_pending_fast_blocks: u64,
     /// Liquidity pending horizon.
     pub maximum_liquidity_maintenance_pending_fast_blocks: u64,
+    /// Byte-identical rebroadcast delay.
+    pub identical_rebroadcast_after_fast_blocks: u64,
     /// Replacement delay.
     pub replacement_after_fast_blocks: u64,
     /// Cancellation threshold.
@@ -941,6 +950,9 @@ impl AppConfig {
             maximum_liquidity_maintenance_pending_fast_blocks: self
                 .execution
                 .maximum_liquidity_maintenance_pending_fast_blocks,
+            identical_rebroadcast_after_fast_blocks: self
+                .execution
+                .identical_rebroadcast_after_fast_blocks,
             replacement_after_fast_blocks: self.execution.replacement_after_fast_blocks,
             cancel_when_fast_blocks_remaining: self.execution.cancel_when_fast_blocks_remaining,
             receipt_confirmation_evm_blocks: self.execution.receipt_confirmation_evm_blocks,
@@ -1005,14 +1017,21 @@ impl AppConfig {
             })
             .ok_or(ArithmeticError::Overflow)?;
 
-        let mut signers = BTreeSet::new();
+        let mut vault_addresses = BTreeSet::new();
+        let mut shared_signer = None;
         let mut vaults = Vec::with_capacity(self.vault.len());
         for vault in self.vault {
             let validated = validate_vault(vault, required_reward_validity)?;
-            if !signers.insert(validated.signer_address) {
+            if !vault_addresses.insert(validated.address) {
+                return Err(validation("vault.address", "vault address is duplicated"));
+            }
+            if shared_signer
+                .replace(validated.signer_address)
+                .is_some_and(|signer| signer != validated.signer_address)
+            {
                 return Err(validation(
                     "vault.signer_address",
-                    "signer address is duplicated across vaults",
+                    "all managed vaults must share one allocator signer",
                 ));
             }
             vaults.push(validated);
@@ -1202,6 +1221,15 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
         return Err(validation(
             "execution.maximum_rate_rebalance_pending_fast_blocks",
             "rate pending horizon exceeds normal inclusion horizon",
+        ));
+    }
+    if config.execution.identical_rebroadcast_after_fast_blocks == 0
+        || config.execution.identical_rebroadcast_after_fast_blocks
+            > config.execution.replacement_after_fast_blocks
+    {
+        return Err(validation(
+            "execution.identical_rebroadcast_after_fast_blocks",
+            "must be positive and no later than fee replacement",
         ));
     }
     if config.strategy.entry_spread_apr_bps <= config.strategy.target_spread_apr_bps {

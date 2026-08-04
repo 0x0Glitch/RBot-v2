@@ -478,9 +478,19 @@ pub async fn execute_one_head_preflight(
     {
         return Err(PreflightError::Latency);
     }
-    let submitted_hash = submitter
-        .submit_signed_bytes(&signed.raw_transaction)
+    let submission = submitter.submit_signed_bytes(&signed.raw_transaction).await;
+    storage
+        .record_attempt_broadcast(
+            request.transaction_id,
+            signed.transaction_hash,
+            request.created_at,
+            head.number,
+        )
         .await?;
+    let submitted_hash = submission?;
+    if submitted_hash != signed.transaction_hash {
+        return Err(PreflightError::SubmissionHash);
+    }
     storage
         .transition_transaction(TransactionTransition {
             transaction_id: request.transaction_id,
@@ -493,9 +503,6 @@ pub async fn execute_one_head_preflight(
             updated_at: request.created_at,
         })
         .await?;
-    if submitted_hash != signed.transaction_hash {
-        return Err(PreflightError::SubmissionHash);
-    }
     if sign_started.elapsed().as_millis()
         > config.app.snapshot.maximum_sign_to_broadcast_latency_millis
     {

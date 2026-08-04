@@ -215,6 +215,8 @@ pub enum TransactionState {
     Reconciled = 11,
     /// Terminal operational failure.
     Failed = 12,
+    /// The reserved nonce was canonically consumed by an unknown transaction.
+    ForeignNonceConsumed = 13,
 }
 
 impl TransactionState {
@@ -232,6 +234,7 @@ impl TransactionState {
                 | Self::Confirmed
                 | Self::Orphaned
                 | Self::ConformanceValidated
+                | Self::ForeignNonceConsumed
         )
     }
 
@@ -245,13 +248,17 @@ impl TransactionState {
                     Self::AbortedBeforeSigning | Self::Signed | Self::Failed
                 )
             }
-            Self::Signed => matches!(next, Self::Submitted | Self::Failed),
+            Self::Signed => matches!(
+                next,
+                Self::Submitted | Self::ForeignNonceConsumed | Self::Failed
+            ),
             Self::Submitted => matches!(
                 next,
                 Self::Replaced
                     | Self::CancellationSubmitted
                     | Self::Included
                     | Self::Reverted
+                    | Self::ForeignNonceConsumed
                     | Self::Failed
             ),
             Self::Replaced => matches!(
@@ -261,10 +268,14 @@ impl TransactionState {
                     | Self::Included
                     | Self::Reverted
                     | Self::Orphaned
+                    | Self::ForeignNonceConsumed
                     | Self::Failed
             ),
             Self::CancellationSubmitted => {
-                matches!(next, Self::Included | Self::Reverted | Self::Failed)
+                matches!(
+                    next,
+                    Self::Included | Self::Reverted | Self::ForeignNonceConsumed | Self::Failed
+                )
             }
             Self::Included => matches!(
                 next,
@@ -277,10 +288,15 @@ impl TransactionState {
                     | Self::CancellationSubmitted
                     | Self::Included
                     | Self::Reverted
+                    | Self::ForeignNonceConsumed
                     | Self::Failed
             ),
             Self::ConformanceValidated => matches!(next, Self::Reconciled | Self::Failed),
-            Self::AbortedBeforeSigning | Self::Reverted | Self::Reconciled | Self::Failed => false,
+            Self::AbortedBeforeSigning
+            | Self::Reverted
+            | Self::Reconciled
+            | Self::Failed
+            | Self::ForeignNonceConsumed => false,
         }
     }
 }
@@ -425,6 +441,9 @@ pub struct SignedAttemptRecord {
     pub signed_block: u64,
     /// Durable broadcast timestamp, populated only after submission returns.
     pub broadcast_at: Option<u64>,
+    /// Canonical block at the latest byte-identical submission attempt.
+    #[serde(default)]
+    pub last_broadcast_block: Option<u64>,
 }
 
 /// Checked state transition with optional inclusion/submission facts.
@@ -453,6 +472,8 @@ pub struct TransactionTransition {
 pub struct UnresolvedTransaction {
     /// Stable lifecycle ID.
     pub transaction_id: TransactionId,
+    /// Vault whose routine action owns the shared signer lane.
+    pub vault: VaultAddress,
     /// Signer.
     pub signer: Address,
     /// Nonce.
@@ -489,6 +510,8 @@ pub struct UnresolvedTransaction {
     pub created_block: u64,
     /// Canonical head number used for the latest durable signed attempt.
     pub last_attempt_block: u64,
+    /// Canonical block at the latest byte-identical submission attempt.
+    pub last_broadcast_block: Option<u64>,
     /// Restricted kind of the latest durable signed attempt.
     pub last_attempt_kind: TransactionAttemptKind,
 }

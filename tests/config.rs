@@ -41,6 +41,24 @@ fn representative_configuration_validates_and_hashes_deterministically() {
 }
 
 #[test]
+fn one_allocator_may_own_multiple_distinct_vaults() {
+    let mut config = raw_example();
+    let mut second = config.vault[0].clone();
+    second.address = "0x0000000000000000000000000000000000000200".to_owned();
+    assert_eq!(second.signer_address, config.vault[0].signer_address);
+    config.vault.push(second);
+    let validated = match config.validate() {
+        Ok(validated) => validated,
+        Err(error) => panic!("shared allocator configuration must validate: {error}"),
+    };
+    assert_eq!(validated.app.vaults.len(), 2);
+    assert_eq!(
+        validated.app.vaults[0].signer_address,
+        validated.app.vaults[1].signer_address
+    );
+}
+
+#[test]
 fn unknown_field_is_rejected() {
     let text = match std::fs::read_to_string(example_path()) {
         Ok(text) => text,

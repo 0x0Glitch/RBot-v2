@@ -88,6 +88,7 @@ fn fixture() -> Fixture {
         to: Some(vault.0),
         value: U256::ZERO,
         input: transaction.calldata.clone(),
+        nonce: "0x7".to_owned(),
         block_hash: Some(block_hash),
         block_number: Some("0x64".to_owned()),
         transaction_index: Some("0x3".to_owned()),

@@ -64,6 +64,7 @@
     "maximum_rate_rebalance_pending_fast_blocks": 1,
     "maximum_capital_deployment_pending_fast_blocks": 2,
     "maximum_liquidity_maintenance_pending_fast_blocks": 2,
+    "identical_rebroadcast_after_fast_blocks": 1,
     "replacement_after_fast_blocks": 1,
     "cancel_when_fast_blocks_remaining": 1,
     "receipt_confirmation_evm_blocks": 2,
@@ -202,4 +203,3 @@
     }
   ]
 }
-

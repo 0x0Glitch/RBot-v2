@@ -192,6 +192,20 @@ pub enum PendingDecision {
     Cancel(CancellationReason),
 }
 
+/// Result of submitting an already-durable replacement or cancellation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingAttemptOutcome {
+    /// The provider acknowledged the exact locally-derived transaction hash.
+    Broadcast(B256),
+    /// Submission returned an error after durability, so receipt/nonce recovery must decide.
+    SubmissionIndeterminate {
+        /// Exact durable local transaction hash.
+        transaction_hash: B256,
+        /// Sanitized provider action category.
+        category: crate::chain::provider::RpcErrorCategory,
+    },
+}
+
 /// Pending-clock or execution failure.
 #[derive(Debug, Error)]
 pub enum PendingPolicyError {
@@ -302,7 +316,7 @@ pub async fn execute_pending_attempt(
     submitter: &dyn SignedTransactionSubmitter,
     execution: &ValidatedExecutionConfig,
     request: PendingAttemptRequest,
-) -> Result<B256, PendingPolicyError> {
+) -> Result<PendingAttemptOutcome, PendingPolicyError> {
     if !matches!(
         request.expected_state,
         TransactionState::Submitted | TransactionState::Replaced
@@ -363,11 +377,36 @@ pub async fn execute_pending_attempt(
             signed_at: request.created_at,
             signed_block: request.signed_block,
             broadcast_at: None,
+            last_broadcast_block: None,
         })
         .await?;
-    let submitted_hash = submitter
-        .submit_signed_bytes(&signed.raw_transaction)
+    let submission = submitter.submit_signed_bytes(&signed.raw_transaction).await;
+    storage
+        .record_attempt_broadcast(
+            transaction_id,
+            signed.transaction_hash,
+            request.created_at,
+            request.signed_block,
+        )
         .await?;
+    let submitted_hash = match submission {
+        Ok(hash) => hash,
+        Err(error)
+            if error.rpc_category() == crate::chain::provider::RpcErrorCategory::AlreadyKnown =>
+        {
+            signed.transaction_hash
+        }
+        Err(error) => {
+            // An RPC submission error is ambiguous: the node may have accepted the bytes
+            // before its response failed, or another same-nonce attempt may already be
+            // canonical. The exact attempt is durable, so leave the nonce lane unresolved
+            // and let canonical receipt/nonce recovery decide on the next controller tick.
+            return Ok(PendingAttemptOutcome::SubmissionIndeterminate {
+                transaction_hash: signed.transaction_hash,
+                category: error.rpc_category(),
+            });
+        }
+    };
     if submitted_hash != signed.transaction_hash {
         return Err(PendingPolicyError::SubmissionHash);
     }
@@ -383,7 +422,7 @@ pub async fn execute_pending_attempt(
             updated_at: request.created_at,
         })
         .await?;
-    Ok(submitted_hash)
+    Ok(PendingAttemptOutcome::Broadcast(submitted_hash))
 }
 
 #[cfg(test)]

@@ -1,6 +1,9 @@
 //! Authenticated remote signer client and strict response verification.
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use alloy::primitives::{Address, B256, Bytes, TxKind};
 use async_trait::async_trait;
@@ -27,7 +30,7 @@ pub struct RemoteSignerPolicy {
     /// Only accepted EVM chain.
     pub chain_id: u64,
     /// Dedicated signer-to-vault routing table.
-    pub signer_vaults: BTreeMap<Address, Address>,
+    pub signer_vaults: BTreeMap<Address, BTreeSet<Address>>,
     /// Absolute signed gas bound.
     pub maximum_gas_limit: u64,
     /// Absolute EIP-1559 fee bound.
@@ -55,7 +58,7 @@ impl RemoteRoutineSigner {
         &self,
         expected: ExpectedSignedTransaction,
     ) -> Result<SignedEnvelope, SignerError> {
-        let expected_vault = self
+        let expected_vaults = self
             .policy
             .signer_vaults
             .get(&expected.expected_signer)
@@ -67,7 +70,7 @@ impl RemoteRoutineSigner {
         let target_valid = if expected.purpose == "same_nonce_cancellation" {
             expected_target == expected.expected_signer
         } else {
-            expected_target == *expected_vault && expected.vault == *expected_vault
+            expected_target == expected.vault && expected_vaults.contains(&expected.vault)
         };
         if expected.transaction.chain_id != self.policy.chain_id
             || !target_valid

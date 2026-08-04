@@ -30,7 +30,11 @@ use crate::{
         snapshot::{SnapshotBlueprint, SnapshotError, bind_idle_lock_ledger, build_exact_snapshot},
         topology::{EventLocation, TopologyError, TopologyIndex},
     },
-    storage::{StorageError, actor::StorageHandle, models::CanonicalLogRecord},
+    storage::{
+        StorageError,
+        actor::StorageHandle,
+        models::{CanonicalLogRecord, TransactionState, UnresolvedTransaction},
+    },
     telemetry::{
         alerts::{Alert, AlertDispatcher, AlertKind, AlertSeverity},
         health::HealthState,
@@ -464,28 +468,27 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                     .map(|market| &market.spot_borrow_rate),
             );
             self.api.record_snapshot(snapshot.clone()).await;
-            let pending_transaction = self
-                .storage
-                .load_unresolved(vault.signer_address)
-                .await?
-                .is_some();
+            let pending_transaction = self.storage.load_unresolved(vault.signer_address).await?;
             let desired = desired_runtime_state(
                 self.config.app.node.mode,
                 &snapshot,
                 self.signer_ready,
-                pending_transaction,
+                pending_transaction.as_ref(),
             );
             let reason = runtime_reason(
                 self.config.app.node.mode,
                 &snapshot,
                 self.signer_ready,
-                pending_transaction,
+                pending_transaction.as_ref(),
             );
             self.runtime
                 .update(vault.address, |status| {
                     status.canonical_head = Some(head);
                     status.snapshot_hash = Some(snapshot.snapshot_hash);
                     status.current_rate_spread = Some(spread);
+                    status.transaction_id = pending_transaction
+                        .as_ref()
+                        .map(|pending| pending.transaction_id);
                     status.transition(desired, reason)
                 })
                 .await?;
@@ -786,13 +789,21 @@ fn desired_runtime_state(
     mode: RuntimeMode,
     snapshot: &crate::domain::ExactVaultSnapshot,
     signer_ready: bool,
-    pending_transaction: bool,
+    pending_transaction: Option<&UnresolvedTransaction>,
 ) -> RuntimeVaultState {
     match mode {
         RuntimeMode::Observe => RuntimeVaultState::Observe,
         RuntimeMode::Shadow if snapshot.capabilities.can_project => RuntimeVaultState::Shadow,
         RuntimeMode::Shadow => RuntimeVaultState::PausedUnsupportedConfiguration,
-        RuntimeMode::Execute if pending_transaction => RuntimeVaultState::PendingTransaction,
+        RuntimeMode::Execute
+            if pending_transaction
+                .is_some_and(|pending| pending.state == TransactionState::ForeignNonceConsumed) =>
+        {
+            RuntimeVaultState::PausedSignerFailure
+        }
+        RuntimeMode::Execute if pending_transaction.is_some() => {
+            RuntimeVaultState::PendingTransaction
+        }
         RuntimeMode::Execute if !snapshot.idle_locks.verified => {
             RuntimeVaultState::LockAccountingUncertain
         }
@@ -813,12 +824,18 @@ fn runtime_reason(
     mode: RuntimeMode,
     snapshot: &crate::domain::ExactVaultSnapshot,
     signer_ready: bool,
-    pending_transaction: bool,
+    pending_transaction: Option<&UnresolvedTransaction>,
 ) -> Option<String> {
     match mode {
         RuntimeMode::Observe => None,
         RuntimeMode::Shadow if snapshot.capabilities.can_project => None,
-        RuntimeMode::Execute if pending_transaction => {
+        RuntimeMode::Execute
+            if pending_transaction
+                .is_some_and(|pending| pending.state == TransactionState::ForeignNonceConsumed) =>
+        {
+            Some("configured signer nonce was consumed outside the durable lane".to_owned())
+        }
+        RuntimeMode::Execute if pending_transaction.is_some() => {
             Some("durable transaction lifecycle is unresolved".to_owned())
         }
         RuntimeMode::Execute if !snapshot.idle_locks.verified => {

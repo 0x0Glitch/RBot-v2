@@ -115,12 +115,44 @@ pub struct RpcTransaction {
     pub value: U256,
     /// Complete input calldata.
     pub input: Bytes,
+    /// Sender nonce as an EVM quantity.
+    pub nonce: String,
     /// Canonical inclusion block hash.
     pub block_hash: Option<B256>,
     /// Canonical inclusion block number quantity.
     pub block_number: Option<String>,
     /// Transaction index quantity.
     pub transaction_index: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct RpcBlockWithTransactions {
+    hash: B256,
+    number: String,
+    transactions: Vec<RpcTransaction>,
+}
+
+/// Secret-free normalized action category for a JSON-RPC submission failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpcErrorCategory {
+    /// The exact transaction is already present at the provider.
+    AlreadyKnown,
+    /// The canonical or provider nonce is already above the submitted nonce.
+    NonceTooLow,
+    /// Another same-nonce transaction needs a larger fee bump.
+    ReplacementUnderpriced,
+    /// The signer cannot currently fund the transaction's maximum cost.
+    InsufficientFunds,
+    /// The signed envelope is malformed or does not recover to a valid sender.
+    InvalidSenderOrEncoding,
+    /// Provider request quota was exceeded.
+    RateLimited,
+    /// Provider server failed transiently.
+    ServerUnavailable,
+    /// Transport, connection, or request timeout.
+    TransportUnavailable,
+    /// No safe provider-specific interpretation is available.
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -234,6 +266,8 @@ pub enum ProviderError {
         method: &'static str,
         /// JSON-RPC error code.
         code: i64,
+        /// Sanitized action category derived from the provider response.
+        category: RpcErrorCategory,
     },
     /// A requested block was not returned.
     #[error("provider did not return requested block")]
@@ -255,6 +289,22 @@ pub enum ProviderError {
     /// HyperEVM reports the configured signer uses big blocks.
     #[error("configured signer is opted into HyperEVM big blocks")]
     SignerUsesBigBlocks,
+}
+
+impl ProviderError {
+    /// Returns the secret-free operational action category for submission recovery.
+    #[must_use]
+    pub const fn rpc_category(&self) -> RpcErrorCategory {
+        match self {
+            Self::Rpc { category, .. } => *category,
+            Self::Transport { .. } => RpcErrorCategory::TransportUnavailable,
+            Self::HttpStatus { status: 429, .. } => RpcErrorCategory::RateLimited,
+            Self::HttpStatus {
+                status: 500..=599, ..
+            } => RpcErrorCategory::ServerUnavailable,
+            _ => RpcErrorCategory::Unknown,
+        }
+    }
 }
 
 /// Read-only data surface required by canonical chain ingestion.
@@ -290,6 +340,14 @@ pub trait TransactionLookupProvider: Send + Sync {
     async fn transaction_by_hash(
         &self,
         hash: B256,
+    ) -> Result<Option<RpcTransaction>, ProviderError>;
+
+    /// Finds a transaction by sender and nonce in one exact canonical block.
+    async fn transaction_by_sender_nonce_in_block(
+        &self,
+        signer: Address,
+        nonce: u64,
+        block: BlockRef,
     ) -> Result<Option<RpcTransaction>, ProviderError>;
 }
 
@@ -330,6 +388,13 @@ pub trait SignedTransactionSubmitter: Send + Sync {
 pub trait AccountNonceProvider: Send + Sync {
     /// Returns the latest canonical account nonce for one configured signer.
     async fn account_nonce(&self, signer: Address) -> Result<u64, ProviderError>;
+
+    /// Returns the account nonce at one exact canonical block hash.
+    async fn account_nonce_at(
+        &self,
+        signer: Address,
+        block: BlockRef,
+    ) -> Result<u64, ProviderError>;
 }
 
 /// Role-scoped HTTP provider.
@@ -684,6 +749,7 @@ impl HttpProvider {
             return Err(ProviderError::Rpc {
                 method,
                 code: error.code,
+                category: classify_rpc_error(method, error.code, &error.message),
             });
         }
         serde_json::from_value(envelope.result).map_err(|_| ProviderError::MalformedResponse)
@@ -802,6 +868,42 @@ impl TransactionLookupProvider for HttpProvider {
         self.request_unscoped("eth_getTransactionByHash", json!([hash]))
             .await
     }
+
+    async fn transaction_by_sender_nonce_in_block(
+        &self,
+        signer: Address,
+        nonce: u64,
+        block: BlockRef,
+    ) -> Result<Option<RpcTransaction>, ProviderError> {
+        self.require_any_role(&[ProviderRole::Receipt, ProviderRole::Checkpoint])?;
+        let observed: Option<RpcBlockWithTransactions> = self
+            .request_unscoped(
+                "eth_getBlockByNumber",
+                json!([format_quantity(block.number), true]),
+            )
+            .await?;
+        let observed = observed.ok_or(ProviderError::MissingBlock)?;
+        if observed.hash != block.hash
+            || parse_quantity("block.number", &observed.number)? != block.number
+        {
+            return Err(ProviderError::MissingBlock);
+        }
+        let mut matching = observed
+            .transactions
+            .into_iter()
+            .filter(|transaction| transaction.from == signer)
+            .filter_map(|transaction| {
+                parse_quantity("transaction.nonce", &transaction.nonce)
+                    .ok()
+                    .filter(|observed_nonce| *observed_nonce == nonce)
+                    .map(|_| transaction)
+            });
+        let found = matching.next();
+        if matching.next().is_some() {
+            return Err(ProviderError::MalformedResponse);
+        }
+        Ok(found)
+    }
 }
 
 #[async_trait]
@@ -868,6 +970,24 @@ impl AccountNonceProvider for HttpProvider {
     async fn account_nonce(&self, signer: Address) -> Result<u64, ProviderError> {
         self.transaction_count(signer).await
     }
+
+    async fn account_nonce_at(
+        &self,
+        signer: Address,
+        block: BlockRef,
+    ) -> Result<u64, ProviderError> {
+        let quantity: String = self
+            .request(
+                ProviderRole::Read,
+                "eth_getTransactionCount",
+                json!([signer, {
+                    "blockHash": block.hash,
+                    "requireCanonical": true,
+                }]),
+            )
+            .await?;
+        parse_quantity("eth_getTransactionCount", &quantity)
+    }
 }
 
 #[derive(Serialize)]
@@ -890,6 +1010,43 @@ struct RpcResponse {
 #[derive(Deserialize)]
 struct RpcError {
     code: i64,
+    #[serde(default)]
+    message: String,
+}
+
+fn classify_rpc_error(method: &'static str, code: i64, message: &str) -> RpcErrorCategory {
+    if method != "eth_sendRawTransaction" {
+        return RpcErrorCategory::Unknown;
+    }
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("already known")
+        || normalized.contains("known transaction")
+        || normalized.contains("already imported")
+    {
+        RpcErrorCategory::AlreadyKnown
+    } else if normalized.contains("nonce too low")
+        || normalized.contains("nonce has already been used")
+        || normalized.contains("old nonce")
+    {
+        RpcErrorCategory::NonceTooLow
+    } else if normalized.contains("replacement transaction underpriced")
+        || normalized.contains("replacement underpriced")
+        || normalized.contains("transaction underpriced")
+    {
+        RpcErrorCategory::ReplacementUnderpriced
+    } else if normalized.contains("insufficient funds") || normalized.contains("funds for gas") {
+        RpcErrorCategory::InsufficientFunds
+    } else if normalized.contains("invalid sender")
+        || normalized.contains("invalid signature")
+        || normalized.contains("invalid transaction encoding")
+        || normalized.contains("rlp")
+    {
+        RpcErrorCategory::InvalidSenderOrEncoding
+    } else if code == 429 || normalized.contains("rate limit") {
+        RpcErrorCategory::RateLimited
+    } else {
+        RpcErrorCategory::Unknown
+    }
 }
 
 fn build_client() -> Result<Client, ProviderError> {

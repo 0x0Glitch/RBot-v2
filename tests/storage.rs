@@ -785,6 +785,7 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
             signed_at: 12,
             signed_block: 12,
             broadcast_at: None,
+            last_broadcast_block: None,
         })
         .await?;
     service.shutdown().await?;
@@ -837,6 +838,7 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
             signed_at: 14,
             signed_block: 14,
             broadcast_at: None,
+            last_broadcast_block: None,
         })
         .await?;
     handle

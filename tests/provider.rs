@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use alloy::primitives::{Address, B256, Bytes};
 use morpho_v2_reallocator::chain::provider::{
-    CapabilityProbe, ChainDataProvider, HttpProvider, ProviderError, ProviderRole,
+    CapabilityProbe, ChainDataProvider, HttpProvider, ProviderError, ProviderRole, RpcErrorCategory,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -46,6 +46,23 @@ impl Respond for RpcResponder {
             };
         ResponseTemplate::new(200)
             .set_body_json(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    }
+}
+
+#[derive(Clone)]
+struct SubmissionErrorResponder {
+    message: &'static str,
+}
+
+impl Respond for SubmissionErrorResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let id = body.get("id").cloned().unwrap_or(json!(1));
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32000, "message": self.message }
+        }))
     }
 }
 
@@ -171,5 +188,45 @@ async fn forbidden_optional_block_receipts_are_treated_as_unsupported()
         })
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn submission_errors_are_sanitized_into_recovery_categories()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (message, expected) in [
+        ("already known", RpcErrorCategory::AlreadyKnown),
+        ("nonce too low", RpcErrorCategory::NonceTooLow),
+        (
+            "replacement transaction underpriced",
+            RpcErrorCategory::ReplacementUnderpriced,
+        ),
+        (
+            "insufficient funds for gas * price + value",
+            RpcErrorCategory::InsufficientFunds,
+        ),
+        ("invalid sender", RpcErrorCategory::InvalidSenderOrEncoding),
+        ("provider-specific rejection", RpcErrorCategory::Unknown),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(SubmissionErrorResponder { message })
+            .mount(&server)
+            .await;
+        let provider = HttpProvider::new(
+            "submission".to_owned(),
+            Url::parse(&server.uri())?,
+            BTreeSet::from([ProviderRole::Submit]),
+        )?;
+        let error = match provider
+            .send_raw_transaction(&Bytes::from_static(&[0x02, 0x01]))
+            .await
+        {
+            Ok(_) => panic!("mock submission must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.rpc_category(), expected);
+        assert!(!error.to_string().contains(message));
+    }
     Ok(())
 }

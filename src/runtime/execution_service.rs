@@ -1,6 +1,6 @@
 //! Restricted local-development execution and durable canonical lifecycle advancement.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use async_trait::async_trait;
@@ -12,8 +12,9 @@ use crate::{
         logs::{EventDecodeError, EventSource, RawEventLog, StateInvalidation, decode_event},
         multicall::AtomicSnapshotProvider,
         provider::{
-            AccountNonceProvider, ChainDataProvider, ProviderError, SignedTransactionSubmitter,
-            TransactionLookupProvider, TransactionSimulationProvider, parse_quantity,
+            AccountNonceProvider, ChainDataProvider, ProviderError, RpcErrorCategory,
+            SignedTransactionSubmitter, TransactionLookupProvider, TransactionSimulationProvider,
+            parse_quantity,
         },
         receipts::validate_receipt,
     },
@@ -51,9 +52,9 @@ use crate::{
         },
         firewall::{RoutineTransactionFields, validate_plan, validate_routine_transaction},
         pending::{
-            CancellationReason, FastBlockOpportunity, PendingAttemptRequest, PendingClock,
-            PendingDecision, PendingPolicyError, PendingSafetySignals, TouchedResources,
-            assess_pending, execute_pending_attempt,
+            CancellationReason, FastBlockOpportunity, PendingAttemptOutcome, PendingAttemptRequest,
+            PendingClock, PendingDecision, PendingPolicyError, PendingSafetySignals,
+            TouchedResources, assess_pending, execute_pending_attempt,
         },
         signer::{RoutineSigner, ValidatedPendingTransaction},
     },
@@ -98,6 +99,29 @@ pub enum ExecutionServiceError {
     /// Durable recovery data is incomplete or internally inconsistent.
     #[error("durable transaction recovery evidence is incomplete")]
     Recovery,
+}
+
+impl ExecutionServiceError {
+    /// Returns whether continuing could violate a local durability or code invariant.
+    #[must_use]
+    pub const fn is_process_fatal(&self) -> bool {
+        match self {
+            Self::Storage(_) | Self::Controller(_) | Self::FeeRange | Self::Recovery => true,
+            Self::Preflight(PreflightError::Storage(_))
+            | Self::Pending(PendingPolicyError::Storage(_))
+            | Self::Receipt(ReceiptTrackingError::Storage(_))
+            | Self::Conformance(ReceiptReconciliationError::Storage(_))
+            | Self::CurrentState(CurrentStateError::Storage(_)) => true,
+            Self::Provider(_)
+            | Self::Chain(_)
+            | Self::Preflight(_)
+            | Self::Receipt(_)
+            | Self::Conformance(_)
+            | Self::CurrentState(_)
+            | Self::Pending(_)
+            | Self::DailyGasBudget => false,
+        }
+    }
 }
 
 /// Simulation adapter that enforces HyperEVM lane checks only on chain 999.
@@ -204,24 +228,43 @@ where
 {
     /// Advances every signer lane once, or releases one newly eligible exact rate plan.
     pub async fn tick(&self) -> Result<(), ExecutionServiceError> {
-        for vault in &self.config.app.vaults {
-            if let Some(pending) = self.storage.load_unresolved(vault.signer_address).await? {
-                self.advance_pending(vault.address, pending).await?;
+        let mut processed_signers = BTreeSet::new();
+        for signer in self
+            .config
+            .app
+            .vaults
+            .iter()
+            .map(|vault| vault.signer_address)
+        {
+            if !processed_signers.insert(signer) {
                 continue;
             }
-            let status = self.runtime.get(vault.address).await;
-            let ready = status
-                .as_ref()
-                .is_some_and(|status| status.state.can_start_transaction());
-            let plan_reason = self.api.plan(vault.address).await.and_then(|plan| {
-                status
+            if let Some(pending) = self.storage.load_unresolved(signer).await? {
+                self.advance_pending(pending.vault, pending).await?;
+                continue;
+            }
+            for vault in self
+                .config
+                .app
+                .vaults
+                .iter()
+                .filter(|vault| vault.signer_address == signer)
+            {
+                let status = self.runtime.get(vault.address).await;
+                let ready = status
                     .as_ref()
-                    .and_then(|status| status.canonical_head)
-                    .filter(|head| plan.snapshot.block == *head)
-                    .map(|_| plan.reason)
-            });
-            if ready && let Some(reason) = plan_reason {
-                self.execute(vault.address, reason).await?;
+                    .is_some_and(|status| status.state.can_start_transaction());
+                let plan_reason = self.api.plan(vault.address).await.and_then(|plan| {
+                    status
+                        .as_ref()
+                        .and_then(|status| status.canonical_head)
+                        .filter(|head| plan.snapshot.block == *head)
+                        .map(|_| plan.reason)
+                });
+                if ready && let Some(reason) = plan_reason {
+                    self.execute(vault.address, reason).await?;
+                    break;
+                }
             }
         }
         Ok(())
@@ -267,7 +310,7 @@ where
             Arc::clone(&self.provider),
             self.config.app.chain.chain_id == 999,
         );
-        let _submitted = execute_one_head_preflight(
+        let preflight = execute_one_head_preflight(
             self.provider.as_ref(),
             &simulator,
             self.provider.as_ref(),
@@ -286,7 +329,27 @@ where
                 created_at: head.timestamp,
             },
         )
-        .await?;
+        .await;
+        if let Err(error) = preflight {
+            if let Some(pending) = self.storage.load_unresolved(vault.signer_address).await? {
+                self.runtime
+                    .update(vault.address, |status| {
+                        status.transaction_id = Some(pending.transaction_id);
+                        status.transition(
+                            RuntimeVaultState::PendingTransaction,
+                            Some("signed nonce requires canonical recovery".to_owned()),
+                        )
+                    })
+                    .await?;
+                tracing::warn!(
+                    transaction_id = %pending.transaction_id.0,
+                    %error,
+                    "final submission was not conclusively acknowledged; durable recovery owns the signer lane"
+                );
+                return Ok(());
+            }
+            return Err(error.into());
+        }
         self.runtime
             .update(vault.address, |status| {
                 status.transaction_id = Some(transaction_id);
@@ -349,6 +412,11 @@ where
                     }
                 } else if pending.state == TransactionState::Orphaned {
                     self.recover_orphaned(vault, &pending, head).await?;
+                } else if self
+                    .reconcile_nonce_or_rebroadcast(vault, &pending, head)
+                    .await?
+                {
+                    return Ok(());
                 } else if matches!(
                     pending.state,
                     TransactionState::Submitted | TransactionState::Replaced
@@ -432,6 +500,13 @@ where
             | TransactionState::Reverted
             | TransactionState::Reconciled
             | TransactionState::Failed => return Err(ExecutionServiceError::Recovery),
+            TransactionState::ForeignNonceConsumed => {
+                self.pause_signer(
+                    vault.address,
+                    "configured signer nonce was consumed by an unknown transaction",
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -450,6 +525,7 @@ where
             if let Some(transaction) = self.provider.transaction_by_hash(expected_hash).await? {
                 if transaction.hash != expected_hash
                     || transaction.from != pending.signer
+                    || parse_quantity("transaction.nonce", &transaction.nonce)? != pending.nonce
                     || transaction.to != Some(vault.address.0)
                     || !transaction.value.is_zero()
                     || transaction.input != pending.calldata
@@ -457,17 +533,48 @@ where
                     return Err(ExecutionServiceError::Recovery);
                 }
             } else {
-                let account_nonce = self.provider.account_nonce(pending.signer).await?;
-                if account_nonce != pending.nonce {
-                    return Err(ExecutionServiceError::Recovery);
+                let account_nonce = self.provider.account_nonce_at(pending.signer, head).await?;
+                if account_nonce > pending.nonce {
+                    self.classify_consumed_nonce(vault, pending, head).await?;
+                    return Ok(());
+                }
+                if account_nonce < pending.nonce {
+                    self.pause_signer(vault.address, "canonical signer nonce moved backwards")
+                        .await?;
+                    return Ok(());
+                }
+                if !self.rebroadcast_due(pending, head).await? {
+                    return Ok(());
                 }
                 let raw = pending
                     .raw_signed_transaction
                     .as_ref()
                     .ok_or(ExecutionServiceError::Recovery)?;
-                let submitted = self.provider.submit_signed_bytes(raw).await?;
-                if submitted != expected_hash {
-                    return Err(ExecutionServiceError::Recovery);
+                let submission = self.provider.submit_signed_bytes(raw).await;
+                self.storage
+                    .record_attempt_broadcast(
+                        pending.transaction_id,
+                        expected_hash,
+                        head.timestamp,
+                        head.number,
+                    )
+                    .await?;
+                match submission {
+                    Ok(submitted) if submitted == expected_hash => {}
+                    Ok(_) => {
+                        self.pause_signer(
+                            vault.address,
+                            "provider returned a mismatched signed transaction hash",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(error) if error.rpc_category() == RpcErrorCategory::AlreadyKnown => {}
+                    Err(error) => {
+                        self.handle_submission_error(vault.address, pending, &error)
+                            .await?;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -484,6 +591,184 @@ where
             })
             .await?;
         Ok(())
+    }
+
+    async fn reconcile_nonce_or_rebroadcast(
+        &self,
+        vault: &crate::config::ValidatedVaultConfig,
+        pending: &crate::storage::models::UnresolvedTransaction,
+        head: BlockRef,
+    ) -> Result<bool, ExecutionServiceError> {
+        let account_nonce = self.provider.account_nonce_at(pending.signer, head).await?;
+        if account_nonce > pending.nonce {
+            self.classify_consumed_nonce(vault, pending, head).await?;
+            return Ok(true);
+        }
+        if account_nonce < pending.nonce {
+            self.pause_signer(vault.address, "canonical signer nonce moved backwards")
+                .await?;
+            return Ok(true);
+        }
+        let latest_hash = pending
+            .transaction_hash
+            .ok_or(ExecutionServiceError::Recovery)?;
+        if self
+            .provider
+            .transaction_by_hash(latest_hash)
+            .await?
+            .is_some()
+            || !self.rebroadcast_due(pending, head).await?
+        {
+            return Ok(false);
+        }
+        let raw = pending
+            .raw_signed_transaction
+            .as_ref()
+            .ok_or(ExecutionServiceError::Recovery)?;
+        let submission = self.provider.submit_signed_bytes(raw).await;
+        self.storage
+            .record_attempt_broadcast(
+                pending.transaction_id,
+                latest_hash,
+                head.timestamp,
+                head.number,
+            )
+            .await?;
+        match submission {
+            Ok(hash) if hash == latest_hash => {}
+            Ok(_) => {
+                self.pause_signer(
+                    vault.address,
+                    "provider returned a mismatched signed transaction hash",
+                )
+                .await?;
+            }
+            Err(error) if error.rpc_category() == RpcErrorCategory::AlreadyKnown => {}
+            Err(error) => {
+                self.handle_submission_error(vault.address, pending, &error)
+                    .await?;
+            }
+        }
+        Ok(true)
+    }
+
+    async fn rebroadcast_due(
+        &self,
+        pending: &crate::storage::models::UnresolvedTransaction,
+        head: BlockRef,
+    ) -> Result<bool, ExecutionServiceError> {
+        let from = pending
+            .last_broadcast_block
+            .unwrap_or(pending.last_attempt_block);
+        let required_gas_limit = (self.config.app.chain.chain_id == 999)
+            .then_some(self.config.app.chain.fast_block_gas_limit);
+        let elapsed = self
+            .storage
+            .count_execution_opportunities(
+                self.config.app.chain.chain_id,
+                from,
+                head.number,
+                required_gas_limit,
+            )
+            .await?;
+        Ok(elapsed
+            >= self
+                .config
+                .app
+                .execution
+                .identical_rebroadcast_after_fast_blocks)
+    }
+
+    async fn classify_consumed_nonce(
+        &self,
+        vault: &crate::config::ValidatedVaultConfig,
+        pending: &crate::storage::models::UnresolvedTransaction,
+        head: BlockRef,
+    ) -> Result<(), ExecutionServiceError> {
+        for number in pending.created_block..=head.number {
+            let Some(block) = self
+                .storage
+                .load_canonical_block(self.config.app.chain.chain_id, number)
+                .await?
+            else {
+                continue;
+            };
+            let Some(transaction) = self
+                .provider
+                .transaction_by_sender_nonce_in_block(pending.signer, pending.nonce, block)
+                .await?
+            else {
+                continue;
+            };
+            if pending.known_transaction_hashes.contains(&transaction.hash) {
+                return Ok(());
+            }
+            self.storage
+                .transition_transaction(TransactionTransition {
+                    transaction_id: pending.transaction_id,
+                    expected_state: pending.state,
+                    next_state: TransactionState::ForeignNonceConsumed,
+                    transaction_hash: Some(transaction.hash),
+                    submitted_at: None,
+                    included_block: Some(block.number),
+                    included_block_hash: Some(block.hash),
+                    updated_at: head.timestamp,
+                })
+                .await?;
+            self.pause_signer(
+                vault.address,
+                "configured signer nonce was consumed by an unknown transaction",
+            )
+            .await?;
+            return Ok(());
+        }
+        self.pause_signer(
+            vault.address,
+            "canonical nonce advanced without an attributable receipt",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn handle_submission_error(
+        &self,
+        vault: VaultAddress,
+        pending: &crate::storage::models::UnresolvedTransaction,
+        error: &ProviderError,
+    ) -> Result<(), ExecutionServiceError> {
+        let category = error.rpc_category();
+        tracing::warn!(
+            rpc_method = "eth_sendRawTransaction",
+            rpc_error_category = ?category,
+            transaction_id = %pending.transaction_id.0,
+            transaction_hash = ?pending.transaction_hash,
+            nonce = pending.nonce,
+            recovery_action = "canonical_reconciliation",
+            "durable signed-byte submission was not conclusively acknowledged"
+        );
+        if matches!(
+            category,
+            RpcErrorCategory::InsufficientFunds | RpcErrorCategory::InvalidSenderOrEncoding
+        ) {
+            self.pause_signer(vault, "signer submission requires operator intervention")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn pause_signer(
+        &self,
+        vault: VaultAddress,
+        reason: &'static str,
+    ) -> Result<(), ControllerError> {
+        self.runtime
+            .update(vault, |status| {
+                status.transition(
+                    RuntimeVaultState::PausedSignerFailure,
+                    Some(reason.to_owned()),
+                )
+            })
+            .await
     }
 
     async fn recover_orphaned(
@@ -516,6 +801,7 @@ where
             };
             if transaction.hash != latest_hash
                 || transaction.from != pending.signer
+                || parse_quantity("transaction.nonce", &transaction.nonce)? != pending.nonce
                 || transaction.to != Some(expected_target)
                 || !transaction.value.is_zero()
                 || transaction.input != expected_input
@@ -523,17 +809,48 @@ where
                 return Err(ExecutionServiceError::Recovery);
             }
         } else {
-            let account_nonce = self.provider.account_nonce(pending.signer).await?;
-            if account_nonce != pending.nonce {
-                return Err(ExecutionServiceError::Recovery);
+            let account_nonce = self.provider.account_nonce_at(pending.signer, head).await?;
+            if account_nonce > pending.nonce {
+                self.classify_consumed_nonce(vault, pending, head).await?;
+                return Ok(());
+            }
+            if account_nonce < pending.nonce {
+                self.pause_signer(vault.address, "canonical signer nonce moved backwards")
+                    .await?;
+                return Ok(());
+            }
+            if !self.rebroadcast_due(pending, head).await? {
+                return Ok(());
             }
             let raw = pending
                 .raw_signed_transaction
                 .as_ref()
                 .ok_or(ExecutionServiceError::Recovery)?;
-            let submitted = self.provider.submit_signed_bytes(raw).await?;
-            if submitted != latest_hash {
-                return Err(ExecutionServiceError::Recovery);
+            let submission = self.provider.submit_signed_bytes(raw).await;
+            self.storage
+                .record_attempt_broadcast(
+                    pending.transaction_id,
+                    latest_hash,
+                    head.timestamp,
+                    head.number,
+                )
+                .await?;
+            match submission {
+                Ok(submitted) if submitted == latest_hash => {}
+                Ok(_) => {
+                    self.pause_signer(
+                        vault.address,
+                        "provider returned a mismatched signed transaction hash",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(error) if error.rpc_category() == RpcErrorCategory::AlreadyKnown => {}
+                Err(error) => {
+                    self.handle_submission_error(vault.address, pending, &error)
+                        .await?;
+                    return Ok(());
+                }
             }
         }
         self.storage
@@ -672,7 +989,7 @@ where
         };
         self.ensure_daily_gas_budget(head.timestamp, proposed_cost)
             .await?;
-        let _ = execute_pending_attempt(
+        let outcome = execute_pending_attempt(
             &self.storage,
             self.signer.as_ref(),
             self.provider.as_ref(),
@@ -694,6 +1011,18 @@ where
             },
         )
         .await?;
+        if let PendingAttemptOutcome::SubmissionIndeterminate {
+            transaction_hash,
+            category,
+        } = outcome
+        {
+            tracing::warn!(
+                %transaction_hash,
+                transaction_id = %pending.transaction_id.0,
+                rpc_error_category = ?category,
+                "signed pending attempt submission is indeterminate; retaining the unresolved nonce lane for canonical recovery"
+            );
+        }
         Ok(())
     }
 
