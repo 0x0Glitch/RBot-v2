@@ -207,7 +207,7 @@ async fn terminal_format_one_state_migrates_atomically_to_format_two()
         .handle()
         .apply_canonical_block(
             CanonicalBlockRecord {
-                chain_id: 84532,
+                chain_id: 999,
                 block: canonical,
             },
             Vec::new(),

@@ -18,7 +18,6 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt,clippy
           targets: x86_64-unknown-linux-gnu
-      - uses: foundry-rs/foundry-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-deny
       - run: make ci

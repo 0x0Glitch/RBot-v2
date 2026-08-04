@@ -34,7 +34,7 @@ const fn default_target_tolerance_apr_bps() -> u32 {
 /// Returns whether a chain is explicitly allowed to use the test-only local signer.
 #[must_use]
 pub const fn is_test_chain_id(chain_id: u64) -> bool {
-    matches!(chain_id, 998 | 1_337 | 31_337 | 84_532 | 11_155_111)
+    matches!(chain_id, 998 | 1_337 | 31_337)
 }
 
 /// Raw application configuration loaded from strict JSON.

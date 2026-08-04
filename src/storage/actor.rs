@@ -2860,7 +2860,7 @@ mod compaction_tests {
     fn long_initial_backfill_retains_early_topology_logs() {
         let mut state = JsonState::default();
         state.canonical_logs.push(CanonicalLogRecord {
-            chain_id: 84532,
+            chain_id: 999,
             block_number: 10,
             block_hash: B256::repeat_byte(10),
             transaction_hash: B256::repeat_byte(11),
@@ -2871,7 +2871,7 @@ mod compaction_tests {
             data: Bytes::new(),
         });
         state.canonical_blocks.push(CanonicalBlockRecord {
-            chain_id: 84532,
+            chain_id: 999,
             block: BlockRef {
                 number: HOT_BLOCK_RETENTION.saturating_add(100),
                 hash: B256::repeat_byte(14),
@@ -2892,7 +2892,7 @@ mod compaction_tests {
         let mut state = JsonState::default();
         for number in [10, 11, HOT_BLOCK_RETENTION.saturating_add(100)] {
             state.canonical_blocks.push(CanonicalBlockRecord {
-                chain_id: 84532,
+                chain_id: 999,
                 block: BlockRef {
                     number,
                     hash: B256::from(U256::from(number)),
@@ -2942,7 +2942,7 @@ mod compaction_tests {
         let mut state = JsonState::default();
         for number in [11, HOT_BLOCK_RETENTION.saturating_add(100)] {
             state.canonical_blocks.push(CanonicalBlockRecord {
-                chain_id: 84532,
+                chain_id: 999,
                 block: BlockRef {
                     number,
                     hash: B256::from(U256::from(number)),
@@ -2953,7 +2953,7 @@ mod compaction_tests {
             });
         }
         state.canonical_receipts.push(CanonicalReceiptRecord {
-            chain_id: 84532,
+            chain_id: 999,
             transaction_hash: B256::repeat_byte(30),
             block_number: 11,
             block_hash: B256::from(U256::from(11_u8)),

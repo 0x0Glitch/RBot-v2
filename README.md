@@ -1,25 +1,24 @@
-# RBot-v2
+# Felix V2 Reallocator
 
-Rust reallocator for Morpho Vault V2 vaults using direct
+Rust service for rebalancing configured Felix Vault V2 vaults that use direct
 `MorphoMarketV1AdapterV2` positions.
 
-The bot is configured per EVM chain and vault deployment. It follows canonical
-heads, rebuilds exact on-chain state, plans bounded reallocations, validates the
-transaction through an independent firewall, signs, submits, confirms the
-canonical receipt, and reconciles the resulting state. Runtime state is stored
-in an atomic JSON file on disk.
+It follows canonical heads, refreshes exact on-chain state, plans bounded
+reallocations, validates calldata through an independent transaction firewall,
+submits through the configured allocator signer, confirms the canonical receipt,
+and reconciles exact post-state. Runtime state is stored as atomic JSON on disk.
 
 ## Requirements
 
 - Rust 1.97.1
 - HTTP RPC endpoint
 - WebSocket RPC endpoint for live heads
-- Deployed Morpho Vault V2, Morpho Blue, adaptive curve IRM, direct adapter,
+- Existing Felix Vault V2, Morpho Blue, adaptive curve IRM, direct adapter,
   Multicall3, and vault asset addresses
 - Runtime code hashes and pinned source identities for those contracts
 - Allocator signer credentials when Execute mode is enabled
 
-## Configure a chain
+## Configure
 
 Copy the examples and replace every placeholder with values for the target
 chain and vault:
@@ -53,10 +52,10 @@ cargo build --release --locked
   --bind 127.0.0.1:9090
 ```
 
-Start with `node.mode` set to `observe` or `shadow`. Execute mode additionally
-requires the appropriate signer and release evidence for the configured
-production profile. Startup fails closed when the chain ID, bytecode, roles,
-provider capabilities, or protocol identities do not match.
+Start with `node.mode` set to `observe` or `shadow`. Execute mode requires the
+allocator signer and release evidence for the configured production profile.
+Startup fails closed when the chain ID, bytecode, roles, provider capabilities,
+or protocol identities do not match.
 
 The operator API is read-only:
 

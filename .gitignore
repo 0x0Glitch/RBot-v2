@@ -8,8 +8,3 @@
 *.sqlite3
 *.bak
 .DS_Store
-/tests/fixtures/protocol_math/cache/
-/tests/fixtures/protocol_math/out/
-/tests/fixtures/e2e/cache/
-/tests/fixtures/e2e/out/
-/tests/fixtures/e2e/broadcast/

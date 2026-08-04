@@ -15,7 +15,19 @@ name = "morpho-v2-reallocator"
 path = "src/main.rs"
 
 [dependencies]
-alloy = { version = "=2.2.0", features = ["full"] }
+alloy = { version = "=2.2.0", default-features = false, features = [
+    "consensus",
+    "consensus-secp256k1",
+    "eips",
+    "json",
+    "provider-http",
+    "provider-ws",
+    "reqwest-rustls-tls",
+    "rpc-types-eth",
+    "signer-local",
+    "sol-types",
+    "std",
+] }
 async-trait = "0.1"
 axum = "=0.8.9"
 blake3 = "1"
@@ -44,7 +56,6 @@ url = "2"
 zeroize = "1"
 
 [dev-dependencies]
-alloy = { version = "=2.2.0", features = ["full", "node-bindings"] }
 assert_cmd = "2"
 insta = { version = "1", features = ["json"] }
 predicates = "3"

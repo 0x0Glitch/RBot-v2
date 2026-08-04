@@ -171,7 +171,7 @@ async fn forbidden_optional_block_receipts_are_treated_as_unsupported()
         .mount(&server)
         .await;
     let provider = HttpProvider::new(
-        "base-style".to_owned(),
+        "restricted-provider".to_owned(),
         Url::parse(&server.uri())?,
         BTreeSet::from([ProviderRole::Receipt]),
     )?;

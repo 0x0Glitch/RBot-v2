@@ -1,7 +1,7 @@
 //! Capability-limited signing boundary with no generic transaction method.
 
 use alloy::{
-    consensus::{TxEip1559, TxEnvelope},
+    consensus::{TxEip1559, TxEnvelope, transaction::SignerRecoverable},
     eips::eip2718::Decodable2718,
     primitives::{Address, B256, Bytes, TxKind, U256, keccak256},
 };
