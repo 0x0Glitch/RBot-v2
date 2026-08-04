@@ -144,7 +144,39 @@ pub fn validate_plan(
         .ok_or(FirewallError::Context)?;
     if plan.config_revision != config.revision
         || plan.snapshot.static_config_revision != config.revision
-        || plan.topology_revision != plan.snapshot.dynamic_topology_revision
+    {
+        return Err(FirewallError::PlanHash);
+    }
+    validate_plan_integrity(plan, vault, config.app.execution.maximum_actions)
+}
+
+/// Revalidates a previously signed plan for receipt conformance after configuration changes.
+///
+/// The signing-time configuration hash remains bound inside both the plan and its exact snapshot;
+/// it is intentionally not compared with the current process revision. This path cannot encode or
+/// sign and exists only to interpret an already-canonical known transaction.
+pub fn validate_historical_plan(
+    plan: V2Plan,
+    config: &ValidatedConfig,
+) -> Result<ValidatedPlan, FirewallError> {
+    let vault = config
+        .app
+        .vaults
+        .iter()
+        .find(|vault| vault.address == plan.vault)
+        .ok_or(FirewallError::Context)?;
+    if plan.config_revision != plan.snapshot.static_config_revision {
+        return Err(FirewallError::PlanHash);
+    }
+    validate_plan_integrity(plan, vault, config.app.execution.maximum_actions)
+}
+
+fn validate_plan_integrity(
+    plan: V2Plan,
+    vault: &ValidatedVaultConfig,
+    maximum_actions: usize,
+) -> Result<ValidatedPlan, FirewallError> {
+    if plan.topology_revision != plan.snapshot.dynamic_topology_revision
         || plan.plan_hash != canonical_plan_hash(&plan)?
     {
         return Err(FirewallError::PlanHash);
@@ -159,7 +191,7 @@ pub fn validate_plan(
     {
         return Err(FirewallError::Solver);
     }
-    validate_actions(&plan, vault, config.app.execution.maximum_actions)?;
+    validate_actions(&plan, vault, maximum_actions)?;
     Ok(ValidatedPlan(plan))
 }
 

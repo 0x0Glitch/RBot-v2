@@ -504,6 +504,45 @@ fn replay_journal(
 }
 
 fn compact_hot_state(state: &mut JsonState) {
+    let referenced_plan_ids = state
+        .transactions
+        .iter()
+        .filter(|transaction| transaction.state.is_unresolved())
+        .filter_map(|transaction| transaction.reservation.plan_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let referenced_plans = state
+        .plans
+        .iter()
+        .filter(|entry| referenced_plan_ids.contains(&entry.plan.plan_id))
+        .map(|entry| entry.plan.clone())
+        .collect::<Vec<_>>();
+    let mut pinned_blocks = state
+        .transactions
+        .iter()
+        .filter(|transaction| transaction.state.is_unresolved())
+        .flat_map(|transaction| {
+            [
+                Some(transaction.reservation.created_block),
+                transaction.included_block,
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    pinned_blocks.extend(
+        referenced_plans
+            .iter()
+            .map(|plan| plan.snapshot.block.number),
+    );
+    // A retained canonical receipt is also durable confirmation and gas-accounting evidence.
+    // Keep its exact header so receipt identity and the rolling gas clock remain independently
+    // checkable after the ordinary hot-header window has moved on.
+    pinned_blocks.extend(
+        state
+            .canonical_receipts
+            .iter()
+            .map(|receipt| receipt.block_number),
+    );
     if let Some(latest) = state
         .canonical_blocks
         .iter()
@@ -511,9 +550,9 @@ fn compact_hot_state(state: &mut JsonState) {
         .max()
     {
         let retain_from = latest.saturating_sub(HOT_BLOCK_RETENTION.saturating_sub(1));
-        state
-            .canonical_blocks
-            .retain(|record| record.block.number >= retain_from);
+        state.canonical_blocks.retain(|record| {
+            record.block.number >= retain_from || pinned_blocks.contains(&record.block.number)
+        });
         // Canonical protocol logs are the all-ever topology source. They cannot be discarded
         // merely because their blocks age out of the hot header window: a long first backfill can
         // complete before the state owner has persisted its first topology checkpoint. Keeping
@@ -521,25 +560,31 @@ fn compact_hot_state(state: &mut JsonState) {
         // every canonical header.
     }
     if state.exact_snapshots.len() > HOT_SNAPSHOT_RETENTION {
-        state
+        let ordinary_to_keep = HOT_SNAPSHOT_RETENTION.saturating_sub(referenced_plans.len());
+        let ordinary_start = state.exact_snapshots.len().saturating_sub(ordinary_to_keep);
+        state.exact_snapshots = state
             .exact_snapshots
-            .drain(..state.exact_snapshots.len() - HOT_SNAPSHOT_RETENTION);
+            .drain(..)
+            .enumerate()
+            .filter(|(index, snapshot)| {
+                *index >= ordinary_start
+                    || referenced_plans.iter().any(|plan| {
+                        snapshot.snapshot.parent.vault == plan.vault.0
+                            && snapshot.snapshot.context == plan.snapshot
+                    })
+            })
+            .map(|(_, snapshot)| snapshot)
+            .collect();
     }
     if state.plans.len() > HOT_PLAN_RETENTION {
-        let referenced = state
-            .transactions
-            .iter()
-            .filter(|transaction| transaction.state.is_unresolved())
-            .filter_map(|transaction| transaction.reservation.plan_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        let ordinary_to_keep = HOT_PLAN_RETENTION.saturating_sub(referenced.len());
+        let ordinary_to_keep = HOT_PLAN_RETENTION.saturating_sub(referenced_plan_ids.len());
         let ordinary_start = state.plans.len().saturating_sub(ordinary_to_keep);
         state.plans = state
             .plans
             .drain(..)
             .enumerate()
             .filter(|(index, plan)| {
-                *index >= ordinary_start || referenced.contains(&plan.plan.plan_id)
+                *index >= ordinary_start || referenced_plan_ids.contains(&plan.plan.plan_id)
             })
             .map(|(_, plan)| plan)
             .collect();
@@ -1943,18 +1988,11 @@ fn confirmed_gas_spend_since(
         .iter()
         .filter(|receipt| receipt.chain_id == chain_id)
     {
-        let Some(block) = state.canonical_blocks.iter().find(|record| {
+        let block = state.canonical_blocks.iter().find(|record| {
             record.chain_id == chain_id
                 && record.block.number == receipt.block_number
                 && record.block.hash == receipt.block_hash
-        }) else {
-            return Err(StorageError::Invariant(
-                "canonical receipt has no canonical block",
-            ));
-        };
-        if block.block.timestamp < since_timestamp {
-            continue;
-        }
+        });
         let attempts = state
             .transaction_attempts
             .iter()
@@ -1967,6 +2005,25 @@ fn confirmed_gas_spend_since(
             return Err(StorageError::Invariant(
                 "canonical transaction hash maps to multiple attempts",
             ));
+        }
+        let accounting_timestamp = if let Some(block) = block {
+            block.block.timestamp
+        } else {
+            // Versions before receipt-header pinning could compact a reconciled receipt's block.
+            // Its lifecycle update is at or after inclusion, so using it is conservative for the
+            // rolling spend ceiling: it can retain an old cost longer, never drop a recent cost.
+            state
+                .transactions
+                .iter()
+                .find(|transaction| {
+                    transaction.reservation.transaction_id == attempts[0].transaction_id
+                        && transaction.included_block == Some(receipt.block_number)
+                        && transaction.included_block_hash == Some(receipt.block_hash)
+                })
+                .map_or(attempts[0].signed_at, |transaction| transaction.updated_at)
+        };
+        if accounting_timestamp < since_timestamp {
+            continue;
         }
         let cost = U256::from(receipt.gas_used)
             .checked_mul(attempt.max_fee_per_gas)
@@ -2788,12 +2845,15 @@ fn persist_episode(
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod compaction_tests {
-    use alloy::primitives::{Address, B256, Bytes};
+    use alloy::primitives::{Address, B256, Bytes, U256};
 
-    use super::{HOT_BLOCK_RETENTION, JsonState, compact_hot_state};
+    use super::{HOT_BLOCK_RETENTION, JsonState, TransactionRow, compact_hot_state};
     use crate::{
-        domain::BlockRef,
-        storage::models::{CanonicalBlockRecord, CanonicalLogRecord},
+        domain::{BlockRef, TransactionId, VaultAddress},
+        storage::models::{
+            CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, NonceReservation,
+            TransactionState,
+        },
     };
 
     #[test]
@@ -2825,5 +2885,91 @@ mod compaction_tests {
 
         assert_eq!(state.canonical_logs.len(), 1);
         assert_eq!(state.canonical_logs[0].block_number, 10);
+    }
+
+    #[test]
+    fn unresolved_nonce_lane_pins_old_lifecycle_blocks() {
+        let mut state = JsonState::default();
+        for number in [10, 11, HOT_BLOCK_RETENTION.saturating_add(100)] {
+            state.canonical_blocks.push(CanonicalBlockRecord {
+                chain_id: 84532,
+                block: BlockRef {
+                    number,
+                    hash: B256::from(U256::from(number)),
+                    parent_hash: B256::ZERO,
+                    timestamp: number,
+                    gas_limit: 30_000_000,
+                },
+            });
+        }
+        state.transactions.push(TransactionRow {
+            reservation: NonceReservation {
+                transaction_id: TransactionId(B256::repeat_byte(20)),
+                plan_id: None,
+                vault: VaultAddress(Address::with_last_byte(21)),
+                signer: Address::with_last_byte(22),
+                nonce: 23,
+                calldata: Bytes::new(),
+                calldata_hash: B256::ZERO,
+                max_fee_per_gas: U256::from(24_u8),
+                max_priority_fee_per_gas: U256::from(1_u8),
+                gas_limit: 25_000,
+                created_block: 10,
+                created_at: 10,
+            },
+            state: TransactionState::Included,
+            transaction_hash: Some(B256::repeat_byte(26)),
+            raw_signed_transaction: Some(Bytes::new()),
+            submitted_at: Some(10),
+            included_block: Some(11),
+            included_block_hash: Some(B256::from(U256::from(11_u8))),
+            updated_at: 11,
+        });
+
+        compact_hot_state(&mut state);
+
+        let numbers = state
+            .canonical_blocks
+            .iter()
+            .map(|record| record.block.number)
+            .collect::<Vec<_>>();
+        assert!(numbers.contains(&10));
+        assert!(numbers.contains(&11));
+    }
+
+    #[test]
+    fn reconciled_receipt_pins_old_canonical_block() {
+        let mut state = JsonState::default();
+        for number in [11, HOT_BLOCK_RETENTION.saturating_add(100)] {
+            state.canonical_blocks.push(CanonicalBlockRecord {
+                chain_id: 84532,
+                block: BlockRef {
+                    number,
+                    hash: B256::from(U256::from(number)),
+                    parent_hash: B256::ZERO,
+                    timestamp: number,
+                    gas_limit: 30_000_000,
+                },
+            });
+        }
+        state.canonical_receipts.push(CanonicalReceiptRecord {
+            chain_id: 84532,
+            transaction_hash: B256::repeat_byte(30),
+            block_number: 11,
+            block_hash: B256::from(U256::from(11_u8)),
+            transaction_index: 0,
+            status: Some(1),
+            gas_used: 21_000,
+            logs: Vec::new(),
+        });
+
+        compact_hot_state(&mut state);
+
+        assert!(
+            state
+                .canonical_blocks
+                .iter()
+                .any(|record| record.block.number == 11)
+        );
     }
 }

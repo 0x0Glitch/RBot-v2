@@ -28,7 +28,7 @@ use morpho_v2_reallocator::{
         fees::{signed_gas_limit, validate_replacement_fees},
         firewall::{
             FirewallError, RoutineTransactionFields, ValidatedPlan, canonical_plan_hash,
-            validate_plan, validate_routine_transaction,
+            validate_historical_plan, validate_plan, validate_routine_transaction,
         },
         lifecycle::{
             RecoveryClassification, RecoveryFacts, classify_recovery, persist_unsigned_rebalance,
@@ -255,6 +255,22 @@ fn encoder_decoder_and_plan_firewall_round_trip_exactly() {
         validate_plan(bad_hash, &config),
         Err(FirewallError::PlanHash)
     ));
+}
+
+#[test]
+fn historical_receipt_validation_keeps_the_signing_revision_bound() {
+    let config = config_for_signer(Address::with_last_byte(0x02));
+    let plan = raw_plan(&config);
+    let mut restarted = config.clone();
+    restarted.revision = B256::repeat_byte(0x99);
+
+    assert!(validate_plan(plan.clone(), &restarted).is_err());
+    assert!(validate_historical_plan(plan.clone(), &restarted).is_ok());
+
+    let mut internally_inconsistent = plan;
+    internally_inconsistent.snapshot.static_config_revision = B256::repeat_byte(0x98);
+    rehash(&mut internally_inconsistent);
+    assert!(validate_historical_plan(internally_inconsistent, &restarted).is_err());
 }
 
 #[test]

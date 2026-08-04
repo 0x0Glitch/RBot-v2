@@ -612,13 +612,17 @@ where
         let latest_hash = pending
             .transaction_hash
             .ok_or(ExecutionServiceError::Recovery)?;
-        if self
-            .provider
-            .transaction_by_hash(latest_hash)
-            .await?
-            .is_some()
-            || !self.rebroadcast_due(pending, head).await?
-        {
+        if let Some(transaction) = self.provider.transaction_by_hash(latest_hash).await? {
+            validate_recovered_routine_transaction(vault, pending, &transaction)?;
+            // An included transaction can become visible through the receipt provider before the
+            // canonical ingestion cursor reaches its block. During that bounded startup gap the
+            // durable lane waits; stale-plan replacement logic must not run.
+            if recovered_transaction_is_included(&transaction)? {
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if !self.rebroadcast_due(pending, head).await? {
             return Ok(false);
         }
         let raw = pending
@@ -1210,6 +1214,40 @@ where
     }
 }
 
+fn validate_recovered_routine_transaction(
+    vault: &crate::config::ValidatedVaultConfig,
+    pending: &crate::storage::models::UnresolvedTransaction,
+    transaction: &crate::chain::provider::RpcTransaction,
+) -> Result<(), ExecutionServiceError> {
+    if transaction.hash
+        != pending
+            .transaction_hash
+            .ok_or(ExecutionServiceError::Recovery)?
+        || transaction.from != pending.signer
+        || parse_quantity("transaction.nonce", &transaction.nonce)? != pending.nonce
+        || transaction.to != Some(vault.address.0)
+        || !transaction.value.is_zero()
+        || transaction.input != pending.calldata
+    {
+        return Err(ExecutionServiceError::Recovery);
+    }
+    Ok(())
+}
+
+fn recovered_transaction_is_included(
+    transaction: &crate::chain::provider::RpcTransaction,
+) -> Result<bool, ExecutionServiceError> {
+    match (
+        transaction.block_hash,
+        transaction.block_number.as_ref(),
+        transaction.transaction_index.as_ref(),
+    ) {
+        (Some(_), Some(_), Some(_)) => Ok(true),
+        (None, None, None) => Ok(false),
+        _ => Err(ExecutionServiceError::Recovery),
+    }
+}
+
 fn derive_transaction_id(vault: VaultAddress, head: BlockRef, nonce: u64) -> TransactionId {
     let mut identity = Vec::with_capacity(68);
     identity.extend_from_slice(vault.0.as_slice());
@@ -1309,5 +1347,49 @@ fn conformance_report(record: ConformanceRecord) -> ConformanceReport {
         movement_assets: record.movement_assets,
         positive_loss_assets: record.positive_loss_assets,
         report_hash: record.report_hash,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{Address, B256, Bytes, U256};
+
+    use super::recovered_transaction_is_included;
+    use crate::chain::provider::RpcTransaction;
+
+    fn transaction() -> RpcTransaction {
+        RpcTransaction {
+            hash: B256::repeat_byte(1),
+            from: Address::with_last_byte(2),
+            to: Some(Address::with_last_byte(3)),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            nonce: "0x4".to_owned(),
+            block_hash: None,
+            block_number: None,
+            transaction_index: None,
+        }
+    }
+
+    #[test]
+    fn included_rpc_transaction_waits_for_canonical_ingestion() {
+        let mut included = transaction();
+        included.block_hash = Some(B256::repeat_byte(5));
+        included.block_number = Some("0x6".to_owned());
+        included.transaction_index = Some("0x0".to_owned());
+        assert_eq!(
+            recovered_transaction_is_included(&included).ok(),
+            Some(true)
+        );
+
+        let pending = transaction();
+        assert_eq!(
+            recovered_transaction_is_included(&pending).ok(),
+            Some(false)
+        );
+
+        let mut malformed = transaction();
+        malformed.block_number = Some("0x6".to_owned());
+        assert!(recovered_transaction_is_included(&malformed).is_err());
     }
 }

@@ -28,7 +28,7 @@ use crate::{
     },
     transaction::{
         final_preflight::expected_action_records,
-        firewall::{RoutineTransactionFields, validate_plan},
+        firewall::{RoutineTransactionFields, validate_historical_plan},
     },
 };
 
@@ -351,7 +351,7 @@ pub async fn reconcile_confirmed_transaction(
         value: U256::ZERO,
         calldata: pending.reservation.calldata,
     };
-    let validated = validate_plan(pending.plan.clone(), config)
+    let validated = validate_historical_plan(pending.plan.clone(), config)
         .map_err(|_| ReceiptReconciliationError::Model)?;
     let inclusion_projection =
         project_snapshot_to_head(&pending.snapshot, pending.inclusion_head, vault)

@@ -492,9 +492,9 @@ async fn run_chain_service(
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
-            _ = fallback.tick() => poll_canonical_chain(&chain).await?,
+            _ = fallback.tick() => poll_canonical_chain(&chain, &shutdown).await?,
             hint = hints.next() => match hint {
-                Some(_) => poll_canonical_chain(&chain).await?,
+                Some(_) => poll_canonical_chain(&chain, &shutdown).await?,
                 None if shutdown.is_cancelled() => return Ok(()),
                 None => return Err(ServiceFailure { reason: "WebSocket head subscription ended" }),
             },
@@ -511,21 +511,26 @@ async fn run_polling_chain_service(
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
-            _ = interval.tick() => poll_canonical_chain(&chain).await?,
+            _ = interval.tick() => poll_canonical_chain(&chain, &shutdown).await?,
         }
     }
 }
 
 async fn poll_canonical_chain(
     chain: &Arc<ChainService<HttpProvider>>,
+    shutdown: &ShutdownSignal,
 ) -> Result<(), ServiceFailure> {
-    chain.poll_once().await.map(|_| ()).map_err(|error| {
-        tracing::error!(service = "chain", %error, "canonical chain service failed");
-        eprintln!("chain service failed: {error}");
-        ServiceFailure {
-            reason: "canonical chain service failed",
+    match chain.poll_once().await {
+        Ok(_) => Ok(()),
+        Err(_) if shutdown.is_cancelled() => Ok(()),
+        Err(error) => {
+            tracing::error!(service = "chain", %error, "canonical chain service failed");
+            eprintln!("chain service failed: {error}");
+            Err(ServiceFailure {
+                reason: "canonical chain service failed",
+            })
         }
-    })
+    }
 }
 
 async fn run_state_service(
