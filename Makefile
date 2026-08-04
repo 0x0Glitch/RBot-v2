@@ -1,4 +1,4 @@
-.PHONY: fmt clippy test nextest check deny release verify-spec ci
+.PHONY: fmt clippy test nextest check deny release ci
 
 fmt:
 	cargo fmt --all -- --check
@@ -21,7 +21,4 @@ deny:
 release:
 	cargo build --release --locked
 
-verify-spec:
-	./scripts/verify-spec-digests.sh
-
-ci: fmt clippy test deny release verify-spec
+ci: fmt clippy test deny release

@@ -1,52 +1,78 @@
 # RBot-v2
 
-Production-oriented Rust control plane for autonomous reallocation across direct
-`MorphoMarketV1AdapterV2` positions owned by a Morpho Vault V2 vault.
+Rust reallocator for Morpho Vault V2 vaults using direct
+`MorphoMarketV1AdapterV2` positions.
 
-Execute mode remains fail-closed until all protocol identities and deployment
-inputs listed in `docs/deployment-inputs.md` are configured and validated.
+The bot is configured per EVM chain and vault deployment. It follows canonical
+heads, rebuilds exact on-chain state, plans bounded reallocations, validates the
+transaction through an independent firewall, signs, submits, confirms the
+canonical receipt, and reconciles the resulting state. Runtime state is stored
+in an atomic JSON file on disk.
 
-Durable runtime state is stored in one versioned JSON document. A bounded
-single-writer actor, exclusive process lock, file and directory `fsync`, and
-atomic rename preserve transaction and reorg recovery boundaries.
+## Requirements
 
-## Development
+- Rust 1.97.1
+- HTTP RPC endpoint
+- WebSocket RPC endpoint for live heads
+- Deployed Morpho Vault V2, Morpho Blue, adaptive curve IRM, direct adapter,
+  Multicall3, and vault asset addresses
+- Runtime code hashes and pinned source identities for those contracts
+- Allocator signer credentials when Execute mode is enabled
+
+## Configure a chain
+
+Copy the examples and replace every placeholder with values for the target
+chain and vault:
+
+```bash
+cp config.example.json config.json
+cp protocol-lock.toml protocol-lock.local.toml
+```
+
+Set the environment variables named by `http_url_env`, `websocket_url_env`,
+and the selected signer configuration. RPC URLs and signing secrets stay out of
+the JSON file.
+
+Validate the configuration before starting:
+
+```bash
+cargo run --release -- config check --config config.json
+cargo run --release -- protocol-lock-check --file protocol-lock.local.toml
+cargo run --release -- doctor \
+  --config config.json \
+  --protocol-lock protocol-lock.local.toml
+```
+
+## Run
+
+```bash
+cargo build --release --locked
+./target/release/morpho-v2-reallocator run \
+  --config config.json \
+  --protocol-lock protocol-lock.local.toml \
+  --bind 127.0.0.1:9090
+```
+
+Start with `node.mode` set to `observe` or `shadow`. Execute mode additionally
+requires the appropriate signer and release evidence for the configured
+production profile. Startup fails closed when the chain ID, bytecode, roles,
+provider capabilities, or protocol identities do not match.
+
+The operator API is read-only:
+
+```text
+GET /health
+GET /ready
+GET /metrics
+GET /v1/vaults/{vault}/state
+GET /v1/vaults/{vault}/plan
+```
+
+## Verify
 
 ```bash
 make ci
-cargo run -- status
-cargo run -- config check --config config.example.json
-cargo run -- config effective --config config.example.json
-cargo run -- doctor --config config.example.json --protocol-lock protocol-lock.toml
 ```
 
-`run` validates configured deployment identities against live runtime bytecode,
-catches up and replays canonical events into the JSON state file, builds atomic
-exact snapshots, and serves the GET-only health/metrics/operator API on
-`127.0.0.1:9090` by default. Shadow mode also persists rate episodes, requires
-direct-parent confirmation, runs the bounded solver, firewalls plans, and serves
-the current candidate at `/v1/vaults/{address}/plan`. Local-development Execute
-is available only on non-mainnet chains and uses the same restricted transaction
-grammar, final simulation, durable signed-byte boundary, receipt conformance and
-exact post-state reconciliation as the production path. Production Execute
-remains fail-closed until the deployment inputs in `docs/deployment-inputs.md`
-and authenticated remote signer are supplied.
-`alerts-test` sends only a typed P2 delivery test; it cannot construct or sign a
-transaction.
-
-Remote-signer Execute also requires `--release-evidence`. This strict JSON record
-is bound to the exact config, protocol lock, clean build revision and running
-binary, and enforces the Shadow/canary windows, drills and approvals. See
-`docs/production-readiness.md`, `docs/production-runbook.md`, and
-`release-evidence.example.json`. Local-development signing is accepted only on
-an explicit test-chain allowlist and cannot be authorized by release evidence.
-
-Application configuration is strict schema-v3 JSON. Unknown fields fail startup;
-risk values live only in the file, while secrets and HTTP/WebSocket endpoints
-are referenced by environment-variable name. `protocol-lock.toml` remains the
-separate immutable protocol identity lock.
-See `docs/configuration.md` for the operator-facing layout, value conventions,
-environment references, and validation commands.
-
-The normative architecture and implementation roadmap live under
-`docs/normative/` and are protected by digest checks.
+This runs formatting, Clippy with warnings denied, the complete test suite,
+dependency-policy checks, and a locked release build.
