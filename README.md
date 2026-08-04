@@ -34,6 +34,13 @@ and authenticated remote signer are supplied.
 `alerts-test` sends only a typed P2 delivery test; it cannot construct or sign a
 transaction.
 
+Remote-signer Execute also requires `--release-evidence`. This strict JSON record
+is bound to the exact config, protocol lock, clean build revision and running
+binary, and enforces the Shadow/canary windows, drills and approvals. See
+`docs/production-readiness.md`, `docs/production-runbook.md`, and
+`release-evidence.example.json`. Local-development signing is accepted only on
+an explicit test-chain allowlist and cannot be authorized by release evidence.
+
 Application configuration is strict schema-v3 JSON. Unknown fields fail startup;
 risk values live only in the file, while secrets and HTTP/WebSocket endpoints
 are referenced by environment-variable name. `protocol-lock.toml` remains the

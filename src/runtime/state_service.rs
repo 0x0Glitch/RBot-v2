@@ -31,7 +31,11 @@ use crate::{
         topology::{EventLocation, TopologyError, TopologyIndex},
     },
     storage::{StorageError, actor::StorageHandle, models::CanonicalLogRecord},
-    telemetry::{health::HealthState, metrics::OperationalMetrics},
+    telemetry::{
+        alerts::{Alert, AlertDispatcher, AlertKind, AlertSeverity},
+        health::HealthState,
+        metrics::OperationalMetrics,
+    },
 };
 
 /// Canonical state-service failure. Every variant disables readiness.
@@ -160,6 +164,7 @@ pub struct CanonicalStateService<P> {
     providers_ready: bool,
     signer_ready: bool,
     last_exact_head: Option<BlockRef>,
+    alerts: Option<Arc<AlertDispatcher>>,
 }
 
 impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateService<P> {
@@ -190,6 +195,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             providers_ready: true,
             signer_ready: false,
             last_exact_head: None,
+            alerts: None,
         })
     }
 
@@ -197,6 +203,13 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
     #[must_use]
     pub fn with_signer_ready(mut self, signer_ready: bool) -> Self {
         self.signer_ready = signer_ready;
+        self
+    }
+
+    /// Attaches the bounded typed alert dispatcher used by supervised live operation.
+    #[must_use]
+    pub fn with_alerts(mut self, alerts: Arc<AlertDispatcher>) -> Self {
+        self.alerts = Some(alerts);
         self
     }
 
@@ -235,10 +248,23 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 self.last_exact_head = None;
                 self.rebuild_through(common_ancestor).await?;
             }
-            ChainUpdate::ProviderDegraded(_) => {
+            ChainUpdate::ProviderDegraded(status) => {
                 self.providers_ready = false;
                 self.mark_catching_up().await?;
                 self.publish_readiness(false, false).await?;
+                self.emit_runtime_alert(
+                    AlertSeverity::P1,
+                    AlertKind::CanonicalChainStopped,
+                    None,
+                    "Canonical provider trust degraded",
+                    format!(
+                        "provider={} reason={}; Execute is disabled",
+                        status.provider, status.reason
+                    ),
+                    None,
+                    runtime_unix_timestamp(),
+                )
+                .await;
             }
             ChainUpdate::TransactionSeen(_) => {}
         }
@@ -463,6 +489,8 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                     status.transition(desired, reason)
                 })
                 .await?;
+            self.emit_state_alert(vault.address, desired, &snapshot, head.timestamp)
+                .await;
             if self.config.app.node.mode != RuntimeMode::Observe
                 && snapshot.capabilities.can_project
             {
@@ -495,6 +523,61 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             .increment("reallocator_snapshot_success_total")
             .map_err(|_| StateServiceError::Metric)?;
         self.publish_readiness(true, all_exact_ready).await
+    }
+
+    async fn emit_state_alert(
+        &self,
+        vault: VaultAddress,
+        state: RuntimeVaultState,
+        snapshot: &crate::domain::ExactVaultSnapshot,
+        created_at: u64,
+    ) {
+        let alert = state_alert_spec(state);
+        if let Some((severity, kind, summary, detail)) = alert {
+            self.emit_runtime_alert(
+                severity,
+                kind,
+                Some(vault),
+                summary,
+                detail.to_owned(),
+                Some(snapshot.snapshot_hash),
+                created_at,
+            )
+            .await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_runtime_alert(
+        &self,
+        severity: AlertSeverity,
+        kind: AlertKind,
+        vault: Option<VaultAddress>,
+        summary: &str,
+        detail: String,
+        state_hash: Option<alloy::primitives::B256>,
+        created_at: u64,
+    ) {
+        let Some(dispatcher) = &self.alerts else {
+            return;
+        };
+        let alert = Alert::new(
+            severity,
+            kind,
+            vault,
+            summary.to_owned(),
+            detail,
+            state_hash,
+            created_at,
+        );
+        match alert {
+            Ok(alert) => {
+                if dispatcher.emit(alert).await.is_err() {
+                    tracing::error!("typed runtime alert delivery failed");
+                }
+            }
+            Err(_) => tracing::error!("typed runtime alert construction failed"),
+        }
     }
 
     async fn mark_catching_up(&self) -> Result<(), StateServiceError> {
@@ -536,6 +619,36 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             }))
             .await;
         Ok(())
+    }
+}
+
+fn runtime_unix_timestamp() -> u64 {
+    u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or_default()
+}
+
+type StateAlertSpec = (AlertSeverity, AlertKind, &'static str, &'static str);
+
+fn state_alert_spec(state: RuntimeVaultState) -> Option<StateAlertSpec> {
+    match state {
+        RuntimeVaultState::LockAccountingUncertain => Some((
+            AlertSeverity::P0,
+            AlertKind::LockAccountingUncertain,
+            "Idle lock accounting is uncertain",
+            "exact canonical idle-lock reconstruction did not verify; Execute is disabled",
+        )),
+        RuntimeVaultState::PausedSignerFailure => Some((
+            AlertSeverity::P0,
+            AlertKind::SignerFailure,
+            "Restricted signer is unavailable",
+            "the configured restricted signer is not ready; Execute is disabled",
+        )),
+        RuntimeVaultState::PausedUnsupportedConfiguration => Some((
+            AlertSeverity::P1,
+            AlertKind::UnsupportedDependency,
+            "Live Vault V2 state is outside the reviewed profile",
+            "one or more exact capability checks failed; Execute is disabled",
+        )),
+        _ => None,
     }
 }
 
@@ -746,5 +859,25 @@ fn unverified_idle_ledger_snapshot(exact_idle_assets: U256) -> IdleLockLedgerSna
         locks: Vec::new(),
         unattributed_idle_assets: exact_idle_assets,
         verified: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_stops_map_to_typed_operator_alerts() {
+        let lock = state_alert_spec(RuntimeVaultState::LockAccountingUncertain);
+        assert!(matches!(
+            lock,
+            Some((AlertSeverity::P0, AlertKind::LockAccountingUncertain, _, _))
+        ));
+        let unsupported = state_alert_spec(RuntimeVaultState::PausedUnsupportedConfiguration);
+        assert!(matches!(
+            unsupported,
+            Some((AlertSeverity::P1, AlertKind::UnsupportedDependency, _, _))
+        ));
+        assert!(state_alert_spec(RuntimeVaultState::Automatic).is_none());
     }
 }

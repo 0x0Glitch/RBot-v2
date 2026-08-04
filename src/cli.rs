@@ -26,6 +26,9 @@ pub enum Command {
         /// Protocol lock path.
         #[arg(long, default_value = "protocol-lock.toml")]
         protocol_lock: PathBuf,
+        /// Reviewed release evidence; mandatory for remote-signer Execute.
+        #[arg(long)]
+        release_evidence: Option<PathBuf>,
         /// Read-only HTTP bind address; loopback is the safe default.
         #[arg(long, default_value = "127.0.0.1:9090")]
         bind: SocketAddr,
@@ -44,6 +47,9 @@ pub enum Command {
         /// Protocol lock path.
         #[arg(long, default_value = "protocol-lock.toml")]
         protocol_lock: PathBuf,
+        /// Reviewed canary/production evidence to validate for Execute.
+        #[arg(long)]
+        release_evidence: Option<PathBuf>,
     },
     /// Validate configuration and print its canonical secret-free form.
     Config {

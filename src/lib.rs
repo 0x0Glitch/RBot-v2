@@ -20,6 +20,7 @@ pub mod morpho;
 pub mod planner;
 pub mod protocol_lock;
 pub mod reconciliation;
+pub mod release_gate;
 pub mod runtime;
 mod serde_helpers;
 pub mod state;

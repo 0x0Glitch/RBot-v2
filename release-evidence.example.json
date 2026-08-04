@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "stage": "production",
+  "chain_id": 999,
+  "config_revision": "UNSET",
+  "protocol_lock_digest": "UNSET",
+  "build_revision": "UNSET",
+  "binary_sha256": "UNSET",
+  "shadow_window": {
+    "started_at": 0,
+    "ended_at": 0,
+    "successful": false,
+    "evidence_sha256": "UNSET"
+  },
+  "canary_window": {
+    "started_at": 0,
+    "ended_at": 0,
+    "successful": false,
+    "evidence_sha256": "UNSET"
+  },
+  "checks": [
+    { "id": "protocol_differential_tests", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "solver_and_exhaustive_tests", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "fork_suite", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "crash_recovery_matrix", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "reorg_matrix", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "load_and_provider_capacity", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "same_head_preflight_latency", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "lock_ledger_replay", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "pending_admin_reconstruction", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "reward_policy_current", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "user_path_gas", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "remote_signer_and_firewall", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "alert_delivery", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "backup_restore_drill", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "cancellation_drill", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "provider_failover_drill", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "runbook_exercised", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "p0_on_call_coverage", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "canary_movement_caps_reviewed", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "no_unresolved_conformance_or_reconciliation", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "no_lock_accounting_uncertainty", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "no_preflight_liveness_regression", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "no_episode_budget_or_reorg_mismatch", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "entry_and_target_replay_match", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "active_adapters_and_gates_supported", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" },
+    { "id": "active_markets_and_vault_seeded", "passed": false, "completed_at": 0, "evidence_sha256": "UNSET", "reviewer": "UNSET" }
+  ],
+  "approvals": [
+    { "id": "independent_code_review", "approved": false, "approved_at": 0, "evidence_sha256": "UNSET", "approver": "UNSET" },
+    { "id": "signer_boundary_security_review", "approved": false, "approved_at": 0, "evidence_sha256": "UNSET", "approver": "UNSET" },
+    { "id": "sre_operations_approval", "approved": false, "approved_at": 0, "evidence_sha256": "UNSET", "approver": "UNSET" },
+    { "id": "direct_eoa_residual_risk_acceptance", "approved": false, "approved_at": 0, "evidence_sha256": "UNSET", "approver": "UNSET" }
+  ]
+}

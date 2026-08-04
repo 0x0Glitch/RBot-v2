@@ -177,6 +177,50 @@ impl ProtocolLock {
         Ok(toml::from_str(&text)?)
     }
 
+    /// Enumerates every visibly unset deployment-specific input in stable order.
+    #[must_use]
+    pub fn missing_deployment_inputs(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        for contract in &self.contract {
+            let prefix = format!("contract[{}]", contract.name);
+            if is_unset(&contract.address) {
+                missing.push(format!("{prefix}.address"));
+            }
+            if is_unset(&contract.runtime_code_hash) {
+                missing.push(format!("{prefix}.runtime_code_hash"));
+            }
+            if is_unset(&contract.source_path)
+                || contract
+                    .source_path
+                    .eq_ignore_ascii_case("deployment-specific")
+            {
+                missing.push(format!("{prefix}.source_path"));
+            }
+            if is_unset(&contract.compiler_version) {
+                missing.push(format!("{prefix}.compiler_version"));
+            }
+            if contract.optimizer_enabled && contract.optimizer_runs == 0 {
+                missing.push(format!("{prefix}.optimizer_runs"));
+            }
+            for (name, value) in &contract.constructor_immutables {
+                if is_unset(value) {
+                    missing.push(format!("{prefix}.constructor_immutables.{name}"));
+                }
+            }
+        }
+        if is_unset(&self.remote_signer.service_identity) {
+            missing.push("remote_signer.service_identity".to_owned());
+        }
+        if is_unset(&self.remote_signer.client_identity_env) {
+            missing.push("remote_signer.client_identity_env".to_owned());
+        }
+        if is_unset(&self.remote_signer.authentication_secret_env) {
+            missing.push("remote_signer.authentication_secret_env".to_owned());
+        }
+        missing.sort();
+        missing
+    }
+
     /// Parses identities, proves required categories are present, and returns a sorted lock.
     pub fn validate(self) -> Result<ValidatedProtocolLock, ProtocolLockError> {
         if self.schema_version != PROTOCOL_LOCK_SCHEMA_VERSION {
@@ -316,6 +360,10 @@ fn validate_commit(commit: &str) -> Result<(), ProtocolLockError> {
         ));
     }
     Ok(())
+}
+
+fn is_unset(value: &str) -> bool {
+    value.trim().is_empty() || value.trim().eq_ignore_ascii_case("unset")
 }
 
 fn invalid(field: &str, reason: &'static str) -> ProtocolLockError {

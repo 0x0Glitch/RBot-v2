@@ -23,6 +23,12 @@ pub const SECONDS_PER_YEAR: u64 = 31_536_000;
 /// Exact fixed-point scale.
 pub const WAD: u64 = 1_000_000_000_000_000_000;
 
+/// Returns whether a chain is explicitly allowed to use the test-only local signer.
+#[must_use]
+pub const fn is_test_chain_id(chain_id: u64) -> bool {
+    matches!(chain_id, 998 | 1_337 | 31_337 | 84_532 | 11_155_111)
+}
+
 /// Raw application configuration loaded from strict JSON.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1110,6 +1116,15 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
         return Err(validation(
             "signing",
             "signer environment-variable name must be non-empty",
+        ));
+    }
+    if config.node.mode == RuntimeMode::Execute
+        && matches!(config.signing, SigningConfig::LocalDevelopment { .. })
+        && !is_test_chain_id(config.chain.chain_id)
+    {
+        return Err(validation(
+            "signing",
+            "local-development Execute is forbidden outside the explicit test-chain allowlist",
         ));
     }
     if config.chain.maximum_log_range == 0

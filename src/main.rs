@@ -1,7 +1,13 @@
 //! Binary entry point for supervised live operation and bounded bootstrap commands.
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, path::Path, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    process::ExitCode,
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use clap::Parser;
@@ -14,13 +20,20 @@ use morpho_v2_reallocator::chain::{
 use morpho_v2_reallocator::cli::{Cli, Command, ConfigCommand};
 use morpho_v2_reallocator::config::{
     AppConfig, RpcRole, RuntimeMode, SigningConfig, ValidatedConfig, ValidatedRpcConfig,
+    is_test_chain_id,
 };
-use morpho_v2_reallocator::protocol_lock::{ProtocolLock, ValidatedProtocolLock};
+use morpho_v2_reallocator::protocol_lock::{
+    ProtocolLock, RemoteSignerIdentity, ValidatedProtocolLock,
+};
+use morpho_v2_reallocator::release_gate::{
+    ProductionReleaseEvidence, ReleaseContext, ReleaseGateReport, ReleaseStage, sha256_file,
+};
 use morpho_v2_reallocator::runtime::{
     controller::{RuntimeRegistry, RuntimeVaultState},
     execution_service::{ExecutionServiceError, LiveExecutionService},
     identity::RuntimeIdentities,
     messages::{CHAIN_TO_STATE_CAPACITY, ChainUpdate},
+    process_guard::ProcessGuards,
     readiness::{ReadinessInputs, evaluate_readiness},
     shutdown::{DEFAULT_SHUTDOWN_TIMEOUT, ShutdownSignal, install_os_shutdown},
     state_service::{CanonicalStateService, EventSourceRegistry},
@@ -44,6 +57,10 @@ use secrecy::SecretString;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if let Err(error) = initialize_tracing() {
+        eprintln!("logging initialization failed: {error}");
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Status => {
@@ -57,8 +74,10 @@ async fn main() -> ExitCode {
         Command::Run {
             config,
             protocol_lock,
+            release_evidence,
             bind,
-        } => match run_supervised(&config, &protocol_lock, bind).await {
+        } => match run_supervised(&config, &protocol_lock, release_evidence.as_deref(), bind).await
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("run failed: {error}");
@@ -85,11 +104,10 @@ async fn main() -> ExitCode {
         Command::Doctor {
             config,
             protocol_lock,
-        } => match static_doctor(&config, &protocol_lock) {
-            Ok((chain_id, config_revision, lock_digest)) => {
-                println!(
-                    "doctor static=ok chain_id={chain_id} config_revision={config_revision} protocol_lock_digest={lock_digest} dynamic=not_run execute=disabled"
-                );
+            release_evidence,
+        } => match static_doctor(&config, &protocol_lock, release_evidence.as_deref()) {
+            Ok(report) => {
+                println!("{report}");
                 ExitCode::SUCCESS
             }
             Err(error) => {
@@ -181,15 +199,45 @@ async fn main() -> ExitCode {
     }
 }
 
+fn initialize_tracing() -> Result<(), String> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .with_current_span(false)
+        .with_span_list(false)
+        .try_init()
+        .map_err(|_| "global tracing subscriber is already initialized".to_owned())
+}
+
 async fn run_supervised(
     config_path: &Path,
     lock_path: &Path,
+    release_evidence_path: Option<&Path>,
     bind: std::net::SocketAddr,
 ) -> Result<(), String> {
     let config = Arc::new(load_config(config_path)?);
-    let lock = ProtocolLock::load(lock_path)
-        .and_then(ProtocolLock::validate)
-        .map_err(|error| error.to_string())?;
+    let raw_lock = ProtocolLock::load(lock_path).map_err(|error| error.to_string())?;
+    let missing_lock_inputs = raw_lock.missing_deployment_inputs();
+    let missing_environment = missing_runtime_environment(&config, &raw_lock.remote_signer);
+    if !missing_lock_inputs.is_empty() || !missing_environment.is_empty() {
+        return Err(format_missing_inputs(
+            &missing_lock_inputs,
+            &missing_environment,
+        ));
+    }
+    let lock = raw_lock.validate().map_err(|error| error.to_string())?;
+    let authorization = authorize_execute_startup(
+        &config,
+        &lock,
+        config_path,
+        lock_path,
+        release_evidence_path,
+    )?;
+    if let Some(stage) = authorization.stage {
+        tracing::info!(?stage, "reviewed Execute release gate passed");
+    }
     let identities =
         RuntimeIdentities::from_config(&config, &lock).map_err(|error| error.to_string())?;
     let primary_config =
@@ -300,7 +348,8 @@ async fn run_supervised(
         Arc::clone(&metrics),
     )
     .map_err(|error| error.to_string())?
-    .with_signer_ready(signer_ready);
+    .with_signer_ready(signer_ready)
+    .with_alerts(Arc::clone(&alerts));
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| error.to_string())?;
@@ -309,7 +358,7 @@ async fn run_supervised(
         runtime: runtime.clone(),
         data: data.clone(),
         metrics: metrics.registry(),
-        alerts,
+        alerts: Arc::clone(&alerts),
     };
     let shutdown = ShutdownSignal::default();
     let mut supervisor =
@@ -370,7 +419,22 @@ async fn run_supervised(
             () = signal_shutdown.cancelled() => {}
         }
     });
-    let supervised = supervisor.run().await.map_err(|error| error.to_string());
+    let supervised_result = supervisor.run().await;
+    if supervised_result.is_err()
+        && let Ok(alert) = Alert::new(
+            AlertSeverity::P0,
+            AlertKind::ServiceFailure,
+            None,
+            "Morpho V2 reallocator supervised service stopped".to_owned(),
+            "a critical supervised service failed; Execute is disabled and local structured logs require immediate review".to_owned(),
+            None,
+            unix_timestamp().unwrap_or_default(),
+        )
+        && alerts.emit(alert).await.is_err()
+    {
+        tracing::error!("fatal service alert delivery failed");
+    }
+    let supervised = supervised_result.map_err(|error| error.to_string());
     let signal_joined = signal_task
         .await
         .map_err(|_| "OS shutdown task failed".to_owned());
@@ -494,9 +558,10 @@ fn build_execute_signer(
     }
     match &config.app.signing {
         SigningConfig::LocalDevelopment { private_key_env } => {
-            if config.app.chain.chain_id == 999 {
+            if !is_test_chain_id(config.app.chain.chain_id) {
                 return Err(
-                    "local-development signer is forbidden for HyperEVM mainnet Execute".to_owned(),
+                    "local-development signer is forbidden outside the explicit test-chain allowlist"
+                        .to_owned(),
                 );
             }
             let vault = config
@@ -647,18 +712,228 @@ fn unix_timestamp() -> Result<u64, morpho_v2_reallocator::storage::StorageError>
 }
 
 fn static_doctor(
-    config_path: &std::path::Path,
-    lock_path: &std::path::Path,
-) -> Result<(u64, alloy::primitives::B256, alloy::primitives::B256), String> {
+    config_path: &Path,
+    lock_path: &Path,
+    release_evidence_path: Option<&Path>,
+) -> Result<String, String> {
     let config = AppConfig::load(config_path)
         .and_then(AppConfig::validate)
         .map_err(|error| error.to_string())?;
-    let lock = ProtocolLock::load(lock_path)
-        .and_then(ProtocolLock::validate)
-        .map_err(|error| error.to_string())?;
+    let raw_lock = ProtocolLock::load(lock_path).map_err(|error| error.to_string())?;
+    let missing_lock_inputs = raw_lock.missing_deployment_inputs();
+    let missing_environment = missing_runtime_environment(&config, &raw_lock.remote_signer);
+    if !missing_lock_inputs.is_empty() || !missing_environment.is_empty() {
+        return Err(format_missing_inputs(
+            &missing_lock_inputs,
+            &missing_environment,
+        ));
+    }
+    let lock = raw_lock.validate().map_err(|error| error.to_string())?;
     if config.app.chain.chain_id != lock.chain_id {
         return Err("configuration chain ID differs from protocol lock".to_owned());
     }
     RuntimeIdentities::from_config(&config, &lock).map_err(|error| error.to_string())?;
-    Ok((lock.chain_id, config.revision, lock.digest))
+    let release = match (&config.app.signing, config.app.node.mode) {
+        (SigningConfig::RemoteSigner { .. }, RuntimeMode::Execute) => {
+            let path = release_evidence_path
+                .ok_or_else(|| "remote-signer Execute is missing --release-evidence".to_owned())?;
+            let report = validate_release_evidence(&config, &lock, path)?;
+            if !report.ready {
+                return Err(format_release_failures(&report));
+            }
+            format!("{:?}", report.stage).to_lowercase()
+        }
+        (SigningConfig::LocalDevelopment { .. }, RuntimeMode::Execute) => {
+            if !is_test_chain_id(config.app.chain.chain_id) {
+                return Err(
+                    "local-development Execute is outside the explicit test-chain allowlist"
+                        .to_owned(),
+                );
+            }
+            if release_evidence_path.is_some() {
+                return Err(
+                    "release evidence cannot authorize a local-development signer".to_owned(),
+                );
+            }
+            "test_only".to_owned()
+        }
+        (_, _) => {
+            if release_evidence_path.is_some() {
+                return Err("release evidence is accepted only in Execute mode".to_owned());
+            }
+            "not_applicable".to_owned()
+        }
+    };
+    Ok(format!(
+        "doctor static=ok chain_id={} config_revision={} protocol_lock_digest={} release_gate={} dynamic=not_run execute=disabled",
+        lock.chain_id, config.revision, lock.digest, release
+    ))
+}
+
+struct ExecuteAuthorization {
+    stage: Option<ReleaseStage>,
+    _process_guards: Option<ProcessGuards>,
+}
+
+fn authorize_execute_startup(
+    config: &ValidatedConfig,
+    lock: &ValidatedProtocolLock,
+    config_path: &Path,
+    lock_path: &Path,
+    release_evidence_path: Option<&Path>,
+) -> Result<ExecuteAuthorization, String> {
+    if config.app.node.mode != RuntimeMode::Execute {
+        if release_evidence_path.is_some() {
+            return Err("release evidence is accepted only in Execute mode".to_owned());
+        }
+        return Ok(ExecuteAuthorization {
+            stage: None,
+            _process_guards: None,
+        });
+    }
+    match &config.app.signing {
+        SigningConfig::LocalDevelopment { .. } => {
+            if !is_test_chain_id(config.app.chain.chain_id) {
+                return Err(
+                    "local-development signer is forbidden outside the explicit test-chain allowlist"
+                        .to_owned(),
+                );
+            }
+            if release_evidence_path.is_some() {
+                return Err(
+                    "release evidence cannot authorize a local-development signer".to_owned(),
+                );
+            }
+            Ok(ExecuteAuthorization {
+                stage: None,
+                _process_guards: None,
+            })
+        }
+        SigningConfig::RemoteSigner { .. } => {
+            let evidence_path = release_evidence_path
+                .ok_or_else(|| "remote-signer Execute requires --release-evidence".to_owned())?;
+            enforce_non_writable_by_group_or_world(config_path, "configuration")?;
+            enforce_non_writable_by_group_or_world(lock_path, "protocol lock")?;
+            enforce_non_writable_by_group_or_world(evidence_path, "release evidence")?;
+            let report = validate_release_evidence(config, lock, evidence_path)?;
+            if !report.ready {
+                return Err(format_release_failures(&report));
+            }
+            let missing = missing_runtime_environment(config, &lock.remote_signer);
+            if !missing.is_empty() {
+                return Err(format!(
+                    "missing runtime environment references: {}",
+                    missing.join(", ")
+                ));
+            }
+            let lock_directory = std::env::var("MORPHO_V2_LOCK_DIR")
+                .map_err(|_| "MORPHO_V2_LOCK_DIR is missing".to_owned())?;
+            let guards = ProcessGuards::acquire(
+                Path::new(&lock_directory),
+                config.app.chain.chain_id,
+                config.app.vaults.iter().map(|vault| vault.signer_address),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(ExecuteAuthorization {
+                stage: Some(report.stage),
+                _process_guards: Some(guards),
+            })
+        }
+    }
+}
+
+fn validate_release_evidence(
+    config: &ValidatedConfig,
+    lock: &ValidatedProtocolLock,
+    path: &Path,
+) -> Result<ReleaseGateReport, String> {
+    let evidence = ProductionReleaseEvidence::load(path).map_err(|error| error.to_string())?;
+    let executable = std::env::current_exe()
+        .map_err(|_| "cannot resolve the running executable for release validation".to_owned())?;
+    let binary_sha256 = sha256_file(&executable)
+        .map_err(|_| "cannot hash the running executable for release validation".to_owned())?;
+    let now = unix_timestamp().map_err(|error| error.to_string())?;
+    Ok(evidence.validate(&ReleaseContext {
+        now,
+        config,
+        protocol_lock: lock,
+        build_revision: morpho_v2_reallocator::build_info().revision,
+        binary_sha256: &binary_sha256,
+    }))
+}
+
+fn format_release_failures(report: &ReleaseGateReport) -> String {
+    let details = report
+        .failures
+        .iter()
+        .map(|failure| format!("\n- {failure}"))
+        .collect::<String>();
+    format!("{:?} release gate failed:{details}", report.stage)
+}
+
+fn missing_runtime_environment(
+    config: &ValidatedConfig,
+    remote_signer: &RemoteSignerIdentity,
+) -> Vec<String> {
+    let mut required = BTreeSet::new();
+    for provider in &config.app.chain.rpc {
+        required.insert(provider.url_env.as_str());
+        if let Some(websocket) = provider.websocket_url_env.as_deref() {
+            required.insert(websocket);
+        }
+    }
+    if config.app.node.mode == RuntimeMode::Execute {
+        match &config.app.signing {
+            SigningConfig::RemoteSigner { endpoint_env } => {
+                required.insert(endpoint_env);
+                required.insert(remote_signer.client_identity_env.as_str());
+                required.insert(remote_signer.authentication_secret_env.as_str());
+                required.insert("MORPHO_V2_LOCK_DIR");
+            }
+            SigningConfig::LocalDevelopment { private_key_env } => {
+                required.insert(private_key_env);
+            }
+        }
+    }
+    if config.app.alerts.telegram.enabled {
+        required.insert(config.app.alerts.telegram.bot_token_env.as_str());
+    }
+    if config.app.alerts.pagerduty.enabled {
+        required.insert(config.app.alerts.pagerduty.integration_key_env.as_str());
+    }
+    required
+        .into_iter()
+        .filter(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn format_missing_inputs(lock_inputs: &[String], environment: &[String]) -> String {
+    let mut lines = Vec::new();
+    lines.extend(
+        lock_inputs
+            .iter()
+            .map(|input| format!("deployment.{input}")),
+    );
+    lines.extend(environment.iter().map(|name| format!("environment.{name}")));
+    format!("missing inputs:\n- {}", lines.join("\n- "))
+}
+
+#[cfg(unix)]
+fn enforce_non_writable_by_group_or_world(path: &Path, label: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| format!("cannot inspect {label} permissions"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symbolic link"));
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(format!("{label} must not be writable by group or world"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn enforce_non_writable_by_group_or_world(_path: &Path, _label: &str) -> Result<(), String> {
+    Ok(())
 }

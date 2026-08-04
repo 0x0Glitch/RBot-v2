@@ -403,3 +403,25 @@ independent-event persistent-unlock path still gate production Execute.
   Exact-block durable ledger reuse shortened later attempts without weakening
   the same-head gate; the eventual capital transaction used nonce `195` and
   reconciled at block `45010632`.
+- Remote-signer Execute now requires a strict release-evidence JSON record bound
+  to chain 999, the exact canonical config and protocol-lock digests, a clean
+  embedded Git revision and the SHA-256 of the running executable. Canary and
+  production evidence enforce the normative reviewed checks and approvals;
+  production additionally requires a completed 14-day Shadow interval followed
+  by a completed 7-day low-value canary. The deliberately failing template is
+  `release-evidence.example.json`.
+- Production startup now holds host-scoped exclusive chain and signer locks from
+  an explicit absolute `MORPHO_V2_LOCK_DIR`. The local-development signer is
+  rejected outside the explicit test-chain allowlist, and release evidence can
+  never authorize it.
+- `doctor` enumerates all visible `UNSET` protocol-lock fields instead of failing
+  at the first invalid address. The Felix service unit, readiness guide and JSON
+  storage-aware incident/backup/cancellation runbook are checked in under
+  `deployments/` and `docs/`. Real Felix identities, fork/load/gas reports,
+  elapsed observation windows and independent approvals remain external and
+  therefore keep production Execute disabled.
+- Structured JSON tracing is initialized before command execution. The live
+  state owner now sends typed deduplicated alerts for provider degradation,
+  signer failure, lock-accounting uncertainty and unsupported exact state; a
+  fatal supervised chain/state/execution failure emits a P0 service alert before
+  shutdown. Alert failures never reveal endpoint or credential material.

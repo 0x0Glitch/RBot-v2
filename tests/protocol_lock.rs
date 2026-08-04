@@ -73,6 +73,24 @@ fn complete_lock_validates_and_hashes_deterministically() {
 }
 
 #[test]
+fn visibly_unset_deployment_inputs_are_enumerated_together() {
+    let mut lock = valid_lock();
+    lock.contract[0].address = "UNSET".to_owned();
+    lock.contract[0].runtime_code_hash = "UNSET".to_owned();
+    lock.contract[0].compiler_version = "UNSET".to_owned();
+    lock.contract[0].optimizer_runs = 0;
+    lock.contract[0]
+        .constructor_immutables
+        .insert("asset".to_owned(), "UNSET".to_owned());
+    lock.remote_signer.service_identity = "UNSET".to_owned();
+    let missing = lock.missing_deployment_inputs();
+    assert_eq!(missing.len(), 6);
+    assert!(missing.contains(&"contract[vault].address".to_owned()));
+    assert!(missing.contains(&"contract[vault].runtime_code_hash".to_owned()));
+    assert!(missing.contains(&"remote_signer.service_identity".to_owned()));
+}
+
+#[test]
 fn missing_identity_fails_closed() {
     let mut lock = valid_lock();
     lock.contract

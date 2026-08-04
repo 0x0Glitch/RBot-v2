@@ -231,6 +231,22 @@ fn signer_and_rate_group_invariants_are_rejected() {
 }
 
 #[test]
+fn local_development_execute_is_rejected_on_hyperevm_mainnet() {
+    let mut config = raw_example();
+    config.node.mode = RuntimeMode::Execute;
+    config.signing = SigningConfig::LocalDevelopment {
+        private_key_env: "TEST_PRIVATE_KEY".to_owned(),
+    };
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("mainnet local signer must fail"),
+            Err(error) => error,
+        },
+        "signing",
+    );
+}
+
+#[test]
 fn market_identity_and_hysteresis_are_rejected() {
     let mut config = raw_example();
     config.vault[0].position[0].market_id =

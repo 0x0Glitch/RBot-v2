@@ -16,6 +16,10 @@ provided and verified:
 - an approved executable reward cash-flow module and revision when any position
   uses `Modeled` reward policy (without one that position remains non-executable);
 - fork RPC credentials for deployment-specific differential and integration tests.
+- an absolute host-level `MORPHO_V2_LOCK_DIR` writable only by the service user;
+- exact release evidence for the reviewed binary/config/lock tuple, including
+  14 days Shadow, 7 subsequent days canary, immutable test/drill artifacts and
+  the named code/security/SRE/residual-risk approvals.
 
 With one primary provider and no quorum, the primary is an explicit correctness
 trust assumption. Configuration requires a separate checkpoint provider. The
@@ -30,3 +34,6 @@ rejects the template until they are supplied; no placeholder can enable Execute.
 
 Local deterministic fixtures will substitute for these values in tests. Missing
 or mismatched production values disable only Execute capability.
+
+`release-evidence.example.json` is intentionally failing. It must not be changed
+to passing without the referenced artifacts and completed observation windows.

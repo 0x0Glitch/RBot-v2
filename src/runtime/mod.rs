@@ -8,6 +8,7 @@ pub mod idle_ledger_service;
 pub mod messages;
 pub mod planning_service;
 pub mod preflight_source;
+pub mod process_guard;
 pub mod readiness;
 pub mod shutdown;
 pub mod state_service;
