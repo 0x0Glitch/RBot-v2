@@ -2,6 +2,7 @@
 #![allow(clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::Path;
 
 use alloy::primitives::{Address, B256, Bytes, I256, U256};
@@ -1062,4 +1063,87 @@ fn fee_projection_type_remains_exact_integer_only() {
         management_fee_shares: U256::from(2_u64),
     };
     assert_eq!(projection.performance_fee_shares, U256::from(1_u64));
+}
+
+#[tokio::test]
+async fn segmented_journal_recovers_partial_tail_and_restored_backup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("state.json");
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    for number in 1_u64..=130 {
+        let hash_byte = u8::try_from(number)?;
+        let parent_byte = u8::try_from(number.saturating_sub(1))?;
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 1,
+                    block: block(number, hash_byte, parent_byte),
+                },
+                Vec::new(),
+                1_800_000_000 + number,
+            )
+            .await?;
+    }
+    let checkpoint: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    assert_eq!(checkpoint["revision"], Value::from(128_u64));
+    let journal_dir = directory.path().join("journal");
+    let mut segments = std::fs::read_dir(&journal_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect::<Vec<_>>();
+    segments.sort();
+    assert!(segments.len() <= 2);
+
+    let crash_dir = directory.path().join("crash-copy");
+    let crash_journal = crash_dir.join("journal");
+    std::fs::create_dir_all(&crash_journal)?;
+    std::fs::copy(&path, crash_dir.join("state.json"))?;
+    std::fs::copy(
+        directory.path().join("manifest.json"),
+        crash_dir.join("manifest.json"),
+    )?;
+    for segment in &segments {
+        let filename = segment
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("journal filename missing"))?;
+        std::fs::copy(segment, crash_journal.join(filename))?;
+    }
+    service.shutdown().await?;
+
+    let mut crash_segments = std::fs::read_dir(&crash_journal)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    crash_segments.sort();
+    let tail = crash_segments
+        .last()
+        .ok_or_else(|| std::io::Error::other("journal segment missing"))?;
+    let valid_length = std::fs::metadata(tail)?.len();
+    let mut output = std::fs::OpenOptions::new().append(true).open(tail)?;
+    output.write_all(b"{\"schema_version\":1")?;
+    output.sync_all()?;
+    drop(output);
+
+    let recovered = reopen(&crash_dir.join("state.json")).await?;
+    assert_eq!(
+        recovered.handle().load_cursor(1).await?,
+        Some(block(130, 130, 129))
+    );
+    assert_eq!(std::fs::metadata(tail)?.len(), valid_length);
+    let backup = directory.path().join("restore").join("state.json");
+    recovered.handle().backup(backup.clone(), 1).await?;
+    recovered.shutdown().await?;
+    let restored = reopen(&backup).await?;
+    assert_eq!(
+        restored.handle().load_cursor(1).await?,
+        Some(block(130, 130, 129))
+    );
+    restored.shutdown().await?;
+    Ok(())
 }

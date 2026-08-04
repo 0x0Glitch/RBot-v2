@@ -33,6 +33,31 @@ use super::{
 /// Default bounded storage mailbox capacity.
 pub const DEFAULT_STORAGE_CHANNEL_CAPACITY: usize = 128;
 const JSON_FORMAT_VERSION: u32 = 2;
+const JOURNAL_SCHEMA_VERSION: u32 = 1;
+const JOURNAL_SEGMENT_EVENTS: u64 = 128;
+const HOT_BLOCK_RETENTION: u64 = 4_096;
+const HOT_SNAPSHOT_RETENTION: usize = 256;
+const HOT_PLAN_RETENTION: usize = 256;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalManifest {
+    schema_version: u32,
+    checkpoint_revision: u64,
+    checkpoint_head_hash: B256,
+    journal_revision: u64,
+    journal_head_hash: B256,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalRecord {
+    schema_version: u32,
+    sequence: u64,
+    previous_hash: B256,
+    patch: json_patch::Patch,
+    checksum: B256,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TimedSnapshot {
@@ -121,13 +146,19 @@ impl Default for JsonState {
 
 struct JsonStore {
     path: PathBuf,
+    manifest_path: PathBuf,
+    journal_dir: PathBuf,
+    journal_head_hash: B256,
+    checkpoint_revision: u64,
+    checkpoint_head_hash: B256,
     state: JsonState,
 }
 
 impl JsonStore {
     fn open(path: PathBuf) -> Result<Self, StorageError> {
         let mut migrated = false;
-        let state = if path.exists() {
+        let checkpoint_exists = path.exists();
+        let mut state = if checkpoint_exists {
             let bytes = std::fs::read(&path)?;
             let mut state: JsonState = serde_json::from_slice(&bytes)?;
             match state.format_version {
@@ -147,10 +178,58 @@ impl JsonStore {
         } else {
             JsonState::default()
         };
-        let store = Self { path, state };
-        if !store.path.exists() || migrated {
-            store.persist(&store.state)?;
+        let (manifest_path, journal_dir) = journal_paths(&path)?;
+        std::fs::create_dir_all(&journal_dir)?;
+        let manifest = if manifest_path.exists() {
+            Some(serde_json::from_slice::<JournalManifest>(&std::fs::read(
+                &manifest_path,
+            )?)?)
+        } else {
+            None
+        };
+        if manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.schema_version != JOURNAL_SCHEMA_VERSION)
+        {
+            return Err(StorageError::Invariant(
+                "journal manifest version is unsupported",
+            ));
         }
+        let checkpoint_revision = state.revision;
+        let checkpoint_head_hash = manifest
+            .as_ref()
+            .filter(|manifest| manifest.checkpoint_revision == checkpoint_revision)
+            .map_or(B256::ZERO, |manifest| manifest.checkpoint_head_hash);
+        let journal_head_hash = replay_journal(
+            &journal_dir,
+            &mut state,
+            checkpoint_revision,
+            checkpoint_head_hash,
+        )?;
+        if manifest.as_ref().is_some_and(|manifest| {
+            manifest.journal_revision > state.revision
+                || manifest.journal_revision == state.revision
+                    && manifest.journal_head_hash != journal_head_hash
+        }) {
+            return Err(StorageError::Invariant(
+                "journal manifest is ahead of durable records",
+            ));
+        }
+        let mut store = Self {
+            path,
+            manifest_path,
+            journal_dir,
+            journal_head_hash,
+            checkpoint_revision,
+            checkpoint_head_hash,
+            state,
+        };
+        if !checkpoint_exists || migrated {
+            store.persist(&store.state)?;
+            store.checkpoint_revision = store.state.revision;
+            store.checkpoint_head_hash = store.journal_head_hash;
+        }
+        store.persist_manifest()?;
         Ok(store)
     }
 
@@ -164,33 +243,91 @@ impl JsonStore {
             .revision
             .checked_add(1)
             .ok_or(StorageError::Invariant("JSON state revision overflow"))?;
-        self.persist(&next)?;
+        if next.revision.is_multiple_of(JOURNAL_SEGMENT_EVENTS) {
+            compact_hot_state(&mut next);
+        }
+        let previous = serde_json::to_value(&self.state)?;
+        let current = serde_json::to_value(&next)?;
+        let patch = json_patch::diff(&previous, &current);
+        let checksum = journal_checksum(
+            JOURNAL_SCHEMA_VERSION,
+            next.revision,
+            self.journal_head_hash,
+            &patch,
+        )?;
+        let record = JournalRecord {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            sequence: next.revision,
+            previous_hash: self.journal_head_hash,
+            patch,
+            checksum,
+        };
+        self.append_journal(&record)?;
+        self.journal_head_hash = checksum;
+        if next.revision.is_multiple_of(JOURNAL_SEGMENT_EVENTS) {
+            self.persist(&next)?;
+            self.checkpoint_revision = next.revision;
+            self.checkpoint_head_hash = checksum;
+        }
         self.state = next;
+        self.persist_manifest()?;
+        if self.state.revision.is_multiple_of(JOURNAL_SEGMENT_EVENTS) {
+            self.prune_checkpointed_segments()?;
+        }
+        Ok(())
+    }
+
+    fn append_journal(&self, record: &JournalRecord) -> Result<(), StorageError> {
+        let first = record
+            .sequence
+            .saturating_sub(1)
+            .checked_div(JOURNAL_SEGMENT_EVENTS)
+            .and_then(|segment| segment.checked_mul(JOURNAL_SEGMENT_EVENTS))
+            .and_then(|start| start.checked_add(1))
+            .ok_or(StorageError::Invariant("journal segment number overflow"))?;
+        let path = self.journal_dir.join(format!("segment-{first:020}.jsonl"));
+        let created = !path.exists();
+        let mut output = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut bytes = serde_json::to_vec(record)?;
+        bytes.push(b'\n');
+        output.write_all(&bytes)?;
+        output.sync_all()?;
+        if created {
+            File::open(&self.journal_dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn persist_manifest(&self) -> Result<(), StorageError> {
+        let manifest = JournalManifest {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            checkpoint_revision: self.checkpoint_revision,
+            checkpoint_head_hash: self.checkpoint_head_hash,
+            journal_revision: self.state.revision,
+            journal_head_hash: self.journal_head_hash,
+        };
+        persist_atomic_json(&self.manifest_path, &manifest, self.state.revision)
+    }
+
+    fn prune_checkpointed_segments(&self) -> Result<(), StorageError> {
+        let retain_from = self
+            .checkpoint_revision
+            .saturating_sub(JOURNAL_SEGMENT_EVENTS)
+            .saturating_add(1);
+        for path in journal_segment_paths(&self.journal_dir)? {
+            let Some(first) = journal_segment_start(&path) else {
+                continue;
+            };
+            if first < retain_from {
+                std::fs::remove_file(path)?;
+            }
+        }
+        File::open(&self.journal_dir)?.sync_all()?;
         Ok(())
     }
 
     fn persist(&self, state: &JsonState) -> Result<(), StorageError> {
-        let parent = parent_directory(&self.path);
-        std::fs::create_dir_all(parent)?;
-        let filename = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(StorageError::Invariant("JSON state filename is invalid"))?;
-        let temporary = self
-            .path
-            .with_file_name(format!(".{filename}.{}.tmp", state.revision));
-        let bytes = serde_json::to_vec_pretty(state)?;
-        let mut output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        output.write_all(&bytes)?;
-        output.sync_all()?;
-        drop(output);
-        std::fs::rename(&temporary, &self.path)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        persist_atomic_json(&self.path, state, state.revision)
     }
 
     fn backup(&self, destination: &Path, unique_suffix: u64) -> Result<(), StorageError> {
@@ -217,6 +354,198 @@ impl JsonStore {
         std::fs::rename(temporary, destination)?;
         File::open(parent)?.sync_all()?;
         Ok(())
+    }
+}
+
+fn journal_paths(path: &Path) -> Result<(PathBuf, PathBuf), StorageError> {
+    let parent = parent_directory(path);
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(StorageError::Invariant("JSON state filename is invalid"))?;
+    if filename == "state.json" {
+        Ok((parent.join("manifest.json"), parent.join("journal")))
+    } else {
+        Ok((
+            parent.join(format!("{filename}.manifest.json")),
+            parent.join(format!("{filename}.journal")),
+        ))
+    }
+}
+
+fn persist_atomic_json<T: Serialize>(
+    path: &Path,
+    value: &T,
+    revision: u64,
+) -> Result<(), StorageError> {
+    let parent = parent_directory(path);
+    std::fs::create_dir_all(parent)?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(StorageError::Invariant("JSON filename is invalid"))?;
+    let temporary =
+        path.with_file_name(format!(".{filename}.{revision}.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    output.write_all(&bytes)?;
+    output.sync_all()?;
+    drop(output);
+    std::fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn journal_checksum(
+    schema_version: u32,
+    sequence: u64,
+    previous_hash: B256,
+    patch: &json_patch::Patch,
+) -> Result<B256, StorageError> {
+    serde_json::to_vec(&(schema_version, sequence, previous_hash, patch))
+        .map(keccak256)
+        .map_err(StorageError::from)
+}
+
+fn journal_segment_start(path: &Path) -> Option<u64> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("segment-"))
+        .and_then(|name| name.strip_suffix(".jsonl"))
+        .and_then(|number| number.parse().ok())
+}
+
+fn journal_segment_paths(directory: &Path) -> Result<Vec<PathBuf>, StorageError> {
+    let mut paths = std::fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| journal_segment_start(path).is_some())
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| journal_segment_start(path).unwrap_or(u64::MAX));
+    Ok(paths)
+}
+
+fn read_journal_segment(path: &Path) -> Result<Vec<JournalRecord>, StorageError> {
+    let bytes = std::fs::read(path)?;
+    let mut records = Vec::new();
+    let mut offset = 0_usize;
+    for chunk in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let complete = chunk.last() == Some(&b'\n');
+        if !complete {
+            let file = OpenOptions::new().write(true).open(path)?;
+            file.set_len(
+                u64::try_from(offset)
+                    .map_err(|_| StorageError::Invariant("journal offset exceeds u64"))?,
+            )?;
+            file.sync_all()?;
+            break;
+        }
+        let payload = &chunk[..chunk.len().saturating_sub(1)];
+        if !payload.is_empty() {
+            records.push(serde_json::from_slice(payload)?);
+        }
+        offset = offset
+            .checked_add(chunk.len())
+            .ok_or(StorageError::Invariant("journal offset overflow"))?;
+    }
+    Ok(records)
+}
+
+fn replay_journal(
+    directory: &Path,
+    state: &mut JsonState,
+    checkpoint_revision: u64,
+    checkpoint_head_hash: B256,
+) -> Result<B256, StorageError> {
+    let mut head_hash = checkpoint_head_hash;
+    for path in journal_segment_paths(directory)? {
+        for record in read_journal_segment(&path)? {
+            if record.schema_version != JOURNAL_SCHEMA_VERSION
+                || journal_checksum(
+                    record.schema_version,
+                    record.sequence,
+                    record.previous_hash,
+                    &record.patch,
+                )? != record.checksum
+            {
+                return Err(StorageError::Invariant("journal checksum is invalid"));
+            }
+            if record.sequence < checkpoint_revision {
+                continue;
+            }
+            if record.sequence == checkpoint_revision {
+                head_hash = record.checksum;
+                continue;
+            }
+            if record.sequence <= state.revision {
+                continue;
+            }
+            if record.sequence != state.revision.saturating_add(1)
+                || record.previous_hash != head_hash
+            {
+                return Err(StorageError::Invariant(
+                    "journal hash chain is discontinuous",
+                ));
+            }
+            let mut value = serde_json::to_value(&*state)?;
+            json_patch::patch(&mut value, &record.patch)
+                .map_err(|_| StorageError::Invariant("journal patch is invalid"))?;
+            *state = serde_json::from_value(value)?;
+            if state.revision != record.sequence {
+                return Err(StorageError::Invariant("journal revision is inconsistent"));
+            }
+            head_hash = record.checksum;
+        }
+    }
+    Ok(head_hash)
+}
+
+fn compact_hot_state(state: &mut JsonState) {
+    if let Some(latest) = state
+        .canonical_blocks
+        .iter()
+        .map(|record| record.block.number)
+        .max()
+    {
+        let retain_from = latest.saturating_sub(HOT_BLOCK_RETENTION.saturating_sub(1));
+        state
+            .canonical_blocks
+            .retain(|record| record.block.number >= retain_from);
+        state
+            .canonical_logs
+            .retain(|record| record.block_number >= retain_from);
+    }
+    if state.exact_snapshots.len() > HOT_SNAPSHOT_RETENTION {
+        state
+            .exact_snapshots
+            .drain(..state.exact_snapshots.len() - HOT_SNAPSHOT_RETENTION);
+    }
+    if state.plans.len() > HOT_PLAN_RETENTION {
+        let referenced = state
+            .transactions
+            .iter()
+            .filter(|transaction| transaction.state.is_unresolved())
+            .filter_map(|transaction| transaction.reservation.plan_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let ordinary_to_keep = HOT_PLAN_RETENTION.saturating_sub(referenced.len());
+        let ordinary_start = state.plans.len().saturating_sub(ordinary_to_keep);
+        state.plans = state
+            .plans
+            .drain(..)
+            .enumerate()
+            .filter(|(index, plan)| {
+                *index >= ordinary_start || referenced.contains(&plan.plan.plan_id)
+            })
+            .map(|(_, plan)| plan)
+            .collect();
+    }
+    if state.topology_history.len() > HOT_SNAPSHOT_RETENTION {
+        state
+            .topology_history
+            .drain(..state.topology_history.len() - HOT_SNAPSHOT_RETENTION);
     }
 }
 
