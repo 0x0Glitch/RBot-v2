@@ -476,7 +476,6 @@ fn rate_solver_matches_exhaustive_tiny_domain_and_episode_budget_never_rearms()
 -> Result<(), Box<dyn Error>> {
     let (snapshot, mut vault, mut validated) = two_market_fixture()?;
     vault.minimum_action_assets = U256::ONE;
-    vault.maximum_movement_per_transaction_assets = U256::from(10_u8);
     vault.maximum_immediate_rebalance_loss_assets = U256::from(10_u8);
     for position in &mut vault.positions {
         position.maximum_action_assets = U256::from(10_u8);

@@ -17,7 +17,7 @@ use crate::domain::{
 };
 
 /// Configuration schema supported by this binary.
-pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const CONFIG_SCHEMA_VERSION: u32 = 4;
 /// Exact simple-APR time basis in seconds.
 pub const SECONDS_PER_YEAR: u64 = 31_536_000;
 /// Exact fixed-point scale.
@@ -380,8 +380,6 @@ pub struct VaultConfig {
     pub maximum_terminal_value_sacrifice_assets: String,
     /// Minimum active positions after economic exit.
     pub minimum_active_positions_after_economic_exit: usize,
-    /// Transaction movement bound.
-    pub maximum_movement_per_transaction_assets: String,
     /// Hourly movement bound.
     pub maximum_movement_per_hour_assets: String,
     /// Daily movement bound.
@@ -783,8 +781,6 @@ pub struct ValidatedVaultConfig {
     pub maximum_terminal_value_sacrifice_assets: U256,
     /// Active position floor.
     pub minimum_active_positions_after_economic_exit: usize,
-    /// Per-transaction movement bound.
-    pub maximum_movement_per_transaction_assets: U256,
     /// Hourly movement bound.
     pub maximum_movement_per_hour_assets: U256,
     /// Daily movement bound.
@@ -1385,16 +1381,6 @@ fn validate_vault(
 
     let minimum_action_assets =
         parse_u256("vault.minimum_action_assets", &vault.minimum_action_assets)?;
-    let maximum_movement_per_transaction_assets = parse_u256(
-        "vault.maximum_movement_per_transaction_assets",
-        &vault.maximum_movement_per_transaction_assets,
-    )?;
-    if minimum_action_assets > maximum_movement_per_transaction_assets {
-        return Err(validation(
-            "vault.minimum_action_assets",
-            "minimum action exceeds maximum per-transaction movement",
-        ));
-    }
     let minimum_deposit_headroom_assets = parse_u256(
         "vault.minimum_deposit_headroom_assets",
         &vault.minimum_deposit_headroom_assets,
@@ -1488,12 +1474,10 @@ fn validate_vault(
                 "vault.liquidity_adapter.maximum_action_assets",
                 &adapter.maximum_action_assets,
             )?;
-            if maximum_action_assets == U256::ZERO
-                || maximum_action_assets > maximum_movement_per_transaction_assets
-            {
+            if maximum_action_assets == U256::ZERO {
                 return Err(validation(
                     "vault.liquidity_adapter.maximum_action_assets",
-                    "must be positive and no greater than the vault transaction movement bound",
+                    "must be positive",
                 ));
             }
             Ok(ValidatedLiquidityAdapterConfig {
@@ -1662,7 +1646,6 @@ fn validate_vault(
         )?,
         minimum_active_positions_after_economic_exit: vault
             .minimum_active_positions_after_economic_exit,
-        maximum_movement_per_transaction_assets,
         maximum_movement_per_hour_assets: parse_u256(
             "vault.maximum_movement_per_hour_assets",
             &vault.maximum_movement_per_hour_assets,

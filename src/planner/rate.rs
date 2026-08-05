@@ -302,10 +302,7 @@ pub fn solve_rate_rebalance(
             total.checked_add(*maximum)
         })
         .unwrap_or(U256::ZERO);
-    let maximum = source_total
-        .min(destination_total)
-        .min(vault.maximum_movement_per_transaction_assets)
-        .min(budget);
+    let maximum = source_total.min(destination_total).min(budget);
     let movement_lattice = build_candidate_lattice(
         vault.minimum_action_assets,
         maximum,

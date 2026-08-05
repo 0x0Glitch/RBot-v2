@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "node": {
     "instance_id": "felix-v2-reallocator-hyperevm",
     "mode": "shadow",
@@ -90,7 +90,7 @@
     "minimum_controllable_improvement_apr_bps": 3,
     "portfolio_spread_tolerance_apr_bps": 0,
     "confirmation_fast_blocks": 2,
-    "immediate_tranche_bps": 2000,
+    "immediate_tranche_bps": 5000,
     "persistent_confirmation_duration": "30s",
     "minimum_independent_rate_events": 3,
     "minimum_independent_event_span": "10s",
@@ -131,7 +131,6 @@
       "maximum_immediate_rebalance_loss_assets": "10000",
       "maximum_terminal_value_sacrifice_assets": "0",
       "minimum_active_positions_after_economic_exit": 1,
-      "maximum_movement_per_transaction_assets": "1000000000000",
       "maximum_movement_per_hour_assets": "2000000000000",
       "maximum_movement_per_day_assets": "10000000000000",
       "minimum_independent_event_assets": "1000000",

@@ -265,7 +265,6 @@ fn validate_actions(
     }
     let movement = allocated.max(deallocated);
     if movement != plan.projection.movement_assets
-        || movement > vault.maximum_movement_per_transaction_assets
         || plan.projection.immediate_loss_assets > vault.maximum_immediate_rebalance_loss_assets
     {
         return Err(FirewallError::Action);

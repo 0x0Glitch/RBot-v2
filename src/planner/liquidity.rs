@@ -192,7 +192,6 @@ pub fn solve_liquidity_maintenance(
         };
         let desired = deficit
             .max(vault.minimum_action_assets)
-            .min(vault.maximum_movement_per_transaction_assets)
             .min(destination.maximum_action_assets);
         let lattice = crate::planner::candidates::build_candidate_lattice(
             vault.minimum_action_assets,
@@ -300,7 +299,6 @@ pub fn solve_liquidity_maintenance(
     };
     let desired = deficit
         .max(vault.minimum_action_assets)
-        .min(vault.maximum_movement_per_transaction_assets)
         .min(destination.maximum_action_assets);
     let lattice = crate::planner::candidates::build_candidate_lattice(
         vault.minimum_action_assets,

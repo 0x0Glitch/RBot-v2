@@ -49,6 +49,7 @@ fn checked_in_hyperevm_vault_configuration_is_exact_and_complete() {
     };
     let vault = &validated.app.vaults[0];
     assert_eq!(validated.app.chain.chain_id, 999);
+    assert_eq!(validated.app.strategy.immediate_tranche_bps, 5_000);
     assert_eq!(vault.positions.len(), 8);
     assert!(vault.liquidity_adapter.is_some());
 }
@@ -78,8 +79,8 @@ fn unknown_field_is_rejected() {
         Err(error) => panic!("cannot read fixture: {error}"),
     };
     let modified = text.replacen(
-        "\"schema_version\": 3,",
-        "\"schema_version\": 3,\n  \"unknown\": true,",
+        "\"schema_version\": 4,",
+        "\"schema_version\": 4,\n  \"unknown\": true,",
         1,
     );
     assert!(serde_json::from_str::<AppConfig>(&modified).is_err());
@@ -204,17 +205,7 @@ fn provider_roles_and_hyperevm_log_bound_are_rejected() {
 }
 
 #[test]
-fn vault_movement_and_headroom_bounds_are_rejected() {
-    let mut config = raw_example();
-    config.vault[0].minimum_action_assets = "1000000000001".to_owned();
-    assert_field(
-        match config.validate() {
-            Ok(_) => panic!("minimum action above maximum must fail"),
-            Err(error) => error,
-        },
-        "vault.minimum_action_assets",
-    );
-
+fn vault_headroom_bounds_are_rejected() {
     let mut config = raw_example();
     config.vault[0].deposit_headroom_search_upper_bound_assets = "0".to_owned();
     assert_field(

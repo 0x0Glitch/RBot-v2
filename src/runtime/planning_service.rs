@@ -670,9 +670,7 @@ fn detect_rate_signal(
             total.checked_add(destination.destination_capacity)
         })
         .unwrap_or(U256::ZERO);
-    let desired_movement = source_capacity
-        .min(destination_capacity)
-        .min(vault.maximum_movement_per_transaction_assets);
+    let desired_movement = source_capacity.min(destination_capacity);
     Some(RateSignal {
         branch: if evaluation_markets == controllable_markets {
             RateObjectiveBranch::Portfolio

@@ -117,7 +117,7 @@ pub fn solve_capital_deployment(
         Some(value) => value,
         None => U256::MAX,
     };
-    let maximum = available.min(vault.maximum_movement_per_transaction_assets);
+    let maximum = available;
     let mut certificate = SearchCertificate {
         candidate_lattice_hash: B256::ZERO,
         nodes_evaluated: 0,
