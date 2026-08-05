@@ -100,6 +100,27 @@ fn decode_action(calldata: &[u8], config: &ValidatedVaultConfig) -> Result<V2Act
     if amount.is_zero() {
         return Err(DecodeError::ZeroAmount);
     }
+    if let Some(liquidity) = config
+        .liquidity_adapter
+        .as_ref()
+        .filter(|configured| configured.address.0 == adapter && data.is_empty())
+    {
+        return Ok(if allocation {
+            V2Action::Allocate {
+                position: liquidity.position_key,
+                adapter: liquidity.address,
+                data: Bytes::new(),
+                requested_assets: RequestedAssets(amount),
+            }
+        } else {
+            V2Action::Deallocate {
+                position: liquidity.position_key,
+                adapter: liquidity.address,
+                data: Bytes::new(),
+                requested_assets: RequestedAssets(amount),
+            }
+        });
+    }
     let mut matching = config.positions.iter().filter(|position| {
         position.adapter.0 == adapter
             && crate::domain::encode_adapter_data(&position.market_params) == data

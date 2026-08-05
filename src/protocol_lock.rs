@@ -38,6 +38,10 @@ pub enum IdentityKind {
     AdaptiveCurveIrm,
     /// Direct Morpho Market V1 Adapter V2.
     DirectAdapter,
+    /// Morpho Vault V1 liquidity-only adapter.
+    MorphoVaultV1Adapter,
+    /// Wrapped MetaMorpho V1 vault used by the liquidity adapter.
+    MorphoVaultV1,
     /// Multicall3 atomic-read helper.
     Multicall3,
     /// Vault asset token.

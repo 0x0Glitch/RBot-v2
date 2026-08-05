@@ -640,6 +640,7 @@ impl WatchedAddresses {
                 IdentityKind::DirectAdapter => {
                     watched.adapters.insert(identity.address);
                 }
+                IdentityKind::MorphoVaultV1Adapter | IdentityKind::MorphoVaultV1 => {}
                 IdentityKind::AssetToken => {
                     watched.tokens.insert(identity.address);
                 }

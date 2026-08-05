@@ -403,7 +403,7 @@ fn validate_production_profile(
             || !vault.require_zero_gates
         {
             failures.push(format!(
-                "vault {} does not enable every strict Felix production safety policy",
+                "vault {} does not enable every strict production safety policy",
                 vault.address.0
             ));
         }

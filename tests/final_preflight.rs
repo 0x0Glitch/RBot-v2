@@ -162,6 +162,7 @@ fn exact_snapshot(config: &ValidatedConfig, head: BlockRef) -> ExactVaultSnapsho
             required_dead_shares: U256::from(1_u64),
         },
         adapters: BTreeMap::new(),
+        liquidity_adapter: None,
         positions: BTreeMap::new(),
         markets: BTreeMap::new(),
         caps: BTreeMap::new(),

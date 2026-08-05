@@ -7,6 +7,8 @@ alloy::sol!("abi/IIrm.sol");
 alloy::sol!("abi/IVaultV2.sol");
 alloy::sol!("abi/IAdapter.sol");
 alloy::sol!("abi/IMorphoMarketV1AdapterV2.sol");
+alloy::sol!("abi/IMorphoVaultV1Adapter.sol");
+alloy::sol!("abi/IMetaMorphoV1.sol");
 alloy::sol!("abi/IGate.sol");
 alloy::sol!("abi/IMulticall3.sol");
 

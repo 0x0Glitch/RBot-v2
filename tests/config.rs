@@ -41,6 +41,19 @@ fn representative_configuration_validates_and_hashes_deterministically() {
 }
 
 #[test]
+fn checked_in_hyperevm_vault_configuration_is_exact_and_complete() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.hyperevm.json");
+    let validated = match AppConfig::load(&path).and_then(AppConfig::validate) {
+        Ok(config) => config,
+        Err(error) => panic!("HyperEVM configuration must validate: {error}"),
+    };
+    let vault = &validated.app.vaults[0];
+    assert_eq!(validated.app.chain.chain_id, 999);
+    assert_eq!(vault.positions.len(), 8);
+    assert!(vault.liquidity_adapter.is_some());
+}
+
+#[test]
 fn one_allocator_may_own_multiple_distinct_vaults() {
     let mut config = raw_example();
     let mut second = config.vault[0].clone();

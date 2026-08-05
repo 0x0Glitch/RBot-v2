@@ -150,6 +150,106 @@ pub fn solve_liquidity_maintenance(
     vault: &ValidatedVaultConfig,
     solver: &SolverConfigCanonical,
 ) -> LiquiditySolveResult {
+    if let (Some(destination), Some(current_state)) =
+        (&vault.liquidity_adapter, &snapshot.liquidity_adapter)
+    {
+        let required = vault.minimum_liquidity_adapter_assets.max(
+            vault
+                .minimum_atomic_exit_coverage_assets
+                .saturating_sub(snapshot.parent.idle_assets),
+        );
+        let deficit = required.saturating_sub(current_state.real_assets);
+        if deficit.is_zero()
+            && projection.deposit_headroom_satisfied
+            && projection.atomic_exit_coverage_satisfied
+            && projection.source_constraints_satisfied
+        {
+            return LiquiditySolveResult {
+                actions: Vec::new(),
+                state: None,
+            };
+        }
+        if deficit.is_zero() {
+            return LiquiditySolveResult {
+                actions: Vec::new(),
+                state: None,
+            };
+        }
+        let base =
+            match crate::planner::simulator::SimulationState::from_projection(snapshot, projection)
+            {
+                Ok(state) => state,
+                Err(_) => {
+                    return LiquiditySolveResult {
+                        actions: Vec::new(),
+                        state: None,
+                    };
+                }
+            };
+        let idle = match base.unreserved_idle() {
+            Ok(value) => value,
+            Err(_) => U256::ZERO,
+        };
+        let desired = deficit
+            .max(vault.minimum_action_assets)
+            .min(vault.maximum_movement_per_transaction_assets)
+            .min(destination.maximum_action_assets);
+        let lattice = crate::planner::candidates::build_candidate_lattice(
+            vault.minimum_action_assets,
+            desired,
+            &[deficit, idle],
+            solver.maximum_amount_candidates_per_position,
+        );
+        for amount in lattice
+            .amounts
+            .into_iter()
+            .rev()
+            .filter(|amount| *amount >= vault.minimum_action_assets)
+        {
+            let mut candidates = Vec::new();
+            let allocation = V2Action::Allocate {
+                position: destination.position_key,
+                adapter: destination.address,
+                data: alloy::primitives::Bytes::new(),
+                requested_assets: RequestedAssets(amount),
+            };
+            if amount <= idle {
+                candidates.push(vec![allocation.clone()]);
+            }
+            for source in vault.positions.iter().filter(|position| {
+                matches!(position.mode, MarketMode::Active | MarketMode::SourceOnly)
+            }) {
+                candidates.push(vec![
+                    V2Action::Deallocate {
+                        position: source.position_key,
+                        adapter: source.adapter,
+                        data: crate::domain::encode_adapter_data(&source.market_params),
+                        requested_assets: RequestedAssets(amount),
+                    },
+                    allocation.clone(),
+                ]);
+            }
+            for actions in candidates {
+                let Ok(state) = crate::planner::simulator::simulate_actions(
+                    snapshot, projection, vault, &actions,
+                ) else {
+                    continue;
+                };
+                if state.immediate_loss_assets <= vault.maximum_immediate_rebalance_loss_assets
+                    && state.validate_service_constraints(snapshot, vault).is_ok()
+                {
+                    return LiquiditySolveResult {
+                        actions,
+                        state: Some(state),
+                    };
+                }
+            }
+        }
+        return LiquiditySolveResult {
+            actions: Vec::new(),
+            state: None,
+        };
+    }
     let Some(destination) = vault
         .positions
         .iter()

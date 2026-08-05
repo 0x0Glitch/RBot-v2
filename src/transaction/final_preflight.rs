@@ -20,8 +20,8 @@ use crate::{
         StorageError,
         actor::StorageHandle,
         models::{
-            ExpectedActionKind, ExpectedActionRecord, FinalPreflightRecord, TransactionState,
-            TransactionTransition,
+            ExpectedActionKind, ExpectedActionRecord, ExpectedAdapterKind, FinalPreflightRecord,
+            TransactionState, TransactionTransition,
         },
     },
     transaction::{
@@ -38,7 +38,9 @@ use crate::{
     },
 };
 use crate::{
-    domain::V2Action, planner::simulator::ActionProjection, state::caps::direct_position_cap_data,
+    domain::V2Action,
+    planner::simulator::ActionProjection,
+    state::caps::{adapter_cap_id, direct_position_cap_data},
 };
 
 /// Stable inclusion scenario identity.
@@ -570,28 +572,62 @@ pub(crate) fn expected_action_records(
             if projection.position != position || projection.requested_assets != requested_assets {
                 return Err(PreflightError::Firewall(FirewallError::Action));
             }
-            let configured = vault
-                .positions
-                .iter()
-                .find(|configured| configured.position_key == position)
-                .ok_or(PreflightError::Firewall(FirewallError::Action))?;
-            if configured.adapter != adapter {
-                return Err(PreflightError::Firewall(FirewallError::Action));
+            if let Some(configured) = vault
+                .liquidity_adapter
+                .as_ref()
+                .filter(|configured| configured.position_key == position)
+            {
+                if configured.address != adapter {
+                    return Err(PreflightError::Firewall(FirewallError::Action));
+                }
+                let idle_params = crate::domain::MarketParams {
+                    loan_token: vault.asset.0,
+                    collateral_token: alloy::primitives::Address::ZERO,
+                    oracle: alloy::primitives::Address::ZERO,
+                    irm: alloy::primitives::Address::ZERO,
+                    lltv: U256::ZERO,
+                };
+                Ok(ExpectedActionRecord {
+                    kind,
+                    adapter_kind: ExpectedAdapterKind::MorphoVaultV1Idle,
+                    position,
+                    adapter,
+                    intermediary: Some(configured.morpho_vault_v1),
+                    market: crate::domain::derive_market_id(&idle_params),
+                    requested_assets,
+                    changed_shares: projection.changed_shares,
+                    expected_assets_after: projection.expected_assets_after,
+                    returned_cap_ids: vec![adapter_cap_id(adapter.0).0],
+                    allocation_change: projection.allocation_change,
+                    positive_loss_assets: projection.positive_loss_assets,
+                })
+            } else {
+                let configured = vault
+                    .positions
+                    .iter()
+                    .find(|configured| configured.position_key == position)
+                    .ok_or(PreflightError::Firewall(FirewallError::Action))?;
+                if configured.adapter != adapter {
+                    return Err(PreflightError::Firewall(FirewallError::Action));
+                }
+                Ok(ExpectedActionRecord {
+                    kind,
+                    adapter_kind: ExpectedAdapterKind::DirectMarket,
+                    position,
+                    adapter,
+                    intermediary: None,
+                    market: configured.market_id,
+                    requested_assets,
+                    changed_shares: projection.changed_shares,
+                    expected_assets_after: projection.expected_assets_after,
+                    returned_cap_ids: direct_position_cap_data(adapter, &configured.market_params)
+                        .ids()
+                        .map(|id| id.0)
+                        .to_vec(),
+                    allocation_change: projection.allocation_change,
+                    positive_loss_assets: projection.positive_loss_assets,
+                })
             }
-            Ok(ExpectedActionRecord {
-                kind,
-                position,
-                adapter,
-                market: configured.market_id,
-                requested_assets,
-                changed_shares: projection.changed_shares,
-                expected_assets_after: projection.expected_assets_after,
-                returned_cap_ids: direct_position_cap_data(adapter, &configured.market_params)
-                    .ids()
-                    .map(|id| id.0),
-                allocation_change: projection.allocation_change,
-                positive_loss_assets: projection.positive_loss_assets,
-            })
         })
         .collect()
 }

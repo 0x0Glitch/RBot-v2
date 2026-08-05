@@ -9,6 +9,7 @@ pub mod blue_math;
 pub mod fees;
 pub mod market_adapter;
 pub mod rewards;
+pub mod vault_v1_adapter;
 pub mod vault_v2;
 
 /// Fail-closed protocol arithmetic or state-transition error.

@@ -9,7 +9,7 @@ use crate::{
     config::ValidatedVaultConfig,
     domain::{
         AdapterAddress, CapRef, ExactVaultSnapshot, MarketId, MarketMode, PositionKey,
-        ProjectedMarketState, TokenAddress, V2Action,
+        ProjectedMarketState, TokenAddress, V2Action, VaultV1LiquidityAdapterState,
     },
     morpho::{
         MathError,
@@ -44,6 +44,7 @@ pub struct ActionProjection {
 struct PositionSimulation {
     adapter: AdapterAddress,
     market: MarketId,
+    current: bool,
     internal_shares: U256,
     expected_assets: U256,
     recorded_market_allocation: U256,
@@ -57,6 +58,7 @@ pub struct SimulationState {
     /// Current projected market states.
     pub markets: BTreeMap<MarketId, ProjectedMarketState>,
     positions: BTreeMap<PositionKey, PositionSimulation>,
+    liquidity_adapter: Option<VaultV1LiquidityAdapterState>,
     /// Current recorded allocation for every cap.
     pub cap_ledger: BTreeMap<CapRef, U256>,
     /// Current parent idle asset units, including locked idle.
@@ -126,11 +128,16 @@ impl SimulationState {
     ) -> Result<Self, SimulationError> {
         let mut positions = BTreeMap::new();
         for (key, position) in &snapshot.positions {
+            let adapter = snapshot
+                .adapters
+                .get(&position.adapter)
+                .ok_or(SimulationError::IncompleteState)?;
             positions.insert(
                 *key,
                 PositionSimulation {
                     adapter: position.adapter,
                     market: position.market_id,
+                    current: adapter.current_market_ids.contains(&position.market_id),
                     internal_shares: position.internal_supply_shares,
                     expected_assets: *projection
                         .vault
@@ -166,6 +173,7 @@ impl SimulationState {
         Ok(Self {
             markets: projection.markets.clone(),
             positions,
+            liquidity_adapter: snapshot.liquidity_adapter.clone(),
             cap_ledger: snapshot
                 .caps
                 .iter()
@@ -192,6 +200,14 @@ impl SimulationState {
         self.positions
             .get(&position)
             .map(|state| state.expected_assets)
+            .or_else(|| {
+                self.liquidity_adapter
+                    .as_ref()
+                    .filter(|adapter| {
+                        crate::domain::derive_liquidity_position_key(adapter.adapter) == position
+                    })
+                    .map(|adapter| adapter.real_assets)
+            })
     }
 
     /// Recomputes every post-action position and service floor from simulated state.
@@ -200,7 +216,10 @@ impl SimulationState {
         snapshot: &ExactVaultSnapshot,
         config: &ValidatedVaultConfig,
     ) -> Result<(), SimulationError> {
-        let mut liquidity_adapter_assets = U256::ZERO;
+        let mut liquidity_adapter_assets = self
+            .liquidity_adapter
+            .as_ref()
+            .map_or(U256::ZERO, |adapter| adapter.real_assets);
         for configured in &config.positions {
             let position = self
                 .positions
@@ -288,11 +307,7 @@ impl SimulationState {
         }
         let mut terminal_adapter_assets = BTreeMap::new();
         for position in self.positions.values() {
-            let adapter = snapshot
-                .adapters
-                .get(&position.adapter)
-                .ok_or(SimulationError::IncompleteState)?;
-            if adapter.current_market_ids.contains(&position.market) {
+            if position.current {
                 let market = terminal_markets
                     .get(&position.market)
                     .ok_or(SimulationError::IncompleteState)?;
@@ -304,6 +319,9 @@ impl SimulationState {
                     .checked_add(assets)
                     .ok_or(SimulationError::Arithmetic)?;
             }
+        }
+        if let Some(liquidity) = &self.liquidity_adapter {
+            terminal_adapter_assets.insert(liquidity.adapter, liquidity.real_assets);
         }
         let mut parent = snapshot.parent.clone();
         parent.idle_assets = self.vault_idle;
@@ -371,11 +389,7 @@ fn adapter_real_assets(
 ) -> Result<BTreeMap<AdapterAddress, U256>, SimulationError> {
     let mut totals = BTreeMap::new();
     for (key, position) in &state.positions {
-        let adapter = snapshot
-            .adapters
-            .get(&position.adapter)
-            .ok_or(SimulationError::IncompleteState)?;
-        if adapter.current_market_ids.contains(&position.market) {
+        if position.current {
             let total = totals.entry(position.adapter).or_insert(U256::ZERO);
             *total = total
                 .checked_add(position.expected_assets)
@@ -384,6 +398,9 @@ fn adapter_real_assets(
         if !snapshot.positions.contains_key(key) {
             return Err(SimulationError::IncompleteState);
         }
+    }
+    if let Some(liquidity) = &state.liquidity_adapter {
+        totals.insert(liquidity.adapter, liquidity.real_assets);
     }
     Ok(totals)
 }
@@ -404,6 +421,79 @@ pub fn simulate_deallocation(
         } if !requested_assets.0.is_zero() => (*position, *adapter, data, requested_assets.0),
         _ => return Err(SimulationError::InvalidAction),
     };
+    if let Some(configured) = config
+        .liquidity_adapter
+        .as_ref()
+        .filter(|configured| configured.position_key == key)
+    {
+        if configured.address != adapter
+            || !data.is_empty()
+            || requested > configured.maximum_action_assets
+        {
+            return Err(SimulationError::InvalidAction);
+        }
+        let current = state
+            .liquidity_adapter
+            .as_ref()
+            .cloned()
+            .ok_or(SimulationError::IncompleteState)?;
+        if current.adapter != adapter {
+            return Err(SimulationError::IncompleteState);
+        }
+        let transition = crate::morpho::vault_v1_adapter::deallocate(&current, requested)?;
+        let reference = CapRef {
+            vault: config.address,
+            id: current.adapter_id,
+        };
+        let old = state
+            .cap_ledger
+            .get(&reference)
+            .copied()
+            .ok_or(SimulationError::IncompleteState)?;
+        state
+            .cap_ledger
+            .insert(reference, apply_delta(old, transition.allocation_change)?);
+        state
+            .shared_liquidity
+            .consume(TokenAddress(config.asset.0), requested)?;
+        state.vault_idle = state
+            .vault_idle
+            .checked_add(requested)
+            .ok_or(SimulationError::Arithmetic)?;
+        let local_loss = current.real_assets.saturating_sub(
+            transition
+                .real_assets
+                .checked_add(requested)
+                .ok_or(SimulationError::Arithmetic)?,
+        );
+        let mutable = state
+            .liquidity_adapter
+            .as_mut()
+            .ok_or(SimulationError::IncompleteState)?;
+        mutable.vault_total_assets = transition.vault_total_assets;
+        mutable.vault_total_supply = transition.vault_total_supply;
+        mutable.share_balance = transition.share_balance;
+        mutable.real_assets = transition.real_assets;
+        mutable.recorded_allocation = apply_delta(old, transition.allocation_change)?;
+        mutable.idle_market_total_supply_assets = transition.idle_market_total_supply_assets;
+        mutable.idle_market_total_supply_shares = transition.idle_market_total_supply_shares;
+        mutable.idle_market_supply_shares = transition.idle_market_supply_shares;
+        mutable.max_withdraw = mutable.max_withdraw.saturating_sub(requested);
+        state.immediate_loss_assets = state
+            .immediate_loss_assets
+            .checked_add(local_loss)
+            .ok_or(SimulationError::Arithmetic)?;
+        let projection = ActionProjection {
+            position: key,
+            requested_assets: requested,
+            changed_shares: transition.changed_morpho_shares,
+            expected_assets_after: transition.real_assets,
+            allocation_change: transition.allocation_change,
+            positive_loss_assets: local_loss,
+        };
+        state.actions.push(projection.clone());
+        return Ok(projection);
+    }
     let configured = config
         .positions
         .iter()
@@ -475,6 +565,7 @@ pub fn simulate_deallocation(
         .get_mut(&key)
         .ok_or(SimulationError::IncompleteState)?;
     mutable.internal_shares = transition.internal_supply_shares;
+    mutable.current = !transition.internal_supply_shares.is_zero();
     mutable.expected_assets = transition.expected_assets;
     mutable.recorded_market_allocation = transition.expected_assets;
     state.immediate_loss_assets = state
@@ -512,6 +603,100 @@ pub fn simulate_allocation(
     };
     if requested > state.unreserved_idle()? {
         return Err(SimulationError::InsufficientIdle);
+    }
+    if let Some(configured) = config
+        .liquidity_adapter
+        .as_ref()
+        .filter(|configured| configured.position_key == key)
+    {
+        if configured.address != adapter
+            || !data.is_empty()
+            || requested > configured.maximum_action_assets
+        {
+            return Err(SimulationError::InvalidAction);
+        }
+        if state.first_total_assets.is_none() {
+            let mut parent = snapshot.parent.clone();
+            parent.idle_assets = state.vault_idle;
+            let accrued = accrue_parent_view(
+                &parent,
+                &adapter_real_assets(state, snapshot)?,
+                projection.head.timestamp,
+            )?;
+            state.first_total_assets = Some(accrued.total_assets);
+        }
+        let first_total_assets = state
+            .first_total_assets
+            .ok_or(SimulationError::Arithmetic)?;
+        let current = state
+            .liquidity_adapter
+            .as_ref()
+            .cloned()
+            .ok_or(SimulationError::IncompleteState)?;
+        if current.adapter != adapter {
+            return Err(SimulationError::IncompleteState);
+        }
+        let transition = crate::morpho::vault_v1_adapter::allocate(&current, requested)?;
+        let reference = CapRef {
+            vault: config.address,
+            id: current.adapter_id,
+        };
+        let old = state
+            .cap_ledger
+            .get(&reference)
+            .copied()
+            .ok_or(SimulationError::IncompleteState)?;
+        let updated = apply_delta(old, transition.allocation_change)?;
+        let cap = snapshot
+            .caps
+            .get(&reference)
+            .ok_or(SimulationError::IncompleteState)?;
+        validate_allocation_cap(cap, first_total_assets, updated)
+            .map_err(|_| SimulationError::AllocationCap)?;
+        state.cap_ledger.insert(reference, updated);
+        state.vault_idle = state
+            .vault_idle
+            .checked_sub(requested)
+            .ok_or(SimulationError::InsufficientIdle)?;
+        state
+            .shared_liquidity
+            .credit(TokenAddress(config.asset.0), requested)?;
+        let local_loss = current
+            .real_assets
+            .checked_add(requested)
+            .ok_or(SimulationError::Arithmetic)?
+            .saturating_sub(transition.real_assets);
+        let mutable = state
+            .liquidity_adapter
+            .as_mut()
+            .ok_or(SimulationError::IncompleteState)?;
+        mutable.vault_total_assets = transition.vault_total_assets;
+        mutable.vault_total_supply = transition.vault_total_supply;
+        mutable.share_balance = transition.share_balance;
+        mutable.real_assets = transition.real_assets;
+        mutable.recorded_allocation = updated;
+        mutable.idle_market_total_supply_assets = transition.idle_market_total_supply_assets;
+        mutable.idle_market_total_supply_shares = transition.idle_market_total_supply_shares;
+        mutable.idle_market_supply_shares = transition.idle_market_supply_shares;
+        mutable.max_deposit = mutable.max_deposit.saturating_sub(requested);
+        mutable.max_withdraw = mutable
+            .max_withdraw
+            .checked_add(requested)
+            .ok_or(SimulationError::Arithmetic)?;
+        state.immediate_loss_assets = state
+            .immediate_loss_assets
+            .checked_add(local_loss)
+            .ok_or(SimulationError::Arithmetic)?;
+        let action_projection = ActionProjection {
+            position: key,
+            requested_assets: requested,
+            changed_shares: transition.changed_morpho_shares,
+            expected_assets_after: transition.real_assets,
+            allocation_change: transition.allocation_change,
+            positive_loss_assets: local_loss,
+        };
+        state.actions.push(action_projection.clone());
+        return Ok(action_projection);
     }
     let configured = config
         .positions
@@ -597,6 +782,7 @@ pub fn simulate_allocation(
         .get_mut(&key)
         .ok_or(SimulationError::IncompleteState)?;
     mutable.internal_shares = transition.internal_supply_shares;
+    mutable.current = !transition.internal_supply_shares.is_zero();
     mutable.expected_assets = transition.expected_assets;
     mutable.recorded_market_allocation = transition.expected_assets;
     state.immediate_loss_assets = state

@@ -1,0 +1,142 @@
+schema_version = 1
+chain_id = 999
+
+[[contract]]
+name = "vault-v2-canary"
+kind = "vault_v2"
+address = "0x51254785367d73A10a2Ea7d44B8e97b749BfbE8b"
+runtime_code_hash = "0x65f95156d47bd9fc7eeff3ef189fb705760b672217716ccb810f7d5bbcedc443"
+repository = "https://github.com/morpho-org/vault-v2"
+git_commit = "b1e9005c5d7a1c99eaa909dde02a365886faac07"
+source_path = "src/VaultV2.sol"
+compiler_version = "0.8.28"
+optimizer_enabled = true
+optimizer_runs = 100000
+constructor_immutables = { owner = "0xDd00059904ddF45e30b4131345957f76F26b8f6c", asset = "0xb88339CB7199b77E23DB6E890353E22632Ba630f", decimals = "18", virtualShares = "1000000000000" }
+proxy_policy = "reject_proxy"
+behavior_profile = "vault-v2-direct-markets-with-morpho-v1-idle-liquidity"
+
+[[contract]]
+name = "morpho-blue"
+kind = "morpho_singleton"
+address = "0x68e37dE8d93d3496ae143F2E900490f6280C57cD"
+runtime_code_hash = "0xb0849cc0b5a1fc4885b2c52c8796f8caa1c85f36fbc5d6de23269c743b95b891"
+repository = "https://github.com/morpho-org/morpho-blue"
+git_commit = "d09dd1c4b9c7d9d05f976faa7ebfdc424dae5e8c"
+source_path = "src/Morpho.sol"
+compiler_version = "0.8.19"
+optimizer_enabled = true
+optimizer_runs = 999999
+constructor_immutables = {}
+proxy_policy = "reject_proxy"
+behavior_profile = "morpho-blue-pinned-runtime"
+
+[[contract]]
+name = "adaptive-curve-irm"
+kind = "adaptive_curve_irm"
+address = "0xD4a426F010986dCad727e8dd6eed44cA4A9b7483"
+runtime_code_hash = "0x4e46b77bc1614e4a2ece46731c1d4dd5905a0d92135c7118b93083635e550985"
+repository = "https://github.com/morpho-org/morpho-blue-irm"
+git_commit = "a1a87fd5a7ee13873ea9d2bbd87e9c7b2cdbbef3"
+source_path = "src/adaptive-curve-irm/AdaptiveCurveIrm.sol"
+compiler_version = "0.8.19"
+optimizer_enabled = true
+optimizer_runs = 999999
+constructor_immutables = { morpho = "0x68e37dE8d93d3496ae143F2E900490f6280C57cD" }
+proxy_policy = "reject_proxy"
+behavior_profile = "adaptive-curve-irm-pinned-runtime"
+
+[[contract]]
+name = "direct-market-adapter"
+kind = "direct_adapter"
+address = "0xCB91635E00B15022869780753C55a61a29eaf6a0"
+runtime_code_hash = "0xcb120e1e2de4fba667a2141e38a80671b1f34a0bd8bf43b8f12a2d521e89ee0a"
+repository = "https://github.com/morpho-org/vault-v2"
+git_commit = "b1e9005c5d7a1c99eaa909dde02a365886faac07"
+source_path = "src/adapters/MorphoMarketV1AdapterV2.sol"
+compiler_version = "0.8.28"
+optimizer_enabled = true
+optimizer_runs = 100000
+constructor_immutables = { factory = "0xaEff6Ef4B7bbfbAadB18b634A8F11392CBeB72Be", parentVault = "0x51254785367d73A10a2Ea7d44B8e97b749BfbE8b", asset = "0xb88339CB7199b77E23DB6E890353E22632Ba630f", morpho = "0x68e37dE8d93d3496ae143F2E900490f6280C57cD", adaptiveCurveIrm = "0xD4a426F010986dCad727e8dd6eed44cA4A9b7483" }
+proxy_policy = "reject_proxy"
+behavior_profile = "morpho-market-v1-adapter-v2-direct"
+
+[[contract]]
+name = "morpho-vault-v1-liquidity-adapter"
+kind = "morpho_vault_v1_adapter"
+address = "0x2B138b526D22C1a393100B8f627cE80C8bd10695"
+runtime_code_hash = "0x7968e015bee0b8a6aaf76b275c9395f387ffff096e8903ea9be32789156e6db2"
+repository = "https://github.com/morpho-org/vault-v2"
+git_commit = "b1e9005c5d7a1c99eaa909dde02a365886faac07"
+source_path = "src/adapters/MorphoVaultV1Adapter.sol"
+compiler_version = "0.8.28"
+optimizer_enabled = true
+optimizer_runs = 100000
+constructor_immutables = { factory = "0xdf5202e29654e02011611A086f15477880580CAc", parentVault = "0x51254785367d73A10a2Ea7d44B8e97b749BfbE8b", morphoVaultV1 = "0x12e5E9cd5849B26e572a48894255cB9187a433d3" }
+proxy_policy = "reject_proxy"
+behavior_profile = "morpho-vault-v1-single-idle-market-liquidity-only"
+
+[[contract]]
+name = "wrapped-morpho-vault-v1"
+kind = "morpho_vault_v1"
+address = "0x12e5E9cd5849B26e572a48894255cB9187a433d3"
+runtime_code_hash = "0x9dfa3d3431a671f79ebf2fb25b3b6bd73114adf01c6bf2d7a7712c77a9bf861a"
+repository = "https://github.com/morpho-org/metamorpho"
+git_commit = "58e758ba581760af4e4e6189ceae742e0d6e063d"
+source_path = "src/MetaMorpho.sol"
+compiler_version = "0.8.21"
+optimizer_enabled = true
+optimizer_runs = 200
+constructor_immutables = { asset = "0xb88339CB7199b77E23DB6E890353E22632Ba630f", decimalsOffset = "12", idleMarket = "0x725d0f4c005c0a521ea5005bb4730845ff0d4cc76b40a618103b103cddd1f951" }
+proxy_policy = "reject_proxy"
+behavior_profile = "metamorpho-v1-single-canonical-idle-market"
+
+[[contract]]
+name = "multicall3"
+kind = "multicall3"
+address = "0xcA11bde05977b3631167028862bE2a173976CA11"
+runtime_code_hash = "0xd5c15df687b16f2ff992fc8d767b4216323184a2bbc6ee2f9c398c318e770891"
+repository = "https://github.com/mds1/multicall"
+git_commit = "b667d67ecfa5361a81e8f110234ce242613b0012"
+source_path = "src/Multicall3.sol"
+compiler_version = "0.8.12"
+optimizer_enabled = true
+optimizer_runs = 10000000
+constructor_immutables = {}
+proxy_policy = "reject_proxy"
+behavior_profile = "multicall3-aggregate3"
+
+[[contract]]
+name = "usdc"
+kind = "asset_token"
+address = "0xb88339CB7199b77E23DB6E890353E22632Ba630f"
+runtime_code_hash = "0xa119f674d44072e257f162aee49c7aba9b7a04fe2e8c84fcefddb366ab6d40cd"
+repository = "https://github.com/circlefin/stablecoin-evm"
+git_commit = "7acbe662898945f1a989ad74e28cfbc8897f4a4b"
+source_path = "contracts/v1/FiatTokenProxy.sol"
+compiler_version = "0.6.12"
+optimizer_enabled = true
+optimizer_runs = 1000000
+constructor_immutables = {}
+proxy_policy = "pinned_immutable_proxy"
+behavior_profile = "hyper-evm-usdc-runtime-and-decimals"
+
+[[contract]]
+name = "adapter-registry"
+kind = "adapter_registry"
+address = "0x857B55cEb57dA0C2A83EE08a8dB529B931089aee"
+runtime_code_hash = "0x426928df6636ab7d3cd2a2cace4cefe83c1edf3a9bc7f0b33f34a596aaf19fe4"
+repository = "https://github.com/morpho-org/vault-v2"
+git_commit = "b1e9005c5d7a1c99eaa909dde02a365886faac07"
+source_path = "src/interfaces/IAdapterRegistry.sol"
+compiler_version = "0.8.28"
+optimizer_enabled = true
+optimizer_runs = 100000
+constructor_immutables = {}
+proxy_policy = "reject_proxy"
+behavior_profile = "vault-v2-adapter-registry-pinned-runtime"
+
+[remote_signer]
+service_identity = "morpho-v2-reallocator-hyperevm"
+client_identity_env = "MORPHO_V2_SIGNER_CLIENT_IDENTITY"
+authentication_secret_env = "MORPHO_V2_SIGNER_AUTH_SECRET"

@@ -728,10 +728,16 @@ fn new_topology(vault: &ValidatedVaultConfig) -> Result<TopologyIndex, StateServ
         .positions
         .iter()
         .map(|position| (position.adapter, position.market_id, position.position_key));
+    let configured_adapters = vault.adapters.iter().map(|adapter| adapter.address).chain(
+        vault
+            .liquidity_adapter
+            .iter()
+            .map(|adapter| adapter.address),
+    );
     let mut topology = TopologyIndex::new(
         vault.address,
         vault.deployment_block,
-        vault.adapters.iter().map(|adapter| adapter.address),
+        configured_adapters,
         configured_positions,
     );
     catalog_configured_caps(&mut topology, vault, vault.deployment_block)?;
@@ -757,6 +763,17 @@ fn catalog_configured_caps(
                 }
                 continue;
             }
+            topology.catalog_cap_data(id, data, block_number)?;
+        }
+    }
+    if let Some(adapter) = &vault.liquidity_adapter {
+        let data = crate::state::caps::adapter_cap_data(adapter.address.0);
+        let id = crate::state::caps::adapter_cap_id(adapter.address.0);
+        if let Some(existing) = topology.cap_id_data.get(&id) {
+            if existing.id_data != data {
+                return Err(TopologyError::CapDataCollision);
+            }
+        } else {
             topology.catalog_cap_data(id, data, block_number)?;
         }
     }

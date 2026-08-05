@@ -82,15 +82,32 @@ pub enum ExpectedActionKind {
     Deallocate,
 }
 
+/// Adapter receipt/event profile for one expected action.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedAdapterKind {
+    /// Direct Morpho Market V1 Adapter V2.
+    #[default]
+    DirectMarket,
+    /// Morpho Vault V1 adapter wrapping the canonical idle market.
+    MorphoVaultV1Idle,
+}
+
 /// Exact simulator output retained for independent receipt conformance.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExpectedActionRecord {
     /// Ordered action direction.
     pub kind: ExpectedActionKind,
+    /// Exact adapter receipt profile.
+    #[serde(default)]
+    pub adapter_kind: ExpectedAdapterKind,
     /// Configured direct position.
     pub position: PositionKey,
     /// Direct adapter called by the vault.
     pub adapter: AdapterAddress,
+    /// Wrapped V1 vault intermediary for the liquidity profile.
+    #[serde(default)]
+    pub intermediary: Option<Address>,
     /// Morpho market ID encoded by the action data.
     pub market: MarketId,
     /// Requested vault asset units.
@@ -100,7 +117,7 @@ pub struct ExpectedActionRecord {
     /// Exact adapter allocation after the action.
     pub expected_assets_after: U256,
     /// Adapter, collateral and exact-market cap IDs in contract order.
-    pub returned_cap_ids: [B256; 3],
+    pub returned_cap_ids: Vec<B256>,
     /// Signed change returned to Vault V2 and applied to each cap.
     pub allocation_change: I256,
     /// Positive action-local loss in vault asset units.

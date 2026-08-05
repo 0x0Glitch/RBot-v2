@@ -157,6 +157,13 @@ pub fn refresh_reasons(
     {
         reasons.insert(RefreshReason::LiquidityAdapterFloor);
     }
+    if snapshot
+        .liquidity_adapter
+        .as_ref()
+        .is_some_and(|adapter| adapter.real_assets < config.minimum_liquidity_adapter_assets)
+    {
+        reasons.insert(RefreshReason::LiquidityAdapterFloor);
+    }
     for configured in &config.positions {
         let position = snapshot
             .positions
@@ -260,6 +267,57 @@ fn maximum_deposit(
             Ok(U256::from(u128::MAX).saturating_sub(parent_total_assets))
         };
     }
+    if let Some(liquidity) = &snapshot.liquidity_adapter {
+        let cap = snapshot
+            .caps
+            .get(&crate::domain::CapRef {
+                vault: config.address,
+                id: liquidity.adapter_id,
+            })
+            .ok_or(ProjectionError::IncompleteSnapshot)?;
+        let executable = |assets: U256| -> Result<bool, ProjectionError> {
+            if parent_total_assets
+                .checked_add(assets)
+                .is_none_or(|value| value > U256::from(u128::MAX))
+            {
+                return Ok(false);
+            }
+            let transition = match crate::morpho::vault_v1_adapter::allocate(liquidity, assets) {
+                Ok(transition) => transition,
+                Err(_) => return Ok(false),
+            };
+            let allocation =
+                add_signed_allocation(liquidity.recorded_allocation, transition.allocation_change)?;
+            Ok(validate_allocation_cap(
+                cap,
+                parent_total_assets
+                    .checked_add(assets)
+                    .ok_or(ProjectionError::Arithmetic)?,
+                allocation,
+            )
+            .is_ok())
+        };
+        let mut low = U256::ZERO;
+        let mut high = upper.min(liquidity.max_deposit);
+        while low < high {
+            let midpoint = low
+                .checked_add(
+                    high.checked_sub(low)
+                        .and_then(|distance| distance.checked_add(U256::ONE))
+                        .ok_or(ProjectionError::Arithmetic)?
+                        / U256::from(2_u8),
+                )
+                .ok_or(ProjectionError::Arithmetic)?;
+            if executable(midpoint)? {
+                low = midpoint;
+            } else {
+                high = midpoint
+                    .checked_sub(U256::ONE)
+                    .ok_or(ProjectionError::Arithmetic)?;
+            }
+        }
+        return Ok(low);
+    }
     let position = snapshot
         .positions
         .values()
@@ -338,6 +396,9 @@ fn maximum_liquidity_deallocation(
 ) -> Result<U256, ProjectionError> {
     if snapshot.parent.liquidity_adapter.is_zero() {
         return Ok(U256::ZERO);
+    }
+    if let Some(liquidity) = &snapshot.liquidity_adapter {
+        return Ok(liquidity.max_withdraw.min(liquidity.real_assets));
     }
     let position = snapshot
         .positions
@@ -445,6 +506,17 @@ pub fn project_snapshot_to_head(
     }
     for adapter in snapshot.adapters.keys() {
         adapter_real_assets.entry(*adapter).or_insert(U256::ZERO);
+    }
+    if let Some(liquidity) = &snapshot.liquidity_adapter {
+        adapter_real_assets.insert(liquidity.adapter, liquidity.real_assets);
+        let delta = signed_difference(liquidity.real_assets, liquidity.recorded_allocation)?;
+        cap_catch_up.insert(
+            crate::domain::CapRef {
+                vault: config.address,
+                id: liquidity.adapter_id,
+            },
+            delta,
+        );
     }
     let parent = accrue_parent_view(&snapshot.parent, &adapter_real_assets, head.timestamp)?;
     let max_executable_deposit_assets =

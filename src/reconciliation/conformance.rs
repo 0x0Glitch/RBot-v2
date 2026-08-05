@@ -24,6 +24,7 @@ use crate::{
         actor::StorageHandle,
         models::{
             CanonicalReceiptRecord, ConformanceRecord, ExpectedActionKind, ExpectedActionRecord,
+            ExpectedAdapterKind,
         },
     },
     transaction::{
@@ -185,6 +186,18 @@ pub fn validate_receipt_conformance(
     receipt: &CanonicalReceiptRecord,
 ) -> Result<ConformanceReport, ConformanceError> {
     validate_identity(expectation, observed, receipt)?;
+    if expectation
+        .actions
+        .iter()
+        .any(|action| match action.adapter_kind {
+            ExpectedAdapterKind::DirectMarket => action.intermediary.is_some(),
+            ExpectedAdapterKind::MorphoVaultV1Idle => {
+                action.intermediary.is_none_or(|address| address.is_zero())
+            }
+        })
+    {
+        return Err(ConformanceError::ExpectedAction);
+    }
     if receipt.status != Some(1) {
         return Err(ConformanceError::Status);
     }
@@ -193,6 +206,7 @@ pub fn validate_receipt_conformance(
     let adapters = expectation
         .actions
         .iter()
+        .filter(|action| action.adapter_kind == ExpectedAdapterKind::DirectMarket)
         .map(|action| action.adapter.0)
         .collect::<BTreeSet<_>>();
     let mut vault_actions = Vec::new();
@@ -272,6 +286,7 @@ pub fn validate_receipt_conformance(
     let expected_adapter = expectation
         .actions
         .iter()
+        .filter(|action| action.adapter_kind == ExpectedAdapterKind::DirectMarket)
         .map(|action| AdapterAction {
             kind: action.kind,
             adapter: action.adapter.0,
@@ -286,20 +301,28 @@ pub fn validate_receipt_conformance(
     let expected_morpho = expectation
         .actions
         .iter()
-        .map(|action| MorphoAction {
-            kind: action.kind,
-            market: action.market.0,
-            caller: action.adapter.0,
-            on_behalf: action.adapter.0,
-            receiver: (action.kind == ExpectedActionKind::Deallocate).then_some(action.adapter.0),
-            assets: action.requested_assets,
-            shares: action.changed_shares,
+        .map(|action| {
+            let account = match action.adapter_kind {
+                ExpectedAdapterKind::DirectMarket => action.adapter.0,
+                ExpectedAdapterKind::MorphoVaultV1Idle => action
+                    .intermediary
+                    .ok_or(ConformanceError::ExpectedAction)?,
+            };
+            Ok(MorphoAction {
+                kind: action.kind,
+                market: action.market.0,
+                caller: account,
+                on_behalf: account,
+                receiver: (action.kind == ExpectedActionKind::Deallocate).then_some(account),
+                assets: action.requested_assets,
+                shares: action.changed_shares,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, ConformanceError>>()?;
     if morpho_actions != expected_morpho {
         return Err(ConformanceError::MorphoEvent);
     }
-    if transfers != expected_transfers(expectation) {
+    if transfers != expected_transfers(expectation)? {
         return Err(ConformanceError::Transfer);
     }
     build_report(expectation, receipt)
@@ -572,12 +595,14 @@ fn normalize_transfer(event: ProtocolEvent) -> Result<AssetTransfer, Conformance
     })
 }
 
-fn expected_transfers(expectation: &ConformanceExpectation<'_>) -> Vec<AssetTransfer> {
+fn expected_transfers(
+    expectation: &ConformanceExpectation<'_>,
+) -> Result<Vec<AssetTransfer>, ConformanceError> {
     expectation
         .actions
         .iter()
-        .flat_map(|action| match action.kind {
-            ExpectedActionKind::Allocate => [
+        .map(|action| match (action.adapter_kind, action.kind) {
+            (ExpectedAdapterKind::DirectMarket, ExpectedActionKind::Allocate) => Ok(vec![
                 AssetTransfer {
                     from: expectation.vault.0,
                     to: action.adapter.0,
@@ -588,8 +613,8 @@ fn expected_transfers(expectation: &ConformanceExpectation<'_>) -> Vec<AssetTran
                     to: expectation.morpho,
                     value: action.requested_assets,
                 },
-            ],
-            ExpectedActionKind::Deallocate => [
+            ]),
+            (ExpectedAdapterKind::DirectMarket, ExpectedActionKind::Deallocate) => Ok(vec![
                 AssetTransfer {
                     from: expectation.morpho,
                     to: action.adapter.0,
@@ -600,9 +625,54 @@ fn expected_transfers(expectation: &ConformanceExpectation<'_>) -> Vec<AssetTran
                     to: expectation.vault.0,
                     value: action.requested_assets,
                 },
-            ],
+            ]),
+            (ExpectedAdapterKind::MorphoVaultV1Idle, ExpectedActionKind::Allocate) => {
+                let intermediary = action
+                    .intermediary
+                    .ok_or(ConformanceError::ExpectedAction)?;
+                Ok(vec![
+                    AssetTransfer {
+                        from: expectation.vault.0,
+                        to: action.adapter.0,
+                        value: action.requested_assets,
+                    },
+                    AssetTransfer {
+                        from: action.adapter.0,
+                        to: intermediary,
+                        value: action.requested_assets,
+                    },
+                    AssetTransfer {
+                        from: intermediary,
+                        to: expectation.morpho,
+                        value: action.requested_assets,
+                    },
+                ])
+            }
+            (ExpectedAdapterKind::MorphoVaultV1Idle, ExpectedActionKind::Deallocate) => {
+                let intermediary = action
+                    .intermediary
+                    .ok_or(ConformanceError::ExpectedAction)?;
+                Ok(vec![
+                    AssetTransfer {
+                        from: expectation.morpho,
+                        to: intermediary,
+                        value: action.requested_assets,
+                    },
+                    AssetTransfer {
+                        from: intermediary,
+                        to: action.adapter.0,
+                        value: action.requested_assets,
+                    },
+                    AssetTransfer {
+                        from: action.adapter.0,
+                        to: expectation.vault.0,
+                        value: action.requested_assets,
+                    },
+                ])
+            }
         })
-        .collect()
+        .collect::<Result<Vec<_>, ConformanceError>>()
+        .map(|groups| groups.into_iter().flatten().collect())
 }
 
 fn build_report(

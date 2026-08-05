@@ -12,6 +12,7 @@ use morpho_v2_reallocator::{
     },
     storage::models::{
         CanonicalLogRecord, CanonicalReceiptRecord, ExpectedActionKind, ExpectedActionRecord,
+        ExpectedAdapterKind,
     },
     transaction::firewall::RoutineTransactionFields,
 };
@@ -61,13 +62,15 @@ fn fixture() -> Fixture {
     ];
     let action = ExpectedActionRecord {
         kind: ExpectedActionKind::Allocate,
+        adapter_kind: morpho_v2_reallocator::storage::models::ExpectedAdapterKind::DirectMarket,
         position: PositionKey(B256::repeat_byte(0x12)),
         adapter,
+        intermediary: None,
         market,
         requested_assets: amount,
         changed_shares: shares,
         expected_assets_after: amount,
-        returned_cap_ids: ids,
+        returned_cap_ids: ids.to_vec(),
         allocation_change: change,
         positive_loss_assets: U256::ZERO,
     };
@@ -248,6 +251,109 @@ fn deallocation_fixture() -> Fixture {
     fixture
 }
 
+fn vault_v1_adapter_fixture(kind: ExpectedActionKind) -> Fixture {
+    let mut fixture = fixture();
+    let intermediary = Address::with_last_byte(0x23);
+    let amount = fixture.action.requested_assets;
+    let shares = fixture.action.changed_shares;
+    fixture.action.adapter_kind = ExpectedAdapterKind::MorphoVaultV1Idle;
+    fixture.action.intermediary = Some(intermediary);
+    fixture.action.returned_cap_ids = vec![B256::repeat_byte(0xa1)];
+    fixture.action.kind = kind;
+    if kind == ExpectedActionKind::Deallocate {
+        fixture.action.expected_assets_after = U256::ZERO;
+        fixture.action.allocation_change = -I256::try_from(amount).unwrap_or(I256::MAX);
+    }
+    let transfer_edges = match kind {
+        ExpectedActionKind::Allocate => [
+            (fixture.vault.0, fixture.action.adapter.0),
+            (fixture.action.adapter.0, intermediary),
+            (intermediary, fixture.morpho),
+        ],
+        ExpectedActionKind::Deallocate => [
+            (fixture.morpho, intermediary),
+            (intermediary, fixture.action.adapter.0),
+            (fixture.action.adapter.0, fixture.vault.0),
+        ],
+    };
+    let mut logs = transfer_edges
+        .into_iter()
+        .enumerate()
+        .map(|(index, (from, to))| {
+            event_log(
+                IERC20::Transfer {
+                    from,
+                    to,
+                    value: amount,
+                },
+                fixture.asset.0,
+                fixture.receipt.transaction_hash,
+                fixture.receipt.block_hash,
+                u64::try_from(index).unwrap_or(u64::MAX),
+            )
+        })
+        .collect::<Vec<_>>();
+    logs.push(match kind {
+        ExpectedActionKind::Allocate => event_log(
+            IMorpho::Supply {
+                id: fixture.action.market.0,
+                caller: intermediary,
+                onBehalf: intermediary,
+                assets: amount,
+                shares,
+            },
+            fixture.morpho,
+            fixture.receipt.transaction_hash,
+            fixture.receipt.block_hash,
+            3,
+        ),
+        ExpectedActionKind::Deallocate => event_log(
+            IMorpho::Withdraw {
+                id: fixture.action.market.0,
+                caller: intermediary,
+                onBehalf: intermediary,
+                receiver: intermediary,
+                assets: amount,
+                shares,
+            },
+            fixture.morpho,
+            fixture.receipt.transaction_hash,
+            fixture.receipt.block_hash,
+            3,
+        ),
+    });
+    logs.push(match kind {
+        ExpectedActionKind::Allocate => event_log(
+            IVaultV2::Allocate {
+                sender: fixture.transaction.from,
+                adapter: fixture.action.adapter.0,
+                assets: amount,
+                ids: fixture.action.returned_cap_ids.to_vec(),
+                change: fixture.action.allocation_change,
+            },
+            fixture.vault.0,
+            fixture.receipt.transaction_hash,
+            fixture.receipt.block_hash,
+            4,
+        ),
+        ExpectedActionKind::Deallocate => event_log(
+            IVaultV2::Deallocate {
+                sender: fixture.transaction.from,
+                adapter: fixture.action.adapter.0,
+                assets: amount,
+                ids: fixture.action.returned_cap_ids.to_vec(),
+                change: fixture.action.allocation_change,
+            },
+            fixture.vault.0,
+            fixture.receipt.transaction_hash,
+            fixture.receipt.block_hash,
+            4,
+        ),
+    });
+    fixture.receipt.logs = logs;
+    fixture
+}
+
 fn event_log<E: IntoLogData>(
     event: E,
     address: Address,
@@ -293,6 +399,28 @@ fn exact_deallocation_receipt_conforms() {
     let report =
         validate_receipt_conformance(&fixture.expectation(), &fixture.observed, &fixture.receipt);
     assert!(report.is_ok());
+}
+
+#[test]
+fn vault_v1_idle_adapter_receipts_conform_and_missing_intermediary_fails_closed() {
+    for kind in [ExpectedActionKind::Allocate, ExpectedActionKind::Deallocate] {
+        let fixture = vault_v1_adapter_fixture(kind);
+        assert!(
+            validate_receipt_conformance(
+                &fixture.expectation(),
+                &fixture.observed,
+                &fixture.receipt,
+            )
+            .is_ok()
+        );
+    }
+
+    let mut missing = vault_v1_adapter_fixture(ExpectedActionKind::Allocate);
+    missing.action.intermediary = None;
+    assert_eq!(
+        validate_receipt_conformance(&missing.expectation(), &missing.observed, &missing.receipt),
+        Err(ConformanceError::ExpectedAction)
+    );
 }
 
 #[test]

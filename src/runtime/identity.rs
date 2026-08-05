@@ -159,6 +159,22 @@ fn validate_vault_identities(
             "direct adapter",
         )?;
     }
+    if let Some(adapter) = &vault.liquidity_adapter {
+        require_identity(
+            contracts,
+            adapter.address.0,
+            IdentityKind::MorphoVaultV1Adapter,
+            Some(adapter.expected_code_hash),
+            "Morpho Vault V1 liquidity adapter",
+        )?;
+        require_identity(
+            contracts,
+            adapter.morpho_vault_v1,
+            IdentityKind::MorphoVaultV1,
+            Some(adapter.expected_morpho_vault_v1_code_hash),
+            "wrapped Morpho Vault V1",
+        )?;
+    }
     for position in &vault.positions {
         require_identity(
             contracts,

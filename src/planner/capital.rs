@@ -91,13 +91,31 @@ pub fn solve_capital_deployment(
         .try_fold(U256::ZERO, |total, lock| {
             total.checked_add(lock.remaining_assets)
         });
-    let available = if snapshot.idle_locks.verified {
+    let idle_available = if snapshot.idle_locks.verified {
         match locked.and_then(|locked| snapshot.parent.idle_assets.checked_sub(locked)) {
             Some(value) => value,
             None => U256::ZERO,
         }
     } else {
         U256::ZERO
+    };
+    let liquidity_available = snapshot
+        .liquidity_adapter
+        .as_ref()
+        .zip(vault.liquidity_adapter.as_ref())
+        .map_or(U256::ZERO, |(state, configured)| {
+            let retained = vault
+                .minimum_liquidity_adapter_assets
+                .max(vault.minimum_atomic_exit_coverage_assets);
+            state
+                .real_assets
+                .saturating_sub(retained)
+                .min(state.max_withdraw)
+                .min(configured.maximum_action_assets)
+        });
+    let available = match idle_available.checked_add(liquidity_available) {
+        Some(value) => value,
+        None => U256::MAX,
     };
     let maximum = available.min(vault.maximum_movement_per_transaction_assets);
     let mut certificate = SearchCertificate {
@@ -169,7 +187,12 @@ pub fn solve_capital_deployment(
             let lattice = build_candidate_lattice(
                 vault.minimum_action_assets,
                 *action_maximum,
-                &[deploy_target, available],
+                &[
+                    deploy_target,
+                    available,
+                    idle_available,
+                    liquidity_available,
+                ],
                 solver.maximum_amount_candidates_per_position,
             );
             hashes.extend_from_slice(lattice.hash.as_slice());
@@ -218,18 +241,36 @@ pub fn solve_capital_deployment(
                 continue;
             }
             selected[sink] = residual;
-            let actions = destinations
-                .iter()
-                .zip(selected)
-                .filter(|(_, amount)| !amount.is_zero())
-                .map(|((destination, _), amount)| V2Action::Allocate {
-                    position: destination.position_key,
-                    adapter: destination.adapter,
-                    data: crate::domain::encode_adapter_data(&destination.market_params),
-                    requested_assets: RequestedAssets(amount),
-                })
-                .collect::<Vec<_>>();
-            if actions.is_empty() || actions.len() > vault.positions.len() {
+            let mut actions = Vec::new();
+            let liquidity_withdrawal = deploy_target.saturating_sub(idle_available);
+            if !liquidity_withdrawal.is_zero() {
+                let Some(liquidity) = &vault.liquidity_adapter else {
+                    continue;
+                };
+                if liquidity_withdrawal > liquidity_available {
+                    continue;
+                }
+                actions.push(V2Action::Deallocate {
+                    position: liquidity.position_key,
+                    adapter: liquidity.address,
+                    data: alloy::primitives::Bytes::new(),
+                    requested_assets: RequestedAssets(liquidity_withdrawal),
+                });
+            }
+            actions.extend(
+                destinations
+                    .iter()
+                    .zip(selected)
+                    .filter(|(_, amount)| !amount.is_zero())
+                    .map(|((destination, _), amount)| V2Action::Allocate {
+                        position: destination.position_key,
+                        adapter: destination.adapter,
+                        data: crate::domain::encode_adapter_data(&destination.market_params),
+                        requested_assets: RequestedAssets(amount),
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            if actions.is_empty() || actions.len() > vault.positions.len().saturating_add(1) {
                 continue;
             }
             certificate.nodes_evaluated += 1;

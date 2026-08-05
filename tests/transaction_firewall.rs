@@ -186,6 +186,7 @@ fn durable_snapshot(plan: &ValidatedPlan, config: &ValidatedConfig) -> ExactVaul
             required_dead_shares: U256::ONE,
         },
         adapters: BTreeMap::new(),
+        liquidity_adapter: None,
         positions: BTreeMap::new(),
         markets: BTreeMap::new(),
         caps: BTreeMap::new(),
@@ -254,6 +255,59 @@ fn encoder_decoder_and_plan_firewall_round_trip_exactly() {
     assert!(matches!(
         validate_plan(bad_hash, &config),
         Err(FirewallError::PlanHash)
+    ));
+}
+
+#[test]
+fn liquidity_adapter_uses_only_the_configured_address_and_empty_data() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.hyperevm.json");
+    let config = match AppConfig::load(&path).and_then(AppConfig::validate) {
+        Ok(config) => config,
+        Err(error) => panic!("HyperEVM config must validate: {error}"),
+    };
+    let vault = &config.app.vaults[0];
+    let liquidity = match &vault.liquidity_adapter {
+        Some(adapter) => adapter,
+        None => panic!("liquidity adapter must be configured"),
+    };
+    let destination = &vault.positions[0];
+    let amount = U256::from(1_000_000_u64);
+    let mut plan = raw_plan(&config);
+    plan.actions = vec![
+        V2Action::Deallocate {
+            position: liquidity.position_key,
+            adapter: liquidity.address,
+            data: Bytes::new(),
+            requested_assets: morpho_v2_reallocator::domain::RequestedAssets(amount),
+        },
+        V2Action::Allocate {
+            position: destination.position_key,
+            adapter: destination.adapter,
+            data: morpho_v2_reallocator::domain::encode_adapter_data(&destination.market_params),
+            requested_assets: morpho_v2_reallocator::domain::RequestedAssets(amount),
+        },
+    ];
+    plan.projection.movement_assets = amount;
+    rehash(&mut plan);
+    let validated = match validate_plan(plan.clone(), &config) {
+        Ok(plan) => plan,
+        Err(error) => panic!("restricted liquidity plan must validate: {error}"),
+    };
+    let calldata = encode_validated_plan(&validated);
+    let decoded = match decode_routine_calldata(&calldata, vault) {
+        Ok(decoded) => decoded,
+        Err(error) => panic!("restricted liquidity calldata must decode: {error}"),
+    };
+    assert_eq!(decoded.actions, plan.actions);
+
+    let mut nonempty = plan;
+    if let V2Action::Deallocate { data, .. } = &mut nonempty.actions[0] {
+        *data = Bytes::from_static(&[1]);
+    }
+    rehash(&mut nonempty);
+    assert!(matches!(
+        validate_plan(nonempty, &config),
+        Err(FirewallError::Action)
     ));
 }
 

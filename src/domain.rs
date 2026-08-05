@@ -185,6 +185,14 @@ pub fn derive_position_key(adapter: AdapterAddress, params: &MarketParams) -> Po
     PositionKey(alloy::primitives::keccak256(input))
 }
 
+/// Derives the unique action key for the configured liquidity-only adapter.
+#[must_use]
+pub fn derive_liquidity_position_key(adapter: AdapterAddress) -> PositionKey {
+    let mut input = b"morpho-vault-v1-liquidity-adapter".to_vec();
+    input.extend_from_slice(adapter.0.as_slice());
+    PositionKey(alloy::primitives::keccak256(input))
+}
+
 /// Canonical direct-adapter data validation failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum AdapterDataError {
@@ -381,6 +389,49 @@ pub struct DirectAdapterState {
     pub skim_recipient: Address,
     /// Submitted pending adapter operations.
     pub pending_operations: Vec<PendingAdminOperation>,
+}
+
+/// Exact state of the narrowly supported Morpho Vault V1 idle liquidity adapter.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VaultV1LiquidityAdapterState {
+    /// Adapter address.
+    pub adapter: AdapterAddress,
+    /// Parent Vault V2.
+    pub parent_vault: Address,
+    /// Wrapped MetaMorpho V1 vault.
+    pub morpho_vault_v1: Address,
+    /// Adapter-scoped cap identifier.
+    pub adapter_id: CapId,
+    /// Adapter runtime bytecode hash.
+    pub runtime_code_hash: B256,
+    /// Wrapped vault runtime bytecode hash.
+    pub morpho_vault_v1_runtime_code_hash: B256,
+    /// Adapter's current exact ERC-4626 redeem value.
+    pub real_assets: U256,
+    /// Parent's recorded allocation for the adapter ID.
+    pub recorded_allocation: U256,
+    /// Adapter's wrapped-vault share balance.
+    pub share_balance: U256,
+    /// Wrapped vault total assets after its view accrual.
+    pub vault_total_assets: U256,
+    /// Wrapped vault ERC-20 share supply.
+    pub vault_total_supply: U256,
+    /// Wrapped vault virtual-share decimal offset.
+    pub decimals_offset: u8,
+    /// Exact current ERC-4626 deposit limit for the adapter.
+    pub max_deposit: U256,
+    /// Exact current ERC-4626 withdrawal limit for the adapter.
+    pub max_withdraw: U256,
+    /// Canonical zero-rate idle Morpho market used by both queues.
+    pub idle_market_id: MarketId,
+    /// Stored idle-market supply assets at the snapshot block.
+    pub idle_market_total_supply_assets: U256,
+    /// Stored idle-market supply shares at the snapshot block.
+    pub idle_market_total_supply_shares: U256,
+    /// Wrapped V1 vault's supply shares in the idle market.
+    pub idle_market_supply_shares: U256,
+    /// Adapter skim recipient.
+    pub skim_recipient: Address,
 }
 
 /// Vault-scoped cap reference.
@@ -693,6 +744,8 @@ pub struct ExactVaultSnapshot {
     /// Direct adapters.
     #[serde(with = "crate::serde_helpers::btree_map")]
     pub adapters: BTreeMap<AdapterAddress, DirectAdapterState>,
+    /// Supported liquidity-only adapter, when configured.
+    pub liquidity_adapter: Option<VaultV1LiquidityAdapterState>,
     /// Direct positions.
     #[serde(with = "crate::serde_helpers::btree_map")]
     pub positions: BTreeMap<PositionKey, DirectMarketPositionState>,

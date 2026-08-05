@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::domain::{
     AdapterAddress, AprBps, ArithmeticError, MarketId, MarketMode, MarketParams, PositionKey,
-    RateGroupId, RatePerSecond, RewardPolicy, TokenAddress, VaultAddress, derive_market_id,
-    derive_position_key,
+    RateGroupId, RatePerSecond, RewardPolicy, TokenAddress, VaultAddress,
+    derive_liquidity_position_key, derive_market_id, derive_position_key,
 };
 
 /// Configuration schema supported by this binary.
@@ -420,6 +420,8 @@ pub struct VaultConfig {
     /// Configured direct adapters.
     #[serde(rename = "adapters")]
     pub adapter: Vec<AdapterConfig>,
+    /// Optional supported liquidity-only adapter profile.
+    pub liquidity_adapter: Option<LiquidityAdapterConfig>,
     /// Configured direct positions.
     #[serde(rename = "positions")]
     pub position: Vec<PositionConfig>,
@@ -447,6 +449,32 @@ pub struct RateGroupConfig {
 pub enum AdapterKind {
     /// Direct Morpho Market V1 Adapter V2.
     MorphoMarketV1AdapterV2,
+}
+
+/// Supported liquidity-adapter behavior profile.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiquidityAdapterKind {
+    /// Morpho Vault V1 adapter wrapping a single canonical zero-rate idle market.
+    MorphoVaultV1Idle,
+}
+
+/// Raw configured liquidity-only adapter.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityAdapterConfig {
+    /// Adapter address; must equal the parent vault's live liquidity adapter.
+    pub address: String,
+    /// Narrow reviewed behavior profile.
+    pub kind: LiquidityAdapterKind,
+    /// Expected adapter runtime code hash.
+    pub expected_code_hash: String,
+    /// Wrapped MetaMorpho V1 vault.
+    pub morpho_vault_v1: String,
+    /// Expected wrapped vault runtime code hash.
+    pub expected_morpho_vault_v1_code_hash: String,
+    /// Per-action movement bound for this liquidity path.
+    pub maximum_action_assets: String,
 }
 
 /// Raw configured direct adapter.
@@ -793,6 +821,8 @@ pub struct ValidatedVaultConfig {
     pub rate_group: ValidatedRateGroupConfig,
     /// Sorted adapters.
     pub adapters: Vec<ValidatedAdapterConfig>,
+    /// Optional supported liquidity-only adapter.
+    pub liquidity_adapter: Option<ValidatedLiquidityAdapterConfig>,
     /// Sorted direct positions.
     pub positions: Vec<ValidatedPositionConfig>,
 }
@@ -825,6 +855,25 @@ pub struct ValidatedAdapterConfig {
     pub expected_code_hash: B256,
     /// Market-count bound.
     pub maximum_markets: usize,
+}
+
+/// Canonical liquidity-only adapter configuration.
+#[derive(Clone, Debug, Serialize)]
+pub struct ValidatedLiquidityAdapterConfig {
+    /// Stable synthetic action key used by the closed transaction grammar.
+    pub position_key: PositionKey,
+    /// Adapter address.
+    pub address: AdapterAddress,
+    /// Narrow behavior profile.
+    pub kind: LiquidityAdapterKind,
+    /// Expected adapter runtime hash.
+    pub expected_code_hash: B256,
+    /// Wrapped MetaMorpho V1 vault.
+    pub morpho_vault_v1: Address,
+    /// Expected wrapped vault runtime hash.
+    pub expected_morpho_vault_v1_code_hash: B256,
+    /// Per-action movement bound.
+    pub maximum_action_assets: U256,
 }
 
 /// Canonical direct-position configuration.
@@ -1422,6 +1471,52 @@ fn validate_vault(
         .map(|adapter| adapter.address)
         .collect::<BTreeSet<_>>();
 
+    let liquidity_adapter = vault
+        .liquidity_adapter
+        .map(|adapter| {
+            let address = AdapterAddress(parse_address(
+                "vault.liquidity_adapter.address",
+                &adapter.address,
+            )?);
+            if adapter_set.contains(&address) {
+                return Err(validation(
+                    "vault.liquidity_adapter.address",
+                    "liquidity-only adapter must not also be configured as a direct adapter",
+                ));
+            }
+            let maximum_action_assets = parse_u256(
+                "vault.liquidity_adapter.maximum_action_assets",
+                &adapter.maximum_action_assets,
+            )?;
+            if maximum_action_assets == U256::ZERO
+                || maximum_action_assets > maximum_movement_per_transaction_assets
+            {
+                return Err(validation(
+                    "vault.liquidity_adapter.maximum_action_assets",
+                    "must be positive and no greater than the vault transaction movement bound",
+                ));
+            }
+            Ok(ValidatedLiquidityAdapterConfig {
+                position_key: derive_liquidity_position_key(address),
+                address,
+                kind: adapter.kind,
+                expected_code_hash: parse_nonzero_hash(
+                    "vault.liquidity_adapter.expected_code_hash",
+                    &adapter.expected_code_hash,
+                )?,
+                morpho_vault_v1: parse_address(
+                    "vault.liquidity_adapter.morpho_vault_v1",
+                    &adapter.morpho_vault_v1,
+                )?,
+                expected_morpho_vault_v1_code_hash: parse_nonzero_hash(
+                    "vault.liquidity_adapter.expected_morpho_vault_v1_code_hash",
+                    &adapter.expected_morpho_vault_v1_code_hash,
+                )?,
+                maximum_action_assets,
+            })
+        })
+        .transpose()?;
+
     let mut positions = Vec::with_capacity(vault.position.len());
     for position in vault.position {
         let adapter = AdapterAddress(parse_address("vault.position.adapter", &position.adapter)?);
@@ -1618,6 +1713,7 @@ fn validate_vault(
             allow_cross_group_movement: group.allow_cross_group_movement,
         },
         adapters,
+        liquidity_adapter,
         positions,
     })
 }

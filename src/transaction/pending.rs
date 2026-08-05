@@ -125,16 +125,30 @@ impl TouchedResources {
                     position, adapter, ..
                 } => (*position, *adapter),
             };
-            let configured = vault
-                .positions
-                .iter()
-                .find(|configured| {
-                    configured.position_key == position && configured.adapter == adapter
+            let market = if let Some(_configured) =
+                vault.liquidity_adapter.as_ref().filter(|configured| {
+                    configured.position_key == position && configured.address == adapter
+                }) {
+                crate::domain::derive_market_id(&crate::domain::MarketParams {
+                    loan_token: vault.asset.0,
+                    collateral_token: alloy::primitives::Address::ZERO,
+                    oracle: alloy::primitives::Address::ZERO,
+                    irm: alloy::primitives::Address::ZERO,
+                    lltv: alloy::primitives::U256::ZERO,
                 })
-                .ok_or(PendingPolicyError::Identity)?;
+            } else {
+                vault
+                    .positions
+                    .iter()
+                    .find(|configured| {
+                        configured.position_key == position && configured.adapter == adapter
+                    })
+                    .map(|configured| configured.market_id)
+                    .ok_or(PendingPolicyError::Identity)?
+            };
             positions.push(position);
             adapters.push(adapter);
-            markets.push(configured.market_id);
+            markets.push(market);
         }
         positions.sort();
         positions.dedup();

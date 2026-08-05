@@ -110,3 +110,9 @@ pub fn validate_allocation_cap(
 pub fn adapter_cap_id(adapter: Address) -> CapId {
     CapId(keccak256(("this", adapter).abi_encode_params()))
 }
+
+/// Returns canonical `abi.encode("this", adapter)` data for a generic adapter cap.
+#[must_use]
+pub fn adapter_cap_data(adapter: Address) -> Bytes {
+    ("this", adapter).abi_encode_params().into()
+}

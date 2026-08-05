@@ -17,12 +17,14 @@ use crate::config::{
     ValidatedVaultConfig,
 };
 use crate::contracts::bindings::{
-    AdapterMarketParams, IAdapter, IERC20, IGate, IIrm, IMorpho, IMorphoMarketV1AdapterV2, IVaultV2,
+    AdapterMarketParams, IAdapter, IERC20, IGate, IIrm, IMetaMorphoV1, IMorpho,
+    IMorphoMarketV1AdapterV2, IMorphoVaultV1Adapter, IVaultV2,
 };
 use crate::domain::{
     AdapterAddress, CapId, CapRef, CapState, DirectAdapterState, DirectMarketPositionState,
     ExactVaultSnapshot, IdleLockLedgerSnapshot, MarketId, MarketMode, ParentVaultState,
     PendingAdminOperation, PositionKey, StateContext, StoredMarketState,
+    VaultV1LiquidityAdapterState, derive_market_id,
 };
 
 use super::capability::{
@@ -125,6 +127,27 @@ pub(crate) enum SnapshotKey {
     AdapterMarketLength(AdapterAddress),
     AdapterMarketAt(AdapterAddress, usize),
     AdapterSkimRecipient(AdapterAddress),
+    LiquidityAdapterFactory,
+    LiquidityAdapterParent,
+    LiquidityAdapterVault,
+    LiquidityAdapterId,
+    LiquidityAdapterRealAssets,
+    LiquidityAdapterAllocation,
+    LiquidityAdapterSkimRecipient,
+    LiquidityVaultAsset,
+    LiquidityVaultAssetBalance,
+    LiquidityVaultTotalAssets,
+    LiquidityVaultTotalSupply,
+    LiquidityVaultShareBalance,
+    LiquidityVaultDecimalsOffset,
+    LiquidityVaultMaxDeposit,
+    LiquidityVaultMaxWithdraw,
+    LiquidityVaultSupplyQueueLength,
+    LiquidityVaultWithdrawQueueLength,
+    LiquidityVaultSupplyQueueZero,
+    LiquidityVaultWithdrawQueueZero,
+    LiquidityIdleMarketState,
+    LiquidityIdlePosition,
     AdapterPendingExecutable(B256),
     PositionInternalShares(PositionKey),
     PositionActualShares(PositionKey),
@@ -544,6 +567,22 @@ pub fn build_snapshot_manifest(
             ReturnSchema::Uint(256),
             SnapshotPurpose::Parent,
         )?;
+        if blueprint
+            .vault
+            .liquidity_adapter
+            .as_ref()
+            .is_some_and(|configured| configured.address == *adapter)
+        {
+            continue;
+        }
+        if !blueprint
+            .vault
+            .adapters
+            .iter()
+            .any(|configured| configured.address == *adapter)
+        {
+            return Err(SnapshotError::IdentityMismatch);
+        }
         builder.call(
             SnapshotKey::AdapterFactory(*adapter),
             adapter.0,
@@ -620,6 +659,168 @@ pub fn build_snapshot_manifest(
         )?;
     }
 
+    if let Some(liquidity) = &blueprint.vault.liquidity_adapter {
+        let adapter = liquidity.address.0;
+        let wrapped = liquidity.morpho_vault_v1;
+        let idle_market = derive_market_id(&crate::domain::MarketParams {
+            loan_token: blueprint.vault.asset.0,
+            collateral_token: Address::ZERO,
+            oracle: Address::ZERO,
+            irm: Address::ZERO,
+            lltv: U256::ZERO,
+        });
+        builder.call(
+            SnapshotKey::LiquidityAdapterFactory,
+            adapter,
+            IMorphoVaultV1Adapter::factoryCall {},
+            ReturnSchema::Address,
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityAdapterParent,
+            adapter,
+            IMorphoVaultV1Adapter::parentVaultCall {},
+            ReturnSchema::Address,
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityAdapterVault,
+            adapter,
+            IMorphoVaultV1Adapter::morphoVaultV1Call {},
+            ReturnSchema::Address,
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityAdapterId,
+            adapter,
+            IMorphoVaultV1Adapter::adapterIdCall {},
+            ReturnSchema::Bytes32,
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityAdapterRealAssets,
+            adapter,
+            IMorphoVaultV1Adapter::realAssetsCall {},
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityAdapterAllocation,
+            adapter,
+            IMorphoVaultV1Adapter::allocationCall {},
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityAdapterSkimRecipient,
+            adapter,
+            IMorphoVaultV1Adapter::skimRecipientCall {},
+            ReturnSchema::Address,
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultAsset,
+            wrapped,
+            IMetaMorphoV1::assetCall {},
+            ReturnSchema::Address,
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultAssetBalance,
+            asset,
+            IERC20::balanceOfCall { account: wrapped },
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Token,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultTotalAssets,
+            wrapped,
+            IMetaMorphoV1::totalAssetsCall {},
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultTotalSupply,
+            wrapped,
+            IMetaMorphoV1::totalSupplyCall {},
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultShareBalance,
+            wrapped,
+            IMetaMorphoV1::balanceOfCall { account: adapter },
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultDecimalsOffset,
+            wrapped,
+            IMetaMorphoV1::DECIMALS_OFFSETCall {},
+            ReturnSchema::Uint(8),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultMaxDeposit,
+            wrapped,
+            IMetaMorphoV1::maxDepositCall { receiver: adapter },
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultMaxWithdraw,
+            wrapped,
+            IMetaMorphoV1::maxWithdrawCall { owner: adapter },
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultSupplyQueueLength,
+            wrapped,
+            IMetaMorphoV1::supplyQueueLengthCall {},
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultWithdrawQueueLength,
+            wrapped,
+            IMetaMorphoV1::withdrawQueueLengthCall {},
+            ReturnSchema::Uint(256),
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultSupplyQueueZero,
+            wrapped,
+            IMetaMorphoV1::supplyQueueCall { index: U256::ZERO },
+            ReturnSchema::Bytes32,
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityVaultWithdrawQueueZero,
+            wrapped,
+            IMetaMorphoV1::withdrawQueueCall { index: U256::ZERO },
+            ReturnSchema::Bytes32,
+            SnapshotPurpose::Adapter,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityIdleMarketState,
+            blueprint.chain.morpho_blue,
+            IMorpho::marketCall { id: idle_market.0 },
+            ReturnSchema::MorphoMarket,
+            SnapshotPurpose::Market,
+        )?;
+        builder.call(
+            SnapshotKey::LiquidityIdlePosition,
+            blueprint.chain.morpho_blue,
+            IMorpho::positionCall {
+                id: idle_market.0,
+                user: wrapped,
+            },
+            ReturnSchema::MorphoPosition,
+            SnapshotPurpose::Position,
+        )?;
+    }
+
     let position_configs = blueprint
         .vault
         .positions
@@ -627,6 +828,18 @@ pub fn build_snapshot_manifest(
         .map(|position| (position.position_key, position))
         .collect::<BTreeMap<_, _>>();
     for (adapter, topology) in &blueprint.topology.adapters {
+        if blueprint
+            .vault
+            .liquidity_adapter
+            .as_ref()
+            .is_some_and(|configured| configured.address == *adapter)
+        {
+            if !topology.current_market_ids.is_empty() || !topology.historical_market_ids.is_empty()
+            {
+                return Err(SnapshotError::IdentityMismatch);
+            }
+            continue;
+        }
         for market in &topology.historical_market_ids {
             if !blueprint
                 .vault
@@ -919,6 +1132,7 @@ pub fn bind_idle_lock_ledger(
         strategy: blueprint.strategy,
         parent: &snapshot.parent,
         adapters: &snapshot.adapters,
+        liquidity_adapter: snapshot.liquidity_adapter.as_ref(),
         positions: &snapshot.positions,
         markets: &snapshot.markets,
         caps: &snapshot.caps,
@@ -1195,6 +1409,24 @@ fn read_selector_allowed(selector: [u8; 4]) -> bool {
         IMorphoMarketV1AdapterV2::expectedSupplyAssetsCall::SELECTOR,
         IMorphoMarketV1AdapterV2::idsCall::SELECTOR,
         IMorphoMarketV1AdapterV2::executableAtCall::SELECTOR,
+        IMorphoVaultV1Adapter::factoryCall::SELECTOR,
+        IMorphoVaultV1Adapter::parentVaultCall::SELECTOR,
+        IMorphoVaultV1Adapter::morphoVaultV1Call::SELECTOR,
+        IMorphoVaultV1Adapter::adapterIdCall::SELECTOR,
+        IMorphoVaultV1Adapter::allocationCall::SELECTOR,
+        IMorphoVaultV1Adapter::realAssetsCall::SELECTOR,
+        IMorphoVaultV1Adapter::skimRecipientCall::SELECTOR,
+        IMetaMorphoV1::assetCall::SELECTOR,
+        IMetaMorphoV1::totalAssetsCall::SELECTOR,
+        IMetaMorphoV1::totalSupplyCall::SELECTOR,
+        IMetaMorphoV1::balanceOfCall::SELECTOR,
+        IMetaMorphoV1::DECIMALS_OFFSETCall::SELECTOR,
+        IMetaMorphoV1::maxDepositCall::SELECTOR,
+        IMetaMorphoV1::maxWithdrawCall::SELECTOR,
+        IMetaMorphoV1::supplyQueueLengthCall::SELECTOR,
+        IMetaMorphoV1::withdrawQueueLengthCall::SELECTOR,
+        IMetaMorphoV1::supplyQueueCall::SELECTOR,
+        IMetaMorphoV1::withdrawQueueCall::SELECTOR,
         IMorpho::marketCall::SELECTOR,
         IMorpho::positionCall::SELECTOR,
         IIrm::rateAtTargetCall::SELECTOR,
@@ -1273,6 +1505,14 @@ fn assemble_snapshot(
             *adapter,
             uint(&values, &SnapshotKey::ParentForcePenalty(*adapter))?,
         );
+        if blueprint
+            .vault
+            .liquidity_adapter
+            .as_ref()
+            .is_some_and(|configured| configured.address == *adapter)
+        {
+            continue;
+        }
         let parent = address(&values, &SnapshotKey::AdapterParent(*adapter))?;
         let adapter_asset = address(&values, &SnapshotKey::AdapterAsset(*adapter))?;
         let morpho = address(&values, &SnapshotKey::AdapterMorpho(*adapter))?;
@@ -1333,6 +1573,87 @@ fn assemble_snapshot(
             },
         );
     }
+    let liquidity_adapter = if let Some(configured) = &blueprint.vault.liquidity_adapter {
+        let adapter_id = CapId(bytes32(&values, &SnapshotKey::LiquidityAdapterId)?);
+        let expected_adapter_id = super::caps::adapter_cap_id(configured.address.0);
+        let idle_params = crate::domain::MarketParams {
+            loan_token: asset,
+            collateral_token: Address::ZERO,
+            oracle: Address::ZERO,
+            irm: Address::ZERO,
+            lltv: U256::ZERO,
+        };
+        let idle_market_id = derive_market_id(&idle_params);
+        let idle_market = market(&values, &SnapshotKey::LiquidityIdleMarketState)?;
+        let idle_position = position(&values, &SnapshotKey::LiquidityIdlePosition)?;
+        let share_balance = uint(&values, &SnapshotKey::LiquidityVaultShareBalance)?;
+        let vault_total_assets = uint(&values, &SnapshotKey::LiquidityVaultTotalAssets)?;
+        let vault_total_supply = uint(&values, &SnapshotKey::LiquidityVaultTotalSupply)?;
+        let decimals_offset =
+            u8::try_from(uint(&values, &SnapshotKey::LiquidityVaultDecimalsOffset)?)
+                .map_err(|_| SnapshotError::NumericRange)?;
+        let real_assets = uint(&values, &SnapshotKey::LiquidityAdapterRealAssets)?;
+        let reproduced = crate::morpho::vault_v1_adapter::preview_redeem(
+            share_balance,
+            vault_total_assets,
+            vault_total_supply,
+            decimals_offset,
+        )
+        .map_err(|_| SnapshotError::NumericRange)?;
+        if address(&values, &SnapshotKey::LiquidityAdapterFactory)?.is_zero()
+            || address(&values, &SnapshotKey::LiquidityAdapterParent)? != vault_address.0
+            || address(&values, &SnapshotKey::LiquidityAdapterVault)? != configured.morpho_vault_v1
+            || address(&values, &SnapshotKey::LiquidityVaultAsset)? != asset
+            || uint(&values, &SnapshotKey::LiquidityVaultAssetBalance)? != U256::ZERO
+            || adapter_id != expected_adapter_id
+            || uint(&values, &SnapshotKey::LiquidityVaultSupplyQueueLength)? != U256::ONE
+            || uint(&values, &SnapshotKey::LiquidityVaultWithdrawQueueLength)? != U256::ONE
+            || MarketId(bytes32(
+                &values,
+                &SnapshotKey::LiquidityVaultSupplyQueueZero,
+            )?) != idle_market_id
+            || MarketId(bytes32(
+                &values,
+                &SnapshotKey::LiquidityVaultWithdrawQueueZero,
+            )?) != idle_market_id
+            || idle_market[2] != U256::ZERO
+            || idle_market[3] != U256::ZERO
+            || idle_position[1] != U256::ZERO
+            || idle_position[2] != U256::ZERO
+            || real_assets != reproduced
+        {
+            return Err(SnapshotError::IdentityMismatch);
+        }
+        Some(VaultV1LiquidityAdapterState {
+            adapter: configured.address,
+            parent_vault: vault_address.0,
+            morpho_vault_v1: configured.morpho_vault_v1,
+            adapter_id,
+            runtime_code_hash: *blueprint
+                .code_hashes
+                .get(&configured.address.0)
+                .ok_or(SnapshotError::MissingCodeIdentity)?,
+            morpho_vault_v1_runtime_code_hash: *blueprint
+                .code_hashes
+                .get(&configured.morpho_vault_v1)
+                .ok_or(SnapshotError::MissingCodeIdentity)?,
+            real_assets,
+            recorded_allocation: uint(&values, &SnapshotKey::LiquidityAdapterAllocation)?,
+            share_balance,
+            vault_total_assets,
+            vault_total_supply,
+            decimals_offset,
+            max_deposit: uint(&values, &SnapshotKey::LiquidityVaultMaxDeposit)?,
+            max_withdraw: uint(&values, &SnapshotKey::LiquidityVaultMaxWithdraw)?,
+            idle_market_id,
+            idle_market_total_supply_assets: idle_market[0],
+            idle_market_total_supply_shares: idle_market[1],
+            idle_market_supply_shares: idle_position[0],
+            skim_recipient: address(&values, &SnapshotKey::LiquidityAdapterSkimRecipient)?,
+        })
+    } else {
+        None
+    };
     let topology_enabled = blueprint
         .topology
         .adapters
@@ -1382,6 +1703,15 @@ fn assemble_snapshot(
         dead_share_balance: uint(&values, &SnapshotKey::ParentDeadShareBalance)?,
         required_dead_shares,
     };
+    match (&blueprint.vault.liquidity_adapter, &liquidity_adapter) {
+        (Some(configured), Some(state))
+            if parent.liquidity_adapter == configured.address.0
+                && parent.liquidity_data.is_empty()
+                && enabled_adapters.contains(&configured.address)
+                && state.adapter == configured.address => {}
+        (None, None) => {}
+        _ => return Err(SnapshotError::IdentityMismatch),
+    }
     let mut caps = BTreeMap::new();
     let mut positions = BTreeMap::new();
     let mut markets = BTreeMap::new();
@@ -1541,6 +1871,17 @@ fn assemble_snapshot(
             recorded_allocation: uint(&values, &SnapshotKey::CapAllocation(reference))?,
         });
     }
+    if let Some(state) = &liquidity_adapter {
+        let cap = caps
+            .get(&CapRef {
+                vault: vault_address,
+                id: state.adapter_id,
+            })
+            .ok_or(SnapshotError::IdentityMismatch)?;
+        if cap.recorded_allocation != state.recorded_allocation {
+            return Err(SnapshotError::IdentityMismatch);
+        }
+    }
     for (adapter, state) in &adapters {
         let reproduced = state.current_market_ids.iter().try_fold(
             U256::ZERO,
@@ -1588,6 +1929,7 @@ fn assemble_snapshot(
         strategy: blueprint.strategy,
         parent: &parent,
         adapters: &adapters,
+        liquidity_adapter: liquidity_adapter.as_ref(),
         positions: &positions,
         markets: &markets,
         caps: &caps,
@@ -1609,6 +1951,7 @@ fn assemble_snapshot(
         },
         parent,
         adapters,
+        liquidity_adapter,
         positions,
         markets,
         caps,
@@ -1968,6 +2311,27 @@ mod tests {
             SnapshotKey::MarketLoanTokenBalance(_) => {
                 U256::from(500_000_000_u64).abi_encode().into()
             }
+            SnapshotKey::LiquidityAdapterFactory
+            | SnapshotKey::LiquidityAdapterParent
+            | SnapshotKey::LiquidityAdapterVault
+            | SnapshotKey::LiquidityAdapterId
+            | SnapshotKey::LiquidityAdapterRealAssets
+            | SnapshotKey::LiquidityAdapterAllocation
+            | SnapshotKey::LiquidityAdapterSkimRecipient
+            | SnapshotKey::LiquidityVaultAsset
+            | SnapshotKey::LiquidityVaultAssetBalance
+            | SnapshotKey::LiquidityVaultTotalAssets
+            | SnapshotKey::LiquidityVaultTotalSupply
+            | SnapshotKey::LiquidityVaultShareBalance
+            | SnapshotKey::LiquidityVaultDecimalsOffset
+            | SnapshotKey::LiquidityVaultMaxDeposit
+            | SnapshotKey::LiquidityVaultMaxWithdraw
+            | SnapshotKey::LiquidityVaultSupplyQueueLength
+            | SnapshotKey::LiquidityVaultWithdrawQueueLength
+            | SnapshotKey::LiquidityVaultSupplyQueueZero
+            | SnapshotKey::LiquidityVaultWithdrawQueueZero
+            | SnapshotKey::LiquidityIdleMarketState
+            | SnapshotKey::LiquidityIdlePosition => Bytes::new(),
         }
     }
 

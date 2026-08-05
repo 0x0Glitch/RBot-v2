@@ -9,13 +9,14 @@ use std::{
 use alloy::primitives::{Address, B256, U256};
 use morpho_v2_reallocator::{
     chain::logs::FlowOrigin,
-    config::AppConfig,
+    config::{AppConfig, LiquidityAdapterKind, ValidatedLiquidityAdapterConfig},
     domain::{
-        Assets, BlockHashBinding, BlockRef, CapRef, CapState, DirectAdapterState,
-        DirectMarketPositionState, ExactVaultSnapshot, IdleLockLedgerSnapshot, ParentVaultState,
-        RateObjectiveBranch, RequestedAssets, StateContext, StoredMarketState, TokenAddress,
-        V2Action, VaultAddress, VaultCapabilities, derive_market_id, derive_position_key,
-        encode_adapter_data,
+        AdapterAddress, Assets, BlockHashBinding, BlockRef, CapId, CapRef, CapState,
+        DirectAdapterState, DirectMarketPositionState, ExactVaultSnapshot, IdleLockLedgerSnapshot,
+        MarketId, ParentVaultState, RateObjectiveBranch, RequestedAssets, StateContext,
+        StoredMarketState, TokenAddress, V2Action, VaultAddress, VaultCapabilities,
+        VaultV1LiquidityAdapterState, derive_liquidity_position_key, derive_market_id,
+        derive_position_key, encode_adapter_data,
     },
     planner::{
         candidates::build_candidate_lattice,
@@ -26,11 +27,11 @@ use morpho_v2_reallocator::{
         objective::rate_spread,
         rate::solve_rate_rebalance,
         scheduler::{ResourceReservations, SchedulablePlan, select_next},
-        simulator::simulate_actions,
+        simulator::{no_plan_terminal_existing_shareholder_assets, simulate_actions},
     },
     state::{
         attribution::{OrderedAssetFlow, OrderedTransactionFlow},
-        caps::direct_position_cap_data,
+        caps::{adapter_cap_id, direct_position_cap_data},
         idle_locks::{IdleLockKind, IdleLockLedger},
         projection::{
             ProjectionError, ProjectionFreshness, RefreshReason, project_snapshot_to_head,
@@ -162,6 +163,7 @@ fn projection_fixture() -> Result<
             required_dead_shares: U256::from(1_000_000_000_u64),
         },
         adapters: BTreeMap::from([(configured.adapter, adapter)]),
+        liquidity_adapter: None,
         positions: BTreeMap::from([(configured.position_key, position)]),
         markets: BTreeMap::from([(configured.market_id, market)]),
         caps: cap_states,
@@ -750,5 +752,165 @@ fn sequential_simulator_enforces_phase_funding_and_bounded_order_search()
     )?;
     assert!(!bounded.complete);
     assert!(bounded.feasible.is_empty());
+    Ok(())
+}
+
+#[test]
+fn first_allocation_into_an_unused_market_remains_in_parent_horizon_value()
+-> Result<(), Box<dyn Error>> {
+    let (mut snapshot, vault) = projection_fixture()?;
+    let configured = &vault.positions[0];
+    let adapter = snapshot
+        .adapters
+        .get_mut(&configured.adapter)
+        .ok_or_else(|| std::io::Error::other("adapter missing"))?;
+    adapter.current_market_ids.clear();
+    adapter.real_assets = U256::ZERO;
+    let position = snapshot
+        .positions
+        .get_mut(&configured.position_key)
+        .ok_or_else(|| std::io::Error::other("position missing"))?;
+    position.internal_supply_shares = U256::ZERO;
+    position.actual_morpho_supply_shares = U256::ZERO;
+    position.expected_assets = U256::ZERO;
+    position.parent_recorded_market_allocation = U256::ZERO;
+    for cap in snapshot.caps.values_mut() {
+        cap.recorded_allocation = U256::ZERO;
+    }
+    snapshot.parent.stored_total_assets = snapshot.parent.idle_assets;
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x11),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp + 12,
+        gas_limit: snapshot.context.block.gas_limit,
+    };
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let amount = U256::from(1_000_000_u64);
+    let state = simulate_actions(
+        &snapshot,
+        &projection,
+        &vault,
+        &[V2Action::Allocate {
+            position: configured.position_key,
+            adapter: configured.adapter,
+            data: encode_adapter_data(&configured.market_params),
+            requested_assets: RequestedAssets(amount),
+        }],
+    )?;
+    let horizon = head.timestamp + 60;
+    let with_plan = state.terminal_existing_shareholder_assets(&snapshot, &projection, horizon)?;
+    let without_plan =
+        no_plan_terminal_existing_shareholder_assets(&snapshot, &vault, &projection, horizon)?;
+    assert!(with_plan >= without_plan.saturating_sub(U256::ONE));
+    Ok(())
+}
+
+#[test]
+fn vault_v1_liquidity_adapter_actions_use_exact_closed_simulation() -> Result<(), Box<dyn Error>> {
+    let (mut snapshot, mut vault) = projection_fixture()?;
+    let address = AdapterAddress(Address::with_last_byte(0xa1));
+    let wrapped = Address::with_last_byte(0xa2);
+    let adapter_id = adapter_cap_id(address.0);
+    let position_key = derive_liquidity_position_key(address);
+    let liquidity_assets = U256::from(200_000_000_u64);
+    vault.liquidity_adapter = Some(ValidatedLiquidityAdapterConfig {
+        position_key,
+        address,
+        kind: LiquidityAdapterKind::MorphoVaultV1Idle,
+        expected_code_hash: B256::repeat_byte(0xa3),
+        morpho_vault_v1: wrapped,
+        expected_morpho_vault_v1_code_hash: B256::repeat_byte(0xa4),
+        maximum_action_assets: U256::from(1_000_000_000_u64),
+    });
+    snapshot.parent.liquidity_adapter = address.0;
+    snapshot.parent.liquidity_data = Default::default();
+    snapshot.parent.stored_total_assets = snapshot
+        .parent
+        .stored_total_assets
+        .checked_add(liquidity_assets)
+        .ok_or_else(|| std::io::Error::other("parent total overflow"))?;
+    snapshot.caps.insert(
+        CapRef {
+            vault: vault.address,
+            id: adapter_id,
+        },
+        CapState {
+            reference: CapRef {
+                vault: vault.address,
+                id: adapter_id,
+            },
+            id_data_hash: B256::repeat_byte(0xa5),
+            absolute_cap: U256::from(1_000_000_000_000_u64),
+            relative_cap: U256::from(1_000_000_000_000_000_000_u64),
+            recorded_allocation: liquidity_assets,
+        },
+    );
+    snapshot.liquidity_adapter = Some(VaultV1LiquidityAdapterState {
+        adapter: address,
+        parent_vault: vault.address.0,
+        morpho_vault_v1: wrapped,
+        adapter_id: CapId(adapter_id.0),
+        runtime_code_hash: B256::repeat_byte(0xa3),
+        morpho_vault_v1_runtime_code_hash: B256::repeat_byte(0xa4),
+        real_assets: liquidity_assets,
+        recorded_allocation: liquidity_assets,
+        share_balance: liquidity_assets * U256::from(1_000_000_000_000_u64),
+        vault_total_assets: liquidity_assets + U256::ONE,
+        vault_total_supply: (liquidity_assets + U256::ONE) * U256::from(1_000_000_000_000_u64),
+        decimals_offset: 12,
+        max_deposit: U256::MAX,
+        max_withdraw: liquidity_assets,
+        idle_market_id: MarketId(B256::repeat_byte(0xa6)),
+        idle_market_total_supply_assets: U256::from(1_000_000_000_000_u64),
+        idle_market_total_supply_shares: U256::from(1_000_000_000_000_000_000_u64),
+        idle_market_supply_shares: liquidity_assets * U256::from(1_000_000_u64),
+        skim_recipient: Address::ZERO,
+    });
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x11),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp + 12,
+        gas_limit: snapshot.context.block.gas_limit,
+    };
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let amount = U256::from(50_000_000_u64);
+    let allocation = simulate_actions(
+        &snapshot,
+        &projection,
+        &vault,
+        &[V2Action::Allocate {
+            position: position_key,
+            adapter: address,
+            data: Default::default(),
+            requested_assets: RequestedAssets(amount),
+        }],
+    )?;
+    assert_eq!(
+        allocation.position_expected_assets(position_key),
+        Some(liquidity_assets + amount)
+    );
+    assert_eq!(allocation.vault_idle, snapshot.parent.idle_assets - amount);
+
+    let deallocation = simulate_actions(
+        &snapshot,
+        &projection,
+        &vault,
+        &[V2Action::Deallocate {
+            position: position_key,
+            adapter: address,
+            data: Default::default(),
+            requested_assets: RequestedAssets(amount),
+        }],
+    )?;
+    assert_eq!(
+        deallocation.position_expected_assets(position_key),
+        Some(liquidity_assets - amount)
+    );
+    assert_eq!(
+        deallocation.vault_idle,
+        snapshot.parent.idle_assets + amount
+    );
     Ok(())
 }

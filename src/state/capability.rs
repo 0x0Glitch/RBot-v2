@@ -10,7 +10,7 @@ use crate::config::{ValidatedStrategyConfig, ValidatedVaultConfig};
 use crate::domain::{
     AdapterAddress, AdminEffect, CapRef, CapState, DirectAdapterState, DirectMarketPositionState,
     MarketMode, PendingAdminOperation, PositionKey, RewardPolicy, StoredMarketState,
-    VaultCapabilities,
+    VaultCapabilities, VaultV1LiquidityAdapterState,
 };
 
 /// Stable reason explaining why a capability is disabled.
@@ -78,6 +78,8 @@ pub struct CapabilityInputs<'a> {
     pub parent: &'a crate::domain::ParentVaultState,
     /// All-ever adapter states.
     pub adapters: &'a BTreeMap<AdapterAddress, DirectAdapterState>,
+    /// Supported liquidity-only adapter state.
+    pub liquidity_adapter: Option<&'a VaultV1LiquidityAdapterState>,
     /// All configured and historical positions.
     pub positions: &'a BTreeMap<PositionKey, DirectMarketPositionState>,
     /// Exact stored market states.
@@ -245,13 +247,23 @@ pub fn classify_capabilities(
     }
 
     let liquidity_adapter_ready = if input.config.require_supported_nonzero_liquidity_adapter {
-        input.positions.values().any(|position| {
-            position.adapter.0 == input.parent.liquidity_adapter
-                && crate::domain::encode_adapter_data(&position.market_params)
-                    == input.parent.liquidity_data
-                && position.expected_assets >= input.config.minimum_liquidity_adapter_assets
-                && input.enabled_adapters.contains(&position.adapter)
-        })
+        if let (Some(configured), Some(state)) =
+            (&input.config.liquidity_adapter, input.liquidity_adapter)
+        {
+            state.adapter == configured.address
+                && input.parent.liquidity_adapter == configured.address.0
+                && input.parent.liquidity_data.is_empty()
+                && state.real_assets >= input.config.minimum_liquidity_adapter_assets
+                && input.enabled_adapters.contains(&configured.address)
+        } else {
+            input.positions.values().any(|position| {
+                position.adapter.0 == input.parent.liquidity_adapter
+                    && crate::domain::encode_adapter_data(&position.market_params)
+                        == input.parent.liquidity_data
+                    && position.expected_assets >= input.config.minimum_liquidity_adapter_assets
+                    && input.enabled_adapters.contains(&position.adapter)
+            })
+        }
     } else {
         true
     };
@@ -475,6 +487,7 @@ mod tests {
             strategy: &config.app.strategy,
             parent: &parent,
             adapters: &adapters,
+            liquidity_adapter: None,
             positions: &ready_positions,
             markets: &markets,
             caps: &caps,
@@ -495,6 +508,7 @@ mod tests {
             strategy: &config.app.strategy,
             parent: &parent,
             adapters: &adapters,
+            liquidity_adapter: None,
             positions: &deficit_positions,
             markets: &markets,
             caps: &caps,
@@ -521,6 +535,7 @@ mod tests {
             strategy: &config.app.strategy,
             parent: &parent,
             adapters: &adapters,
+            liquidity_adapter: None,
             positions: &removed_positions,
             markets: &markets,
             caps: &caps,

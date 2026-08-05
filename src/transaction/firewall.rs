@@ -226,22 +226,35 @@ fn validate_actions(
             return Err(FirewallError::Action);
         }
         allocation_phase |= is_allocation;
-        let configured = vault
-            .positions
-            .iter()
-            .find(|configured| configured.position_key == position)
-            .ok_or(FirewallError::Action)?;
-        if configured.adapter != adapter
-            || *data != crate::domain::encode_adapter_data(&configured.market_params)
-            || amount > configured.maximum_action_assets
-            || (is_allocation && configured.mode != crate::domain::MarketMode::Active)
-            || (!is_allocation
-                && !matches!(
-                    configured.mode,
-                    crate::domain::MarketMode::Active | crate::domain::MarketMode::SourceOnly
-                ))
+        if let Some(configured) = vault
+            .liquidity_adapter
+            .as_ref()
+            .filter(|configured| configured.position_key == position)
         {
-            return Err(FirewallError::Action);
+            if configured.address != adapter
+                || !data.is_empty()
+                || amount > configured.maximum_action_assets
+            {
+                return Err(FirewallError::Action);
+            }
+        } else {
+            let configured = vault
+                .positions
+                .iter()
+                .find(|configured| configured.position_key == position)
+                .ok_or(FirewallError::Action)?;
+            if configured.adapter != adapter
+                || *data != crate::domain::encode_adapter_data(&configured.market_params)
+                || amount > configured.maximum_action_assets
+                || (is_allocation && configured.mode != crate::domain::MarketMode::Active)
+                || (!is_allocation
+                    && !matches!(
+                        configured.mode,
+                        crate::domain::MarketMode::Active | crate::domain::MarketMode::SourceOnly
+                    ))
+            {
+                return Err(FirewallError::Action);
+            }
         }
         let total = if is_allocation {
             &mut allocated

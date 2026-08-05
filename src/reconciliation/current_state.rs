@@ -189,6 +189,34 @@ fn validate_snapshot(
             return Err(CurrentStateError::Accounting);
         }
     }
+    match (&vault.liquidity_adapter, &snapshot.liquidity_adapter) {
+        (Some(configured), Some(adapter)) => {
+            let reproduced = crate::morpho::vault_v1_adapter::preview_redeem(
+                adapter.share_balance,
+                adapter.vault_total_assets,
+                adapter.vault_total_supply,
+                adapter.decimals_offset,
+            )
+            .map_err(|_| CurrentStateError::Accounting)?;
+            let cap = snapshot
+                .caps
+                .get(&crate::domain::CapRef {
+                    vault: vault.address,
+                    id: adapter.adapter_id,
+                })
+                .ok_or(CurrentStateError::Accounting)?;
+            if adapter.adapter != configured.address
+                || adapter.parent_vault != vault.address.0
+                || adapter.morpho_vault_v1 != configured.morpho_vault_v1
+                || reproduced != adapter.real_assets
+                || cap.recorded_allocation != adapter.recorded_allocation
+            {
+                return Err(CurrentStateError::Accounting);
+            }
+        }
+        (None, None) => {}
+        _ => return Err(CurrentStateError::Accounting),
+    }
     for (key, position) in &snapshot.positions {
         if position.position_key != *key
             || position.market_id != derive_market_id(&position.market_params)
