@@ -13,6 +13,10 @@ separate process with a separate `data_dir` and API port for each chain. One
 process may manage multiple vaults on its configured chain, including vaults
 sharing an allocator.
 
+For the complete end-to-end design, production evidence, resolved deployment
+problems, remaining risks, and questions for senior review, see
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ## Requirements
 
 - Rust 1.97.1
