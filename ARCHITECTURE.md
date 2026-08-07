@@ -996,9 +996,13 @@ state aggregates?
 ### 21.6 Economic effectiveness is not yet proven at meaningful scale
 
 The live vault currently has about 40 USDC total and about 39 USDC in one direct
-market. At the latest reviewed state that market supplied roughly 0.93% APY,
-while the three selected markets supplied roughly 7.11%, 7.06%, and 6.68% APY.
-Top-K therefore has a clear 40/40/20 target. The exact four-action estimate was
+market. At block 42,578,865 that market supplied roughly 0.8906% APY, while the
+three selected markets supplied roughly 7.1062%, 7.0602%, and 6.6730% APY.
+The weakest selected improvement is therefore more than 578 APY bps, well above
+the 200-bps entry and 250-bps exit gates. The next candidate supplied roughly
+6.2213% APY, only about 45 bps below the third selected market, so the 100-bps
+replacement rule correctly prevented churn. Top-K therefore has a clear
+40/40/20 target. The exact four-action estimate was
 931,662 gas and the signed limit with 15% headroom was 1,071,412 gas. With the
 0.1 gwei live quote, the signed initial fee is 0.2 gwei. The configured 3x gas
 multiplier and 100-USDC/HYPE ceiling require roughly 0.065 USDC of 24-hour gain,
@@ -1090,13 +1094,15 @@ and does not construct arbitrary adapter data.
 general withdrawal-liquidity preparation flow into a separate tool with explicit
 adapter profiles and penalty ceilings?
 
-### 21.13 Live atomic cutover is complete; rollback drill remains
+### 21.13 Live atomic cutover and rollback drill are complete
 
 CI release and systemd/install assets implement versioned directories, manifest
 verification, atomic `current` switching, direct binary execution, and readiness
-probing. The live cutover, graceful old-signer shutdown, and controlled systemd
-restart have passed. A deliberate rollback to a previous known-good immutable
-artifact still needs an operator drill before full production sign-off.
+probing. The live cutover, graceful old-signer shutdown, controlled systemd
+restart, atomic rollback to the previous verified artifact, and forward recovery
+to the current artifact all passed with zero unresolved transactions. The
+remaining operational work is to automate and periodically rehearse this exact
+documented procedure rather than treating a one-time drill as permanent proof.
 
 ### 21.14 Disk and build-cache operations need a runbook
 
@@ -1107,10 +1113,14 @@ logs, or journal persistence.
 **Recommended change:** establish disk alerts, log rotation, journal/data backup
 retention, Cargo target retention, and a minimum-free-space pre-deploy gate.
 
-### 21.15 Backup and disaster recovery need a live drill
+### 21.15 Same-host backup recovery is proven; fresh-host recovery remains
 
-Storage backup, journal replay, crash-boundary tests, and startup recovery exist,
-but a complete AWS restore to a fresh host has not been demonstrated.
+The live service was stopped at durable revision 129,861 with zero unresolved
+transactions. Its built-in backup command created a protected backup, and an
+isolated restore passed `storage-init` with the same revision, transaction state,
+and Top-K memory hash. The service then resumed from block 42,578,960 to
+42,578,972. A complete AWS restore to a separately provisioned fresh host has
+not yet been demonstrated.
 
 **Recommended test:** stop at a known reconciled revision, back up state and
 manifest, restore on a clean host, verify cursor/nonce/receipt state, resume, and
