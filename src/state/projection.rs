@@ -305,7 +305,8 @@ fn maximum_deposit(
                     high.checked_sub(low)
                         .and_then(|distance| distance.checked_add(U256::ONE))
                         .ok_or(ProjectionError::Arithmetic)?
-                        / U256::from(2_u8),
+                        .checked_div(U256::from(2_u8))
+                        .ok_or(ProjectionError::Arithmetic)?,
                 )
                 .ok_or(ProjectionError::Arithmetic)?;
             if executable(midpoint)? {
@@ -384,7 +385,8 @@ fn maximum_deposit(
                 distance
                     .checked_add(U256::ONE)
                     .ok_or(ProjectionError::Arithmetic)?
-                    / U256::from(2_u8),
+                    .checked_div(U256::from(2_u8))
+                    .ok_or(ProjectionError::Arithmetic)?,
             )
             .ok_or(ProjectionError::Arithmetic)?;
         if executable(midpoint)? {
@@ -435,7 +437,8 @@ fn maximum_liquidity_deallocation(
                 high.checked_sub(low)
                     .and_then(|distance| distance.checked_add(U256::ONE))
                     .ok_or(ProjectionError::Arithmetic)?
-                    / U256::from(2_u8),
+                    .checked_div(U256::from(2_u8))
+                    .ok_or(ProjectionError::Arithmetic)?,
             )
             .ok_or(ProjectionError::Arithmetic)?;
         if deallocate(

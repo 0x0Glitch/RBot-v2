@@ -1,4 +1,5 @@
 //! Per-head projection, ordered idle-lock replay, and shared-liquidity tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 
 use std::{
     collections::{BTreeMap, BTreeSet},

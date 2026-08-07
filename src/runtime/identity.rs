@@ -183,9 +183,19 @@ async fn verify_proxy_identity<P: AtomicSnapshotProvider>(
             .storage_at(identity.address, proxy.storage_slot)
             .await
             .map_err(|error| RuntimeIdentityError::Provider(error.rpc_category()))?;
-        if stored.as_slice()[..12].iter().any(|byte| *byte != 0)
-            || Address::from_slice(&stored.as_slice()[12..]) != proxy.address
-        {
+        let leading = stored
+            .as_slice()
+            .get(..12)
+            .ok_or(RuntimeIdentityError::Configuration(
+                "proxy implementation slot",
+            ))?;
+        let address = stored
+            .as_slice()
+            .get(12..)
+            .ok_or(RuntimeIdentityError::Configuration(
+                "proxy implementation slot",
+            ))?;
+        if leading.iter().any(|byte| *byte != 0) || Address::from_slice(address) != proxy.address {
             return Err(RuntimeIdentityError::Configuration(
                 "proxy implementation slot",
             ));

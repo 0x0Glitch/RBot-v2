@@ -1,4 +1,5 @@
 //! Official pinned event signatures, strict decoding, effect decoding, and adapter-data tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, I256, IntoLogData, U256};

@@ -305,10 +305,10 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             .ok_or(PreflightSourceError::Failed)?;
         let prepared = match published_reason {
             PlanReason::LiquidityMaintenance => {
-                build_validated_liquidity_plan(&self.config, vault, &snapshot, expected)
+                build_validated_liquidity_plan(&self.config, vault, &snapshot, expected, None)
             }
             PlanReason::CapitalDeployment => {
-                build_validated_capital_plan(&self.config, vault, &snapshot, expected)
+                build_validated_capital_plan(&self.config, vault, &snapshot, expected, None)
             }
             PlanReason::RateRebalance => build_validated_rate_plan(
                 &self.config,
@@ -316,6 +316,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                 &snapshot,
                 expected,
                 episode.as_ref().ok_or(PreflightSourceError::Failed)?,
+                None,
             ),
             PlanReason::PositionSyncRequired => return Err(PreflightSourceError::Failed),
         }

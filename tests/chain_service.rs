@@ -1,4 +1,5 @@
 //! Canonical catch-up, fallback, durability, checkpoint, and reorg integration tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -177,19 +178,26 @@ async fn direct_extension_uses_parent_hash_without_rereading_the_cursor()
     let directory = TempDir::new()?;
     let service = StorageService::start(&directory.path().join("extension.json"), 32, 1)?;
     let (send, mut receive) = mpsc::channel(8);
+    let (head_send, head_receive) = tokio::sync::watch::channel(None);
     let chain = ChainService::new(
         Arc::clone(&provider),
         None,
         service.handle(),
         send,
         config(watched, 8),
-    )?;
+    )?
+    .with_head_hints(head_send);
     chain.poll_once().await?;
+    assert_eq!(*head_receive.borrow(), Some(first));
     while receive.try_recv().is_ok() {}
     assert_eq!(provider.header_reads(), 0);
 
     provider.replace_chain(vec![first, second], vec![]).await;
     chain.poll_once().await?;
+    assert_eq!(*head_receive.borrow(), Some(second));
+    while let Ok(update) = receive.try_recv() {
+        assert!(!matches!(update, ChainUpdate::CanonicalHead(_)));
+    }
     assert_eq!(provider.header_reads(), 0);
     service.shutdown().await?;
     Ok(())

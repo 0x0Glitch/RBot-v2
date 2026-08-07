@@ -398,7 +398,10 @@ pub async fn reconcile_confirmed_transaction(
     if matching.len() != 1 {
         return Err(ReceiptReconciliationError::MissingCanonicalAttempt);
     }
-    let receipt = matching[0];
+    let receipt = matching
+        .first()
+        .copied()
+        .ok_or(ReceiptReconciliationError::MissingCanonicalAttempt)?;
     let observed = provider
         .transaction_by_hash(receipt.transaction_hash)
         .await?
@@ -518,7 +521,7 @@ fn validate_log_order(receipt: &CanonicalReceiptRecord) -> Result<(), Conformanc
     }) || receipt
         .logs
         .windows(2)
-        .any(|pair| pair[0].log_index >= pair[1].log_index)
+        .any(|pair| matches!(pair, [previous, current] if previous.log_index >= current.log_index))
     {
         return Err(ConformanceError::LogOrder);
     }

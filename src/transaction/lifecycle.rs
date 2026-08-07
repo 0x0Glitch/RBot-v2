@@ -222,6 +222,8 @@ pub enum RecoveryClassification {
     Orphaned,
     /// Account nonce advanced without a known canonical receipt.
     AmbiguousNonceAdvance,
+    /// Durable unresolved nonce is ahead of the confirmed account nonce.
+    InvalidFutureReservation,
 }
 
 /// Classifies startup state without guessing or allocating a new nonce.
@@ -229,6 +231,8 @@ pub enum RecoveryClassification {
 pub fn classify_recovery(facts: RecoveryFacts) -> RecoveryClassification {
     if facts.receipt_orphaned {
         RecoveryClassification::Orphaned
+    } else if facts.pending_nonce > facts.latest_account_nonce {
+        RecoveryClassification::InvalidFutureReservation
     } else if facts.latest_account_nonce > facts.pending_nonce {
         if facts.canonical_receipt {
             RecoveryClassification::CanonicalInclusion

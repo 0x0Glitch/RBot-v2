@@ -510,7 +510,7 @@ pub fn pending_operation_id(target: Address, calldata: &Bytes) -> B256 {
 }
 
 fn validate_selector(selector: [u8; 4], calldata: &Bytes) -> Result<(), TopologyError> {
-    if calldata.len() < 4 || calldata[..4] != selector {
+    if calldata.get(..4) != Some(selector.as_slice()) {
         return Err(TopologyError::SelectorMismatch);
     }
     Ok(())

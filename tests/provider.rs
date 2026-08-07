@@ -1,4 +1,5 @@
 //! HTTP provider capability and role-boundary tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use std::collections::BTreeSet;

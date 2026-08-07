@@ -8,7 +8,7 @@ use std::sync::{
 
 use alloy::primitives::{Address, B256};
 use futures::{StreamExt, stream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::domain::BlockRef;
 use crate::runtime::messages::{ChainUpdate, ProviderStatus, ReceiptRecord};
@@ -73,6 +73,7 @@ pub struct ChainService<P> {
     checkpoint: Option<Arc<P>>,
     storage: StorageHandle,
     updates: mpsc::Sender<ChainUpdate>,
+    head_hints: Option<watch::Sender<Option<BlockRef>>>,
     config: ChainServiceConfig,
     log_filter: Option<Arc<dyn CanonicalLogFilter>>,
     provider_ready: Option<Arc<AtomicBool>>,
@@ -115,6 +116,7 @@ impl<P: ChainDataProvider> ChainService<P> {
             checkpoint,
             storage,
             updates,
+            head_hints: None,
             config,
             log_filter: None,
             provider_ready: None,
@@ -132,6 +134,13 @@ impl<P: ChainDataProvider> ChainService<P> {
     #[must_use]
     pub fn with_provider_readiness(mut self, ready: Arc<AtomicBool>) -> Self {
         self.provider_ready = Some(ready);
+        self
+    }
+
+    /// Publishes replaceable latest-head hints separately from ordered canonical event updates.
+    #[must_use]
+    pub fn with_head_hints(mut self, head_hints: watch::Sender<Option<BlockRef>>) -> Self {
+        self.head_hints = Some(head_hints);
         self
     }
 
@@ -208,7 +217,7 @@ impl<P: ChainDataProvider> ChainService<P> {
                 }
             }
         }
-        self.send_update(ChainUpdate::CanonicalHead(latest)).await?;
+        self.publish_head(latest).await?;
         Ok(latest)
     }
 
@@ -406,7 +415,7 @@ impl<P: ChainDataProvider> ChainService<P> {
                 // The exact-state owner may be holding a latest-only snapshot reported at this
                 // height; giving it this checkpoint lets it verify replay through that exact
                 // block before later catch-up blocks are applied.
-                self.send_update(ChainUpdate::CanonicalHead(block)).await?;
+                self.publish_head(block).await?;
             }
             previous = Some(block);
         }
@@ -516,7 +525,10 @@ impl<P: ChainDataProvider> ChainService<P> {
         }
         receipts.sort_by_key(|receipt| receipt.transaction_index);
         for pair in receipts.windows(2) {
-            if pair[0].transaction_index == pair[1].transaction_index {
+            let [previous, current] = pair else {
+                continue;
+            };
+            if previous.transaction_index == current.transaction_index {
                 return Err(ChainError::InvalidBundle(
                     "fallback receipts contain duplicate transaction index",
                 ));
@@ -593,10 +605,24 @@ impl<P: ChainDataProvider> ChainService<P> {
     }
 
     async fn send_update(&self, update: ChainUpdate) -> Result<(), ChainError> {
-        self.updates
-            .send(update)
-            .await
-            .map_err(|_| ChainError::ChannelClosed)
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.updates.send(update),
+        )
+        .await
+        .map_err(|_| ChainError::ChannelTimeout)?
+        .map_err(|_| ChainError::ChannelClosed)
+    }
+
+    async fn publish_head(&self, head: BlockRef) -> Result<(), ChainError> {
+        if let Some(head_hints) = &self.head_hints {
+            head_hints.send_replace(Some(head));
+            Ok(())
+        } else {
+            // Compatibility path for isolated chain-service tests. Production always installs
+            // the watch sender so repeated heads cannot fill the canonical event mailbox.
+            self.send_update(ChainUpdate::CanonicalHead(head)).await
+        }
     }
 }
 

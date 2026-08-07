@@ -149,7 +149,8 @@ fn bounded_distributions(
                         return None;
                     }
                     let mut candidate = selected.clone();
-                    candidate[index] = *amount;
+                    let slot = candidate.get_mut(index)?;
+                    *slot = *amount;
                     next.push((candidate, updated));
                 }
             }
@@ -157,7 +158,8 @@ fn bounded_distributions(
         }
         for (mut selected, subtotal) in partials {
             let residual = total.saturating_sub(subtotal);
-            if residual > maximums[sink]
+            let sink_maximum = maximums.get(sink)?;
+            if residual > *sink_maximum
                 || (!residual.is_zero() && residual < minimum_action)
                 || selected
                     .iter()
@@ -165,7 +167,8 @@ fn bounded_distributions(
             {
                 continue;
             }
-            selected[sink] = residual;
+            let slot = selected.get_mut(sink)?;
+            *slot = residual;
             unique.insert(selected);
             if unique.len() > limit {
                 return None;
@@ -552,7 +555,7 @@ fn search_rate_rebalance(
                     certificate.search_complete = false;
                     break 'search;
                 }
-                certificate.nodes_evaluated += 1;
+                certificate.nodes_evaluated = certificate.nodes_evaluated.saturating_add(1);
                 let actions = sources
                     .iter()
                     .zip(source_amounts)

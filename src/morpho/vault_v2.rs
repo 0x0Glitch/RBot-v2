@@ -39,7 +39,11 @@ pub fn accrue_parent_view(
             .checked_add(*assets)
             .ok_or(crate::domain::ArithmeticError::Overflow)?;
     }
-    let elapsed = U256::from(timestamp - parent.last_update);
+    let elapsed = U256::from(
+        timestamp
+            .checked_sub(parent.last_update)
+            .ok_or(MathError::TimestampRegression)?,
+    );
     let elapsed_assets = parent
         .stored_total_assets
         .checked_mul(elapsed)

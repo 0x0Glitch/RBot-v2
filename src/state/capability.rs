@@ -157,8 +157,10 @@ pub fn classify_capabilities(
             reasons.insert(CapabilityReason::AccountingShareDeficit);
             hard_accounting_pause = true;
         } else {
-            let exact_excess =
-                position.actual_morpho_supply_shares - position.internal_supply_shares;
+            let exact_excess = position
+                .actual_morpho_supply_shares
+                .checked_sub(position.internal_supply_shares)
+                .unwrap_or(U256::ZERO);
             if exact_excess != position.ignored_donation_shares {
                 reasons.insert(CapabilityReason::DonationClassificationMismatch);
                 hard_accounting_pause = true;

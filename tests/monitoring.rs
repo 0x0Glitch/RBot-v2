@@ -1,4 +1,5 @@
 //! Monitoring asset syntax and metric-name conformance tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 
 use std::collections::BTreeSet;
 use std::fs;

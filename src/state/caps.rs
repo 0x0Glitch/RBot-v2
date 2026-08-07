@@ -96,8 +96,8 @@ pub fn validate_allocation_cap(
     if cap.relative_cap < wad {
         let maximum = first_total_assets
             .checked_mul(cap.relative_cap)
-            .ok_or(CapError::Arithmetic)?
-            / wad;
+            .and_then(|product| product.checked_div(wad))
+            .ok_or(CapError::Arithmetic)?;
         if new_allocation > maximum {
             return Err(CapError::RelativeCapExceeded);
         }

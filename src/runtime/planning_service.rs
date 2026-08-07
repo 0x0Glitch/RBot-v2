@@ -22,7 +22,10 @@ use crate::{
             ActionProjection, SimulationState, no_plan_terminal_existing_shareholder_assets,
         },
     },
-    runtime::controller::{ControllerError, RuntimeRegistry},
+    runtime::{
+        controller::{ControllerError, RuntimeRegistry},
+        planning_revision::PlanningRevision,
+    },
     state::projection::ProjectedVaultView,
     storage::{StorageError, actor::StorageHandle},
     transaction::firewall::{
@@ -98,16 +101,24 @@ pub async fn refresh_priority_plan(
     storage: &StorageHandle,
     api: &ApiDataStore,
     runtime: &RuntimeRegistry,
+    revision: Option<&PlanningRevision>,
 ) -> Result<Option<V2Plan>, PlanningServiceError> {
-    if let Some(prepared) = build_validated_liquidity_plan(config, vault, snapshot, projection)? {
+    if let Some(prepared) =
+        build_validated_liquidity_plan(config, vault, snapshot, projection, revision)?
+    {
         terminate_rate_episode(vault, projection, storage, api).await?;
         return publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await;
     }
-    if let Some(prepared) = build_validated_capital_plan(config, vault, snapshot, projection)? {
+    if let Some(prepared) =
+        build_validated_capital_plan(config, vault, snapshot, projection, revision)?
+    {
         terminate_rate_episode(vault, projection, storage, api).await?;
         return publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await;
     }
-    refresh_rate_plan(config, vault, snapshot, projection, storage, api, runtime).await
+    refresh_rate_plan(
+        config, vault, snapshot, projection, storage, api, runtime, revision,
+    )
+    .await
 }
 
 /// Updates the durable episode state and publishes one fully firewalled Shadow rate plan.
@@ -120,6 +131,7 @@ pub async fn refresh_rate_plan(
     storage: &StorageHandle,
     api: &ApiDataStore,
     runtime: &RuntimeRegistry,
+    revision: Option<&PlanningRevision>,
 ) -> Result<Option<V2Plan>, PlanningServiceError> {
     let mut episode = storage
         .load_active_rate_episode(vault.address, vault.rate_group.id)
@@ -272,7 +284,8 @@ pub async fn refresh_rate_plan(
         }
     }
 
-    let Some(prepared) = build_validated_rate_plan(config, vault, snapshot, projection, &episode)?
+    let Some(prepared) =
+        build_validated_rate_plan(config, vault, snapshot, projection, &episode, revision)?
     else {
         clear_plan(vault, api, runtime, Some(episode.episode_id)).await?;
         return Ok(None);
@@ -320,6 +333,7 @@ pub fn build_validated_rate_plan(
     snapshot: &ExactVaultSnapshot,
     projection: &ProjectedVaultView,
     episode: &RateSignalEpisode,
+    revision: Option<&PlanningRevision>,
 ) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
     let solved = solve_rate_rebalance(
         snapshot,
@@ -346,6 +360,11 @@ pub fn build_validated_rate_plan(
         snapshot: snapshot.context.clone(),
         config_revision: config.revision,
         topology_revision: snapshot.context.dynamic_topology_revision,
+        read_set_revision: revision.map_or(0, |item| item.read_set_revision),
+        latest_relevant_event_block: revision.map_or(snapshot.context.block.number, |item| {
+            item.latest_relevant_event_block
+        }),
+        planner_generation: revision.map_or(0, |item| item.planner_generation),
         actions: best.actions,
         projection: PlanProjection {
             movement_assets: best.objective.movement_assets,
@@ -382,6 +401,7 @@ pub fn build_validated_liquidity_plan(
     vault: &ValidatedVaultConfig,
     snapshot: &ExactVaultSnapshot,
     projection: &ProjectedVaultView,
+    revision: Option<&PlanningRevision>,
 ) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
     let solved = solve_liquidity_maintenance(snapshot, projection, vault, &config.app.solver);
     let Some(state) = solved.state else {
@@ -403,6 +423,7 @@ pub fn build_validated_liquidity_plan(
         state,
         solved.certificate.candidate_lattice_hash,
         solved.certificate.nodes_evaluated,
+        revision,
     )
     .map(Some)
 }
@@ -413,6 +434,7 @@ pub fn build_validated_capital_plan(
     vault: &ValidatedVaultConfig,
     snapshot: &ExactVaultSnapshot,
     projection: &ProjectedVaultView,
+    revision: Option<&PlanningRevision>,
 ) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
     let solved = solve_capital_deployment(
         snapshot,
@@ -441,6 +463,7 @@ pub fn build_validated_capital_plan(
         state,
         solved.certificate.candidate_lattice_hash,
         solved.certificate.nodes_evaluated,
+        revision,
     )
     .map(Some)
 }
@@ -456,6 +479,7 @@ fn build_validated_non_rate_plan(
     state: SimulationState,
     candidate_lattice_hash: B256,
     nodes_evaluated: u64,
+    revision: Option<&PlanningRevision>,
 ) -> Result<PreparedRatePlan, PlanningServiceError> {
     let markets = strategy_market_ids(vault);
     let before_spread =
@@ -499,6 +523,11 @@ fn build_validated_non_rate_plan(
         snapshot: snapshot.context.clone(),
         config_revision: config.revision,
         topology_revision: snapshot.context.dynamic_topology_revision,
+        read_set_revision: revision.map_or(0, |item| item.read_set_revision),
+        latest_relevant_event_block: revision.map_or(snapshot.context.block.number, |item| {
+            item.latest_relevant_event_block
+        }),
+        planner_generation: revision.map_or(0, |item| item.planner_generation),
         actions,
         projection: PlanProjection {
             movement_assets,
@@ -689,7 +718,10 @@ fn detect_rate_signal(
     if maximum <= minimum {
         return None;
     }
-    let midpoint = minimum + (maximum - minimum) / U256::from(2_u8);
+    let midpoint = maximum
+        .checked_sub(minimum)?
+        .checked_div(U256::from(2_u8))?
+        .checked_add(minimum)?;
     let source_markets = candidates
         .iter()
         .filter(|candidate| candidate.can_source && candidate.objective_value <= midpoint)

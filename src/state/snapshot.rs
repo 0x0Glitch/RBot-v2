@@ -313,8 +313,11 @@ impl SnapshotManifest {
                 || call.expected_code_hash.is_zero()
                 || call.allow_failure
                 || call.call_data.len() < 4
-                || call.call_data[..4] != call.selector
-                || keccak256(&call.call_data[4..]) != call.canonical_arguments_hash
+                || call.call_data.get(..4) != Some(call.selector.as_slice())
+                || call
+                    .call_data
+                    .get(4..)
+                    .is_none_or(|arguments| keccak256(arguments) != call.canonical_arguments_hash)
                 || !read_selector_allowed(call.selector)
             {
                 return Err(SnapshotError::InvalidManifest);
@@ -1372,7 +1375,9 @@ impl<'a> ManifestBuilder<'a> {
             target,
             expected_code_hash,
             selector,
-            canonical_arguments_hash: keccak256(&call_data[4..]),
+            canonical_arguments_hash: keccak256(
+                call_data.get(4..).ok_or(SnapshotError::InvalidManifest)?,
+            ),
             expected_return,
             allow_failure: false,
             purpose,
@@ -1442,7 +1447,11 @@ fn decode_value(schema: ReturnSchema, data: &Bytes) -> Result<DecodedValue, Snap
         ReturnSchema::Bool => canonical::<bool>(data).map(DecodedValue::Bool),
         ReturnSchema::Uint(bits) => {
             let value = canonical::<U256>(data)?;
-            if bits == 0 || bits > 256 || (bits < 256 && value >= (U256::ONE << bits)) {
+            let exceeds_width = bits < 256
+                && U256::ONE
+                    .checked_shl(usize::from(bits))
+                    .is_none_or(|limit| value >= limit);
+            if bits == 0 || bits > 256 || exceeds_width {
                 return Err(SnapshotError::ReturnSchemaMismatch);
             }
             Ok(DecodedValue::Uint(value))
@@ -1457,14 +1466,20 @@ fn decode_value(schema: ReturnSchema, data: &Bytes) -> Result<DecodedValue, Snap
         ReturnSchema::MorphoMarket => {
             let value = canonical::<(U256, U256, U256, U256, U256, U256)>(data)?;
             let fields = [value.0, value.1, value.2, value.3, value.4, value.5];
-            if fields.iter().any(|field| *field >= (U256::ONE << 128)) {
+            let uint128_limit = U256::from(u128::MAX)
+                .checked_add(U256::ONE)
+                .ok_or(SnapshotError::ReturnSchemaMismatch)?;
+            if fields.iter().any(|field| *field >= uint128_limit) {
                 return Err(SnapshotError::ReturnSchemaMismatch);
             }
             Ok(DecodedValue::Market(fields))
         }
         ReturnSchema::MorphoPosition => {
             let value = canonical::<(U256, U256, U256)>(data)?;
-            if value.1 >= (U256::ONE << 128) || value.2 >= (U256::ONE << 128) {
+            let uint128_limit = U256::from(u128::MAX)
+                .checked_add(U256::ONE)
+                .ok_or(SnapshotError::ReturnSchemaMismatch)?;
+            if value.1 >= uint128_limit || value.2 >= uint128_limit {
                 return Err(SnapshotError::ReturnSchemaMismatch);
             }
             Ok(DecodedValue::Position([value.0, value.1, value.2]))

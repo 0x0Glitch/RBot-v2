@@ -128,7 +128,8 @@ pub fn rate_spread<'a>(rates: impl Iterator<Item = &'a U256>) -> U256 {
     }
     maximum
         .zip(minimum)
-        .map_or(U256::ZERO, |(maximum, minimum)| maximum - minimum)
+        .and_then(|(maximum, minimum)| maximum.checked_sub(minimum))
+        .unwrap_or(U256::ZERO)
 }
 
 /// Returns max-minus-min only when every named market has an exact projected state.

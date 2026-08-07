@@ -47,6 +47,9 @@ pub enum ChainError {
     /// A required bounded service channel closed.
     #[error("chain update channel closed")]
     ChannelClosed,
+    /// State consumer did not accept a canonical update inside the bounded deadline.
+    #[error("chain update channel timed out")]
+    ChannelTimeout,
     /// Chain service configuration violates a hard request bound.
     #[error("invalid chain service configuration: {0}")]
     InvalidConfiguration(&'static str),

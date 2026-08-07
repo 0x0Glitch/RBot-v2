@@ -5,7 +5,12 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     thread::{self, JoinHandle},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
@@ -33,6 +38,7 @@ use super::{
 
 /// Default bounded storage mailbox capacity.
 pub const DEFAULT_STORAGE_CHANNEL_CAPACITY: usize = 128;
+const STORAGE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const JSON_FORMAT_VERSION: u32 = 3;
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const JOURNAL_SEGMENT_EVENTS: u64 = 128;
@@ -40,6 +46,14 @@ const HOT_BLOCK_RETENTION: u64 = 512;
 const HOT_SNAPSHOT_RETENTION: usize = 32;
 const HOT_PLAN_RETENTION: usize = 32;
 const HOT_TOPOLOGY_RETENTION: usize = 256;
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -452,7 +466,9 @@ fn read_journal_segment(path: &Path) -> Result<Vec<JournalRecord>, StorageError>
             file.sync_all()?;
             break;
         }
-        let payload = &chunk[..chunk.len().saturating_sub(1)];
+        let payload = chunk.strip_suffix(b"\n").ok_or(StorageError::Invariant(
+            "complete journal line has no newline",
+        ))?;
         if !payload.is_empty() {
             records.push(serde_json::from_slice(payload)?);
         }
@@ -526,9 +542,11 @@ fn compact_hot_state(state: &mut JsonState) {
         .map(|entry| entry.plan.clone())
         .collect::<Vec<_>>();
     if state.topology_history.len() > HOT_TOPOLOGY_RETENTION {
-        state
+        let excess = state
             .topology_history
-            .drain(..state.topology_history.len() - HOT_TOPOLOGY_RETENTION);
+            .len()
+            .saturating_sub(HOT_TOPOLOGY_RETENTION);
+        state.topology_history.drain(..excess);
     }
     let topology_replay_from = state
         .topology_history
@@ -704,16 +722,19 @@ fn migrate_v2_to_v3(
 ) -> Result<(), StorageError> {
     let rolling_window_start = initialization_timestamp.saturating_sub(86_400);
     for index in 0..state.transactions.len() {
-        if !state.transactions[index]
-            .reservation
-            .movement_assets
-            .is_zero()
-        {
+        let transaction = state
+            .transactions
+            .get(index)
+            .ok_or(StorageError::Invariant(
+                "transaction disappeared during format migration",
+            ))?;
+        if !transaction.reservation.movement_assets.is_zero() {
             continue;
         }
-        let transaction_id = state.transactions[index].reservation.transaction_id;
-        let plan_id = state.transactions[index].reservation.plan_id;
-        let transaction_state = state.transactions[index].state;
+        let transaction_id = transaction.reservation.transaction_id;
+        let plan_id = transaction.reservation.plan_id;
+        let transaction_state = transaction.state;
+        let created_at = transaction.reservation.created_at;
         let movement = plan_id
             .and_then(|plan_id| {
                 state
@@ -737,10 +758,14 @@ fn migrate_v2_to_v3(
                     .map(|record| record.movement_assets)
             });
         if let Some(movement) = movement {
-            state.transactions[index].reservation.movement_assets = movement;
-        } else if consumes_rolling_budget(transaction_state)
-            && state.transactions[index].reservation.created_at >= rolling_window_start
-        {
+            let transaction = state
+                .transactions
+                .get_mut(index)
+                .ok_or(StorageError::Invariant(
+                    "transaction disappeared during format migration",
+                ))?;
+            transaction.reservation.movement_assets = movement;
+        } else if consumes_rolling_budget(transaction_state) && created_at >= rolling_window_start {
             return Err(StorageError::Invariant(
                 "recent transaction lacks movement evidence required for format migration",
             ));
@@ -1092,13 +1117,56 @@ pub enum StorageCommand {
     },
 }
 
+struct StorageEnvelope {
+    command: StorageCommand,
+}
+
+#[derive(Default)]
+struct StorageQueueStatsInner {
+    depth: AtomicUsize,
+    high_water: AtomicUsize,
+    oldest_enqueued_epoch_millis: AtomicU64,
+}
+
+/// Bounded storage-mailbox telemetry snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageQueueStats {
+    /// Commands waiting for the storage owner.
+    pub depth: usize,
+    /// Highest observed waiting-command count since process start.
+    pub high_water: usize,
+    /// Conservative age of the oldest queued command.
+    pub oldest_age_millis: u64,
+}
+
 /// Cloneable bounded command handle; it never exposes mutable state.
 #[derive(Clone)]
 pub struct StorageHandle {
-    sender: mpsc::Sender<StorageCommand>,
+    sender: mpsc::Sender<StorageEnvelope>,
+    stats: Arc<StorageQueueStatsInner>,
 }
 
 impl StorageHandle {
+    /// Returns lock-free bounded-mailbox telemetry.
+    #[must_use]
+    pub fn queue_stats(&self) -> StorageQueueStats {
+        let depth = self.stats.depth.load(Ordering::Acquire);
+        let oldest = self
+            .stats
+            .oldest_enqueued_epoch_millis
+            .load(Ordering::Acquire);
+        let oldest_age_millis = if depth == 0 || oldest == 0 {
+            0
+        } else {
+            epoch_millis().saturating_sub(oldest)
+        };
+        StorageQueueStats {
+            depth,
+            high_water: self.stats.high_water.load(Ordering::Acquire),
+            oldest_age_millis,
+        }
+    }
+
     /// Applies one canonical block after an atomic JSON commit.
     pub async fn apply_canonical_block(
         &self,
@@ -1584,18 +1652,32 @@ impl StorageHandle {
         command: impl FnOnce(oneshot::Sender<Result<T, StorageError>>) -> StorageCommand,
     ) -> Result<T, StorageError> {
         let (reply, receive) = oneshot::channel();
-        self.sender
-            .send(command(reply))
+        self.enqueue(command(reply)).await?;
+        tokio::time::timeout(STORAGE_COMMAND_TIMEOUT, receive)
             .await
-            .map_err(|_| StorageError::ActorStopped)?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+            .map_err(|_| StorageError::CommandTimeout)?
+            .map_err(|_| StorageError::ActorStopped)?
     }
 
     async fn send(&self, command: StorageCommand) -> Result<(), StorageError> {
-        self.sender
-            .send(command)
+        self.enqueue(command).await
+    }
+
+    async fn enqueue(&self, command: StorageCommand) -> Result<(), StorageError> {
+        let permit = tokio::time::timeout(STORAGE_COMMAND_TIMEOUT, self.sender.reserve())
             .await
-            .map_err(|_| StorageError::ActorStopped)
+            .map_err(|_| StorageError::CommandTimeout)?
+            .map_err(|_| StorageError::ActorStopped)?;
+        let previous = self.stats.depth.fetch_add(1, Ordering::AcqRel);
+        let depth = previous.saturating_add(1);
+        self.stats.high_water.fetch_max(depth, Ordering::AcqRel);
+        if previous == 0 {
+            self.stats
+                .oldest_enqueued_epoch_millis
+                .store(epoch_millis(), Ordering::Release);
+        }
+        permit.send(StorageEnvelope { command });
+        Ok(())
     }
 }
 
@@ -1630,11 +1712,13 @@ impl StorageService {
         FileExt::try_lock_exclusive(&lock_file).map_err(|_| StorageError::DatabaseLocked)?;
         let store = JsonStore::open(state_path.to_owned(), initialization_timestamp)?;
         let (sender, receiver) = mpsc::channel(channel_capacity);
+        let stats = Arc::new(StorageQueueStatsInner::default());
+        let actor_stats = Arc::clone(&stats);
         let join = thread::Builder::new()
-            .name("morpho-v2-json-storage".to_owned())
-            .spawn(move || run_actor(store, lock_file, receiver))?;
+            .name("storage".to_owned())
+            .spawn(move || run_actor(store, lock_file, receiver, actor_stats))?;
         Ok(Self {
-            handle: StorageHandle { sender },
+            handle: StorageHandle { sender, stats },
             join: Some(join),
         })
     }
@@ -1649,15 +1733,30 @@ impl StorageService {
     pub async fn shutdown(mut self) -> Result<(), StorageError> {
         let (reply, receive) = oneshot::channel();
         self.handle.send(StorageCommand::Shutdown { reply }).await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)??;
+        tokio::time::timeout(STORAGE_COMMAND_TIMEOUT, receive)
+            .await
+            .map_err(|_| StorageError::CommandTimeout)?
+            .map_err(|_| StorageError::ActorStopped)??;
         let join = self.join.take().ok_or(StorageError::ActorStopped)?;
         join.join().map_err(|_| StorageError::ActorPanicked)?;
         Ok(())
     }
 }
 
-fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receiver<StorageCommand>) {
-    while let Some(command) = receiver.blocking_recv() {
+fn run_actor(
+    mut store: JsonStore,
+    _lock_file: File,
+    mut receiver: mpsc::Receiver<StorageEnvelope>,
+    stats: Arc<StorageQueueStatsInner>,
+) {
+    while let Some(envelope) = receiver.blocking_recv() {
+        let remaining = stats.depth.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        if remaining == 0 {
+            stats
+                .oldest_enqueued_epoch_millis
+                .store(0, Ordering::Release);
+        }
+        let command = envelope.command;
         match command {
             StorageCommand::ApplyCanonicalBlock {
                 block,
@@ -2206,10 +2305,11 @@ fn apply_block(
             "canonical receipt does not belong to block",
         ));
     }
-    if receipts
-        .windows(2)
-        .any(|pair| pair[0].transaction_index >= pair[1].transaction_index)
-    {
+    if receipts.windows(2).any(|pair| {
+        pair.first()
+            .zip(pair.get(1))
+            .is_some_and(|(first, second)| first.transaction_index >= second.transaction_index)
+    }) {
         return Err(StorageError::Invariant(
             "canonical receipts are not strictly ordered",
         ));
@@ -2247,10 +2347,11 @@ fn persist_canonical_receipt(
                 || log.transaction_hash != receipt.transaction_hash
                 || log.transaction_index != receipt.transaction_index
         })
-        || receipt
-            .logs
-            .windows(2)
-            .any(|pair| pair[0].log_index >= pair[1].log_index)
+        || receipt.logs.windows(2).any(|pair| {
+            pair.first()
+                .zip(pair.get(1))
+                .is_some_and(|(first, second)| first.log_index >= second.log_index)
+        })
     {
         return Err(StorageError::Invariant(
             "direct receipt is not bound to a canonical block",
@@ -2321,11 +2422,11 @@ fn confirmed_gas_spend_since(
                 .transactions
                 .iter()
                 .find(|transaction| {
-                    transaction.reservation.transaction_id == attempts[0].transaction_id
+                    transaction.reservation.transaction_id == attempt.transaction_id
                         && transaction.included_block == Some(receipt.block_number)
                         && transaction.included_block_hash == Some(receipt.block_hash)
                 })
-                .map_or(attempts[0].signed_at, |transaction| transaction.updated_at)
+                .map_or(attempt.signed_at, |transaction| transaction.updated_at)
         };
         if accounting_timestamp < since_timestamp {
             continue;
@@ -2755,7 +2856,11 @@ fn transition_transaction(
         .iter()
         .position(|row| row.reservation.transaction_id == transition.transaction_id)
         .ok_or(StorageError::StaleTransition)?;
-    if state.transactions[row_index].state != transition.expected_state {
+    if state
+        .transactions
+        .get(row_index)
+        .is_none_or(|row| row.state != transition.expected_state)
+    {
         return Err(StorageError::StaleTransition);
     }
     if matches!(
@@ -2782,7 +2887,10 @@ fn transition_transaction(
             ))?;
         attempt.broadcast_at = Some(submitted_at);
     }
-    let row = &mut state.transactions[row_index];
+    let row = state
+        .transactions
+        .get_mut(row_index)
+        .ok_or(StorageError::StaleTransition)?;
     row.state = transition.next_state;
     if let Some(hash) = transition.transaction_hash {
         row.transaction_hash = Some(hash);
@@ -2825,8 +2933,12 @@ fn release_rate_movement(
     let Some(index) = matching.first().copied() else {
         return Ok(());
     };
-    let episode_id = state.rate_movement_reservations[index].episode_id;
-    let movement_assets = state.rate_movement_reservations[index].movement_assets;
+    let reservation = state
+        .rate_movement_reservations
+        .get(index)
+        .ok_or(StorageError::Invariant("rate movement disappeared"))?;
+    let episode_id = reservation.episode_id;
+    let movement_assets = reservation.movement_assets;
     let episode = state
         .rate_episodes
         .iter_mut()
@@ -2836,7 +2948,11 @@ fn release_rate_movement(
         .episode
         .release_pending(movement_assets)
         .map_err(|_| StorageError::Invariant("pending rate movement cannot be released"))?;
-    state.rate_movement_reservations[index].state = RateMovementReservationState::Released;
+    let reservation = state
+        .rate_movement_reservations
+        .get_mut(index)
+        .ok_or(StorageError::Invariant("rate movement disappeared"))?;
+    reservation.state = RateMovementReservationState::Released;
     Ok(())
 }
 
@@ -3066,7 +3182,10 @@ fn persist_reconciliation(
         confirmed_episode.as_ref(),
     ) {
         (Some(index), Some(confirmed)) => {
-            let reservation = &state.rate_movement_reservations[index];
+            let reservation = state
+                .rate_movement_reservations
+                .get(index)
+                .ok_or(StorageError::Invariant("rate movement disappeared"))?;
             if confirmed.episode_id != reservation.episode_id {
                 return Err(StorageError::Invariant(
                     "reconciliation confirms the wrong rate episode",
@@ -3122,7 +3241,11 @@ fn persist_reconciliation(
         persist_episode(state, episode, record.reconciled_at)?;
     }
     if let Some(index) = movement_indexes.first().copied() {
-        state.rate_movement_reservations[index].state = RateMovementReservationState::Confirmed;
+        let reservation = state
+            .rate_movement_reservations
+            .get_mut(index)
+            .ok_or(StorageError::Invariant("rate movement disappeared"))?;
+        reservation.state = RateMovementReservationState::Confirmed;
     }
     state.reconciliation_records.push(record);
     Ok(())

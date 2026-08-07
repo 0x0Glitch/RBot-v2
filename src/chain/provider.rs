@@ -402,7 +402,10 @@ pub trait SignedTransactionSubmitter: Send + Sync {
 /// Typed latest-account-nonce surface owned by the execution controller.
 #[async_trait]
 pub trait AccountNonceProvider: Send + Sync {
-    /// Returns the latest canonical account nonce for one configured signer.
+    /// Returns the confirmed account nonce from `eth_getTransactionCount(..., "latest")`.
+    ///
+    /// Implementations must not substitute the `pending` tag. Durable local ownership of the
+    /// single unresolved nonce lane is the only pending-state authority.
     async fn account_nonce(&self, signer: Address) -> Result<u64, ProviderError>;
 
     /// Returns the account nonce at one exact canonical block hash.
@@ -411,6 +414,21 @@ pub trait AccountNonceProvider: Send + Sync {
         signer: Address,
         block: BlockRef,
     ) -> Result<u64, ProviderError>;
+}
+
+/// Read-only provider surface used to recover one durably owned signer nonce.
+///
+/// This deliberately contains no submission method. Recovery first compares confirmed nonce and
+/// queries the persisted transaction hashes across every configured member of this set; signed
+/// bytes are submitted only through the separately restricted primary submitter.
+pub trait NonceRecoveryProvider:
+    ChainDataProvider + AccountNonceProvider + TransactionLookupProvider + Send + Sync
+{
+}
+
+impl<T> NonceRecoveryProvider for T where
+    T: ChainDataProvider + AccountNonceProvider + TransactionLookupProvider + Send + Sync
+{
 }
 
 /// Typed native-balance surface used only for allocator gas-funding checks.

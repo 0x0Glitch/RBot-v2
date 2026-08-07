@@ -144,31 +144,44 @@ fn capital_distributions(
     minimum_action: U256,
 ) -> Vec<Vec<U256>> {
     let mut distributions = BTreeSet::new();
-    for first in 0..maximums.len() {
-        if total <= maximums[first] {
+    for (first, first_maximum) in maximums.iter().copied().enumerate() {
+        if total <= first_maximum {
             let mut selected = vec![U256::ZERO; maximums.len()];
-            selected[first] = total;
-            distributions.insert(selected);
+            if let Some(slot) = selected.get_mut(first) {
+                *slot = total;
+                distributions.insert(selected);
+            }
         }
-        for second in 0..maximums.len() {
+        for (second, second_maximum) in maximums.iter().copied().enumerate() {
             if first == second {
                 continue;
             }
-            for first_amount in &lattices[first] {
+            let Some(first_lattice) = lattices.get(first) else {
+                continue;
+            };
+            for first_amount in first_lattice {
                 if first_amount.is_zero()
                     || *first_amount < minimum_action
-                    || *first_amount > maximums[first]
+                    || *first_amount > first_maximum
                     || *first_amount >= total
                 {
                     continue;
                 }
-                let second_amount = total - *first_amount;
-                if second_amount < minimum_action || second_amount > maximums[second] {
+                let Some(second_amount) = total.checked_sub(*first_amount) else {
+                    continue;
+                };
+                if second_amount < minimum_action || second_amount > second_maximum {
                     continue;
                 }
                 let mut selected = vec![U256::ZERO; maximums.len()];
-                selected[first] = *first_amount;
-                selected[second] = second_amount;
+                let Some(first_slot) = selected.get_mut(first) else {
+                    continue;
+                };
+                *first_slot = *first_amount;
+                let Some(second_slot) = selected.get_mut(second) else {
+                    continue;
+                };
+                *second_slot = second_amount;
                 distributions.insert(selected);
             }
         }
@@ -392,7 +405,7 @@ pub fn solve_capital_deployment(
             if actions.is_empty() || actions.len() > vault.positions.len().saturating_add(1) {
                 continue;
             }
-            certificate.nodes_evaluated += 1;
+            certificate.nodes_evaluated = certificate.nodes_evaluated.saturating_add(1);
             let state = match simulate_actions(snapshot, projection, vault, &actions) {
                 Ok(state) => state,
                 Err(_) => {

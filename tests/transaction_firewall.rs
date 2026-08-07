@@ -1,4 +1,5 @@
 //! Closed transaction grammar, mutation firewall, signer, fee and nonce tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::{
@@ -92,6 +93,9 @@ fn raw_plan(config: &ValidatedConfig) -> V2Plan {
         },
         config_revision: config.revision,
         topology_revision: B256::repeat_byte(0x41),
+        read_set_revision: 0,
+        latest_relevant_event_block: 2_500_000,
+        planner_generation: 0,
         actions: vec![V2Action::Allocate {
             position: position.position_key,
             adapter: position.adapter,
@@ -438,6 +442,16 @@ fn nonce_fee_and_recovery_policy_are_bounded() {
             receipt_orphaned: false,
         }),
         RecoveryClassification::AmbiguousNonceAdvance
+    );
+    assert_eq!(
+        classify_recovery(RecoveryFacts {
+            latest_account_nonce: 8,
+            pending_nonce: 9,
+            transaction_visible: false,
+            canonical_receipt: false,
+            receipt_orphaned: false,
+        }),
+        RecoveryClassification::InvalidFutureReservation
     );
 }
 

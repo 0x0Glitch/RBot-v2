@@ -220,6 +220,9 @@ const GAUGE_NAMES: &[&str] = &[
     "reallocator_last_processed_timestamp_seconds",
     "reallocator_pending_transaction",
     "reallocator_json_format_info",
+    "reallocator_storage_queue_depth",
+    "reallocator_storage_queue_high_water",
+    "reallocator_storage_oldest_command_age_milliseconds",
 ];
 
 const COUNTER_NAMES: &[&str] = &[
@@ -227,6 +230,7 @@ const COUNTER_NAMES: &[&str] = &[
     "reallocator_snapshot_success",
     "reallocator_idle_ledger_replay_failure",
     "reallocator_snapshot_retries",
+    "reallocator_plans_superseded",
 ];
 
 #[cfg(test)]

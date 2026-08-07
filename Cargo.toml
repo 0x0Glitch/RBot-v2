@@ -44,6 +44,7 @@ humantime-serde = "1"
 json-patch = "=4.2.0"
 prometheus-client = "=0.25.0"
 reqwest = { version = "=0.13.4", features = ["json"] }
+sd-notify = "=0.5.0"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -78,6 +79,8 @@ missing_docs = "warn"
 
 [lints.clippy]
 expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
 float_arithmetic = "deny"
 panic = "deny"
 todo = "deny"

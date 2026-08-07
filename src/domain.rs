@@ -181,7 +181,7 @@ pub fn derive_position_key(adapter: AdapterAddress, params: &MarketParams) -> Po
         lltv: params.lltv,
     }
     .abi_encode();
-    let mut input = Vec::with_capacity(Address::len_bytes() + market_data.len());
+    let mut input = Vec::with_capacity(Address::len_bytes().saturating_add(market_data.len()));
     input.extend_from_slice(adapter.0.as_slice());
     input.extend_from_slice(&market_data);
     PositionKey(alloy::primitives::keccak256(input))
@@ -933,6 +933,15 @@ pub struct V2Plan {
     pub config_revision: B256,
     /// Dynamic topology revision.
     pub topology_revision: B256,
+    /// Monotonic revision of the exact contracts and markets queried for this plan.
+    #[serde(default)]
+    pub read_set_revision: u64,
+    /// Highest relevant event block included by the planning snapshot.
+    #[serde(default)]
+    pub latest_relevant_event_block: u64,
+    /// Per-vault latest-wins planner generation.
+    #[serde(default)]
+    pub planner_generation: u64,
     /// Ordered deallocation-first actions.
     pub actions: Vec<V2Action>,
     /// Exact projected effects.

@@ -15,6 +15,9 @@ pub struct HealthState {
     live: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
     last_processed_block: Arc<AtomicU64>,
+    supervisor_heartbeat: Arc<AtomicU64>,
+    chain_heartbeat: Arc<AtomicU64>,
+    state_heartbeat: Arc<AtomicU64>,
     readiness: Arc<tokio::sync::RwLock<Option<ReadinessReport>>>,
 }
 
@@ -24,6 +27,9 @@ impl Default for HealthState {
             live: Arc::new(AtomicBool::new(true)),
             shutting_down: Arc::new(AtomicBool::new(false)),
             last_processed_block: Arc::new(AtomicU64::new(0)),
+            supervisor_heartbeat: Arc::new(AtomicU64::new(0)),
+            chain_heartbeat: Arc::new(AtomicU64::new(0)),
+            state_heartbeat: Arc::new(AtomicU64::new(0)),
             readiness: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
@@ -41,6 +47,31 @@ pub struct LivenessStatus {
 }
 
 impl HealthState {
+    /// Records that the supervisor select loop remains schedulable.
+    pub fn record_supervisor_heartbeat(&self) {
+        self.supervisor_heartbeat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records completion of one bounded canonical poll attempt, including classified failures.
+    pub fn record_chain_heartbeat(&self) {
+        self.chain_heartbeat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that the canonical state owner consumed one update.
+    pub fn record_state_heartbeat(&self) {
+        self.state_heartbeat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the three watchdog progress counters.
+    #[must_use]
+    pub fn watchdog_heartbeats(&self) -> (u64, u64, u64) {
+        (
+            self.supervisor_heartbeat.load(Ordering::Relaxed),
+            self.chain_heartbeat.load(Ordering::Relaxed),
+            self.state_heartbeat.load(Ordering::Relaxed),
+        )
+    }
+
     /// Updates the last fully processed canonical block monotonically.
     pub fn record_processed_block(&self, block: u64) {
         self.last_processed_block

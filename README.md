@@ -121,9 +121,8 @@ PRIVATE_KEY=0x...
 MORPHO_TELEGRAM_BOT_TOKEN=...
 ```
 
-Enable Telegram and set its `chat_id` in `config.hyperevm.json` before changing
-the node to Execute mode. Execute validation refuses to start without Telegram,
-and startup also requires the configured bot-token environment variable. The
+Telegram is optional. When enabled, set its `chat_id` and provide the configured
+bot-token environment variable before changing the node to Execute mode. The
 allocator address must have enough native HYPE for the
 configured maximum bounded transaction cost. Startup and execution stop on a
 wrong chain, wrong bytecode, wrong allocator role, insufficient gas funding, or
@@ -161,7 +160,7 @@ cargo run --release -- doctor \
   --protocol-lock protocol-lock.local.toml
 ```
 
-## Run
+## Run locally
 
 ```bash
 cargo run --release --locked -- run \
@@ -170,19 +169,39 @@ cargo run --release --locked -- run \
   --bind 127.0.0.1:9090
 ```
 
-For a persistent terminal session, run the same command inside tmux:
+This Cargo command is for development and operator validation only. Routine
+production deployment must run a prebuilt, verified binary; it must not compile
+from source on the host.
+
+## Run in production
+
+CI builds the immutable release binary and release manifest. Install a verified
+release into a versioned directory and atomically move `/opt/morpho/current`:
 
 ```bash
-tmux new -s reallocator
-RUST_LOG=info cargo run --release --locked -- run \
-  --config config.yaml \
-  --protocol-lock protocol-lock.local.toml \
-  --bind 127.0.0.1:9090
+id -u morpho >/dev/null 2>&1 || \
+  sudo useradd --system --home /var/lib/morpho --shell /usr/sbin/nologin morpho
+sudo install -d -o morpho -g morpho -m 0750 /var/lib/morpho /var/log/morpho
+sudo install -d -o root -g morpho -m 0750 /etc/morpho
+sudo install -m 0644 deploy/morpho-v2-reallocator.service \
+  /etc/systemd/system/morpho-v2-reallocator.service
+sudo systemctl daemon-reload
+sudo systemctl enable morpho-v2-reallocator
+sudo deploy/install-release.sh \
+  ./release-artifact/morpho-v2-reallocator \
+  ./release-artifact/release-manifest.json \
+  ./config.json \
+  ./protocol-lock.toml \
+  v0.1.0 \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+journalctl -u morpho-v2-reallocator -f
 ```
 
-The terminal output is intentionally compact: startup and actionable failures
-are logged once, and each successfully refreshed canonical block prints one
-`block processed` line. Attach later with `tmux attach -t reallocator`.
+The service uses `Type=notify`. Its watchdog is acknowledged only after the
+supervisor, canonical chain loop, state loop, and storage owner all demonstrate
+progress. Terminal output is intentionally compact: startup and actionable
+failures are logged once, and each successfully refreshed canonical block prints
+one `block processed` line.
 
 The first start replays canonical history from `event_start_block`. Keep the bot
 in Shadow mode until exact snapshots and plans are stable. Execute mode fails

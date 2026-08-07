@@ -230,8 +230,10 @@ fn validate_snapshot(
         if position.position_key != *key
             || position.market_id != derive_market_id(&position.market_params)
             || position.internal_supply_shares > position.actual_morpho_supply_shares
-            || position.actual_morpho_supply_shares - position.internal_supply_shares
-                != position.ignored_donation_shares
+            || position
+                .actual_morpho_supply_shares
+                .checked_sub(position.internal_supply_shares)
+                != Some(position.ignored_donation_shares)
             || !snapshot.adapters.contains_key(&position.adapter)
             || !snapshot.markets.contains_key(&position.market_id)
             || position.affected_caps.iter().any(|reference| {

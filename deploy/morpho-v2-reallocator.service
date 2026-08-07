@@ -1,0 +1,29 @@
+[Unit]
+Description=Morpho Vault V2 Reallocator
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=notify
+User=morpho
+Group=morpho
+ExecStart=/opt/morpho/current/morpho-v2-reallocator run --config /etc/morpho/config.json --protocol-lock /etc/morpho/protocol-lock.toml --bind 127.0.0.1:9190
+Restart=always
+RestartSec=2s
+WatchdogSec=30s
+TimeoutStartSec=90s
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/morpho /var/log/morpho
+LimitNOFILE=65536
+EnvironmentFile=/etc/morpho/reallocator.env
+WorkingDirectory=/var/lib/morpho
+
+[Install]
+WantedBy=multi-user.target

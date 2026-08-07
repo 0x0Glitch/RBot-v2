@@ -262,8 +262,8 @@ pub enum PreflightError {
     #[error("signer already owns an unresolved transaction")]
     NonceBusy,
     /// Head, event cursor, or queued invalidation changed the decision context.
-    #[error("same-head signing context changed")]
-    HeadChanged,
+    #[error("planning context was superseded; refresh exact state and replan")]
+    RefreshAndReplan,
     /// The canonical signer nonce changed before the final signing gate.
     #[error("canonical signer nonce changed during final preflight")]
     NonceChanged,
@@ -310,7 +310,7 @@ pub fn inclusion_assumptions(
     max_fee_per_gas: u128,
 ) -> Result<[InclusionAssumption; 3], PreflightError> {
     if expected_offset == 0 || latest_offset < expected_offset {
-        return Err(PreflightError::HeadChanged);
+        return Err(PreflightError::RefreshAndReplan);
     }
     let build = |kind, opportunity_offset| InclusionAssumption {
         kind,
@@ -363,7 +363,7 @@ pub async fn execute_one_head_preflight(
         && require_cursor(source.event_cursor().await?, requested_head).is_err()
     {
         tracing::debug!(stage = "initial_cursor", "same-head preflight deferred");
-        return Err(PreflightError::HeadChanged);
+        return Err(PreflightError::RefreshAndReplan);
     }
     let requested_scenarios = inclusion_assumptions(
         requested_head,
@@ -378,7 +378,7 @@ pub async fn execute_one_head_preflight(
         Ok(prepared) => prepared,
         Err(PreflightSourceError::ContextChanged) => {
             tracing::debug!(stage = "plan_rebuild", "same-head preflight deferred");
-            return Err(PreflightError::HeadChanged);
+            return Err(PreflightError::RefreshAndReplan);
         }
         Err(error) => return Err(error.into()),
     };
@@ -395,7 +395,7 @@ pub async fn execute_one_head_preflight(
         .any(|scenario| scenario.canonical_block != head)
         || plan.plan().vault != vault.address
     {
-        return Err(PreflightError::HeadChanged);
+        return Err(PreflightError::RefreshAndReplan);
     }
     validate_rolling_movement(
         storage,
@@ -536,17 +536,13 @@ pub async fn execute_one_head_preflight(
         },
         async { source.event_cursor().await.map_err(PreflightError::from) },
         async {
-            if config.app.snapshot.mode == SnapshotMode::AtomicLatest {
-                nonce_provider
-                    .account_nonce(vault.signer_address)
-                    .await
-                    .map_err(PreflightError::from)
-            } else {
-                nonce_provider
-                    .account_nonce_at(vault.signer_address, head)
-                    .await
-                    .map_err(PreflightError::from)
-            }
+            // Nonce safety never depends on a provider's `pending` view or historical nonce
+            // support. The provider returns the confirmed `latest` nonce; durable storage proves
+            // whether this process already owns one unresolved transaction.
+            nonce_provider
+                .account_nonce(vault.signer_address)
+                .await
+                .map_err(PreflightError::from)
         },
         async {
             source
@@ -577,7 +573,7 @@ pub async fn execute_one_head_preflight(
         {
             PreflightError::Latency
         } else {
-            PreflightError::HeadChanged
+            PreflightError::RefreshAndReplan
         });
     }
     let signing_gate_hash = context_hash(&[
@@ -778,7 +774,7 @@ fn require_head(observed: BlockRef, expected: BlockRef) -> Result<(), PreflightE
     if observed == expected {
         Ok(())
     } else {
-        Err(PreflightError::HeadChanged)
+        Err(PreflightError::RefreshAndReplan)
     }
 }
 
@@ -838,11 +834,11 @@ mod tests {
 
         assert!(matches!(
             inclusion_assumptions(head(1), 0, 1, 100),
-            Err(PreflightError::HeadChanged)
+            Err(PreflightError::RefreshAndReplan)
         ));
         assert!(matches!(
             inclusion_assumptions(head(1), 3, 2, 100),
-            Err(PreflightError::HeadChanged)
+            Err(PreflightError::RefreshAndReplan)
         ));
         let maximum_timestamp = inclusion_assumptions(head(u64::MAX), 1, 1, 100);
         assert!(maximum_timestamp.is_ok());
@@ -863,7 +859,7 @@ mod tests {
         };
         assert!(matches!(
             require_head(moved, expected),
-            Err(PreflightError::HeadChanged)
+            Err(PreflightError::RefreshAndReplan)
         ));
     }
 

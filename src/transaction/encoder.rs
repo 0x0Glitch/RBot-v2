@@ -11,8 +11,8 @@ use crate::{
 #[must_use]
 pub fn encode_validated_plan(plan: &ValidatedPlan) -> Bytes {
     let calls = plan.actions().iter().map(encode_action).collect::<Vec<_>>();
-    if calls.len() == 1 {
-        return calls[0].clone();
+    if let [call] = calls.as_slice() {
+        return call.clone();
     }
     IVaultV2::multicallCall { data: calls }.abi_encode().into()
 }

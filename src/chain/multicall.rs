@@ -322,10 +322,12 @@ fn decode_reported_block_number(
             });
         }
     }
-    if decode_u256(&decoded[2].1)? != U256::from(expected_chain_id) {
+    let chain_id = decoded.get(2).ok_or(MulticallError::MalformedAggregate)?;
+    if decode_u256(&chain_id.1)? != U256::from(expected_chain_id) {
         return Err(MulticallError::ContextMismatch);
     }
-    u64::try_from(decode_u256(&decoded[0].1)?).map_err(|_| MulticallError::ContextMismatch)
+    let number = decoded.first().ok_or(MulticallError::MalformedAggregate)?;
+    u64::try_from(decode_u256(&number.1)?).map_err(|_| MulticallError::ContextMismatch)
 }
 
 fn context_and_authoritative_calls(multicall: Address, calls: &[AtomicCall]) -> Vec<Call3> {
@@ -374,11 +376,14 @@ fn decode_aggregate(
             });
         }
     }
-    let number = decode_u256(&decoded[0].1)?;
-    let evm_timestamp =
-        u64::try_from(decode_u256(&decoded[1].1)?).map_err(|_| MulticallError::ContextMismatch)?;
-    let chain_id = decode_u256(&decoded[2].1)?;
-    let parent_hash = decode_b256(&decoded[3].1)?;
+    let mut context = decoded.iter();
+    let number = decode_u256(&context.next().ok_or(MulticallError::MalformedAggregate)?.1)?;
+    let evm_timestamp = u64::try_from(decode_u256(
+        &context.next().ok_or(MulticallError::MalformedAggregate)?.1,
+    )?)
+    .map_err(|_| MulticallError::ContextMismatch)?;
+    let chain_id = decode_u256(&context.next().ok_or(MulticallError::MalformedAggregate)?.1)?;
+    let parent_hash = decode_b256(&context.next().ok_or(MulticallError::MalformedAggregate)?.1)?;
     let timestamp_lag = block
         .timestamp
         .checked_sub(evm_timestamp)

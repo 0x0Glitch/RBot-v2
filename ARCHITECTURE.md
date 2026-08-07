@@ -132,30 +132,34 @@ chain-ID code branch.
 
 ## 4. Process and ownership model
 
-`src/main.rs` constructs the process. The supervisor owns four long-running
-services:
+`src/main.rs` constructs the process. A retained Tokio `JoinSet` owns every
+long-running worker:
 
 1. **Chain service**: selects canonical heads and persists verified chain data.
 2. **State service**: owns topology replay, exact snapshots, planning artifacts,
    per-vault readiness, and runtime state.
 3. **Execution service**: owns the signer, nonce lane, preflight, transaction
    lifecycle, conformance, and reconciliation.
-4. **Read-only API**: serves health, metrics, snapshots, rates, plans, episodes,
+4. **Planning coordinator**: consumes a replaceable per-vault revision and
+   publishes at most one plan for the newest complete state.
+5. **Read-only API**: serves health, metrics, snapshots, rates, plans, episodes,
    transaction summaries, and alerts.
+6. **Systemd watchdog**: proves supervisor, chain, state, and storage progress.
 
 The JSON storage actor is a separate single-writer owner. Other services send
 bounded commands and wait for acknowledgements. They cannot mutate the durable
 document concurrently.
 
-Critical channels are bounded. Examples include a 1,024-item chain-to-state
-channel, 128-item state-to-planner channel, 16-item planner-to-executor channel,
-and 128-item production storage mailbox. Backpressure is preferable to
-unbounded memory growth.
+Canonical chain updates use a bounded channel and remain durable and ordered.
+Replaceable head hints and per-vault planning revisions use `watch`, so an event
+burst cannot grow planning memory without bound. Transactions are recovered from
+durable unresolved state rather than an in-memory notification. The 128-command
+storage mailbox has timeouts plus depth, high-water, and oldest-age metrics.
 
-The supervisor cancels the process when a genuinely fatal service exits. A
-normal revert or surprising post-state is not automatically process-fatal; it
-is classified, refreshed, and replanned when identity and nonce ownership remain
-known.
+Worker errors and Tokio task panics are detected, classified, and restarted from
+durable state. Vault or signer uncertainty changes execution readiness while the
+API, metrics, recovery, and other vaults remain alive. Only unrecoverable
+process-integrity or critical-state corruption terminates the process.
 
 ## 5. Configuration and protocol identity
 
@@ -285,6 +289,25 @@ projection, allocation, supported deallocation, user deposit/withdraw modeling,
 lock verification, seed requirements, reward policy, and episode-state
 verification. Execute planning is disabled if any required capability is absent.
 
+### 7.4 Expected protocol drift
+
+Legitimate Morpho behavior refreshes state instead of being labeled corruption:
+
+- a relative allocation above its relative cap blocks new allocation and is
+  deallocated only when configured policy requires it;
+- external permissionless `forceDeallocate` increases idle assets and triggers
+  refresh/replan, while the routine strategy never calls it;
+- Vault V2's four ERC-4626 maximum views returning zero does not disable the
+  vault;
+- a temporary Vault V1 adapter `realAssets` revert makes that vault unavailable
+  and retryable without killing the process;
+- inclusion-time shares use the matching official Morpho/adapter events and the
+  exact post-state rather than a stale prediction; and
+- interest-driven allocation changes are ordinary state drift.
+
+An unknown adapter, changed asset, code identity, or role still quarantines the
+affected execution scope.
+
 ## 8. Projection and exact arithmetic
 
 Protocol and planning arithmetic use checked integer types (`U256`, `I256`, and
@@ -378,6 +401,26 @@ limit, whether the lattice search completed, target reachability, and whether th
 target was reached. “Target unreachable” is a valid result when available vault
 capital cannot materially change system-wide utilization.
 
+### 9.5 Latest-event-wins coordination
+
+Every canonical event is persisted and replayed; only the downstream planning
+notification is coalesced. `DirtyAccumulator` keeps one complete current entry
+per vault with latest relevant event block, read-set revision, topology revision,
+config revision, reason set, and planner generation. A `watch` channel replaces
+older generations without dropping affected vaults or markets.
+
+After an event burst, the state owner performs one complete aggregate/latest
+snapshot. Planning may publish only when the snapshot block covers every
+processed relevant event and all revision/fingerprint keys still match. An event
+arriving during snapshot or pure planning supersedes the result normally; it is
+discarded and does not become an incident. A topology or identity event rebuilds
+the read set even when its event block is already covered by the snapshot.
+
+Immediately before signing, execution rechecks revisions, obtains a fresh atomic
+safety fingerprint, and simulates the exact typed call from the allocator. After
+signed bytes are durable, later events cannot create a second nonce; they remain
+dirty until receipt recovery and exact post-state reconciliation finish.
+
 ## 10. Action grammar and transaction firewall
 
 Routine writes target only the configured Vault V2. A plan contains typed
@@ -397,13 +440,15 @@ arbitrary calldata.
 
 ## 11. Final preflight and signer boundary
 
-The execution service runs every five seconds and owns a single unresolved
-nonce lane. Immediately before signing it:
+The execution service monitors its durable signer lane and owns at most one
+unresolved transaction. Planning is event-triggered, not periodic. Immediately
+before signing it:
 
 1. Rebuilds/refreshes the exact execution context.
 2. Verifies the current canonical cursor and relevant-event history.
 3. Rechecks deployed identities and optional HyperEVM signer lane.
-4. Reads pending nonce from the allocator address.
+4. Reads the confirmed nonce using `eth_getTransactionCount(..., "latest")`;
+   the RPC `pending` tag is never a safety dependency.
 5. Verifies no unresolved transaction already owns the lane.
 6. Simulates inclusion scenarios with exact timestamps.
 7. Runs `eth_call` from the real configured allocator EOA.
@@ -448,6 +493,13 @@ Important ordering rules:
 - Cancellation uses the same known nonce and only for the known unresolved
   transaction.
 - Startup loads unresolved state before permitting new signing.
+- With no unresolved row, the next nonce is the confirmed/latest nonce.
+- If the unresolved nonce equals confirmed nonce, all recovery providers are
+  queried and identical persisted raw bytes are rebroadcast when absent.
+- If confirmed nonce advanced, only a known matching inclusion continues;
+  unknown consumption quarantines the signer while the process stays alive.
+- A durable nonce ahead of confirmed nonce is local corruption and quarantines
+  signing. No second nonce can be reserved in any unresolved case.
 - An included transaction remains unresolved until canonical receipt,
   confirmation, conformance, and reconciliation complete.
 
@@ -577,27 +629,20 @@ For withdrawal:
 If any subcall fails, the entire multicall reverts. The live 25 USDC withdrawal
 used a zero-penalty force deallocation successfully.
 
-## 18. Live deployment model
+## 18. Production deployment model
 
-The AWS instance runs the release profile through Cargo inside tmux:
+Routine production deployment uses the prebuilt binary directly under systemd.
+CI emits a release manifest containing source commit, Cargo.lock hash, config
+revision, protocol-lock digest, binary SHA-256, build identity, version, and
+timestamp. `deploy/install-release.sh` verifies the artifact, validates config
+and protocol lock, installs a versioned directory, and atomically switches
+`/opt/morpho/current`. `deploy/morpho-v2-reallocator.service` provides restart,
+watchdog, filesystem, privilege, and writable-path boundaries.
 
-```bash
-cd /home/ubuntu/morpho-v2-reallocator/current
-./run-execute.sh 2>&1 | tee -a /home/ubuntu/morpho-v2-reallocator/logs/execute.log
-```
-
-`run-execute.sh` loads the protected signer/RPC environment and executes:
-
-```bash
-cargo run --release --locked -- run \
-  --config ./config.aws-execute-paid.json \
-  --protocol-lock ./protocol-lock.hyperevm.toml \
-  --bind 127.0.0.1:9190
-```
-
-The tmux session is `morpho-v2-reallocator`, window `0`. Cargo startup is about
-0.3 seconds after the release cache is built. Output is simultaneously visible
-in tmux and persisted in `logs/execute.log`.
+The previously running AWS Cargo/tmux instance is not evidence that this new
+runtime has been deployed. Production cutover requires a tagged CI artifact,
+verified manifest, backup, systemd installation, readiness check, and rollback
+exercise. No routine production deployment compiles on the host.
 
 ## 19. Live execution evidence
 
@@ -735,10 +780,10 @@ deposit, and allocator reallocation transactions and exact 25 USDC movement.
 long Rust module targets.
 
 **Resolution:** compact text output disables targets and logs `block processed`
-only after successful exact refresh of a new head. Cargo output and application
-output are tee'd to the terminal and log file.
+only after successful exact refresh of a new head. Systemd captures the direct
+binary's output in the journal.
 
-### 20.12 Cargo rebuilt every invocation on the source bundle
+### 20.12 Cargo was an uptime dependency
 
 **Symptom:** `cargo run` recompiled the whole application when deployed without a
 repository-local `.git` directory.
@@ -746,8 +791,8 @@ repository-local `.git` directory.
 **Root cause:** `build.rs` always emitted `rerun-if-changed=.git/...`; missing
 watched paths were perpetually dirty.
 
-**Resolution:** emit Git watch paths only when `.git` is a real local directory.
-Two consecutive AWS Cargo invocations now finish in approximately 0.3 seconds.
+**Resolution:** Cargo is no longer in the production runtime path. CI builds and
+hashes an immutable binary; systemd executes that binary directly.
 
 ### 20.13 The first Cargo cutover missed protected environment loading
 
@@ -758,9 +803,8 @@ and fallback RPC variables.
 protected bot environment. The repository `.env` was intentionally for the
 separate depositor tool.
 
-**Resolution:** keep the protected environment-loading wrapper and replace only
-its final binary command with `cargo run --release --locked`. No transaction or
-nonce state changed during the failed startup.
+**Resolution:** systemd loads `/etc/morpho/reallocator.env`; release directories
+contain no secrets. Validation occurs before the atomic symlink cutover.
 
 ### 20.14 Chain-specific code and test deployment artifacts accumulated
 
@@ -897,7 +941,7 @@ correct.
 
 **Recommended change:** keep concise logs, but expose separate metrics for latest
 observed head, durable cursor, latest exact snapshot, skipped/coalesced heads, and
-snapshot retry count. Document this directly in the tmux runbook.
+snapshot retry count. Document this directly in the operator runbook.
 
 ### 21.12 Force-deallocation helper is intentionally narrow
 
@@ -909,16 +953,12 @@ and does not construct arbitrary adapter data.
 general withdrawal-liquidity preparation flow into a separate tool with explicit
 adapter profiles and penalty ceilings?
 
-### 21.13 Deployment is not yet an atomic tagged-release workflow
+### 21.13 Atomic release tooling is implemented; live cutover is pending
 
-The current production source was synchronized into an existing release
-directory and built in place. Durable state and configs were preserved, but this
-is weaker than an immutable release with atomic symlink cutover and tested
-rollback.
-
-**Recommended change:** build in a new versioned directory, verify manifest and
-doctor checks, stop the old process, atomically switch `current`, start, verify
-readiness, and retain the prior binary/config for rollback.
+CI release and systemd/install assets implement versioned directories, manifest
+verification, atomic `current` switching, direct binary execution, and readiness
+probing. A live cutover and rollback drill still must be performed before
+treating the AWS host as migrated.
 
 ### 21.14 Disk and build-cache operations need a runbook
 
@@ -975,7 +1015,7 @@ every state transition, plus fork tests against the exact production deployment.
 
 ## 23. Current validation evidence
 
-The reviewed branch passed:
+The current reviewed working tree passed:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
@@ -983,13 +1023,12 @@ The reviewed branch passed:
 - `cargo deny check`
 - `cargo build --release --locked`
 - `cargo machete --with-metadata`
+- `bash -n deploy/install-release.sh`
 - HyperEVM JSON configuration validation
 - HyperEVM protocol-lock validation
-- Python operator tool compilation
 - operator shell syntax checks
-- GitHub Actions CI
 
-At the time of this document, the live API reported:
+Before the systemd migration changes, the previous live AWS runtime reported:
 
 ```json
 {
@@ -1001,6 +1040,7 @@ At the time of this document, the live API reported:
 }
 ```
 
-This readiness proves configured runtime gates are satisfied. It does not by
-itself close the remaining economic, infrastructure-independence, deployment,
+That historical readiness proved its configured runtime gates were satisfied.
+It does not prove the current branch has been deployed and does not by itself
+close the remaining economic, infrastructure-independence, deployment,
 or external-review issues listed above.

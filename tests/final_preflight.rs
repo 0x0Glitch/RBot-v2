@@ -1,4 +1,5 @@
 //! Same-head final-preflight, durable signing, and pre-sign abort integration tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::{
@@ -87,6 +88,9 @@ fn validated_plan(config: &ValidatedConfig, head: BlockRef) -> ValidatedPlan {
         },
         config_revision: config.revision,
         topology_revision: B256::repeat_byte(0x41),
+        read_set_revision: 0,
+        latest_relevant_event_block: head.number,
+        planner_generation: 0,
         actions: vec![V2Action::Allocate {
             position: position.position_key,
             adapter: position.adapter,
@@ -488,7 +492,7 @@ async fn head_change_after_unsigned_persistence_aborts_without_signing()
         request(),
     )
     .await;
-    assert!(matches!(error, Err(PreflightError::HeadChanged)));
+    assert!(matches!(error, Err(PreflightError::RefreshAndReplan)));
     assert_eq!(signer.calls.load(Ordering::SeqCst), 0);
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
     assert!(

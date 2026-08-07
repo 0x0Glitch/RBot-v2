@@ -1,4 +1,5 @@
 //! Canonical receipt conformance tests against exact official event bindings.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use alloy::primitives::IntoLogData;

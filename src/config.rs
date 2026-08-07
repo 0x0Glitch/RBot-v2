@@ -2219,7 +2219,11 @@ pub fn apr_bps_to_rate_per_second_up(value: AprBps) -> Result<RatePerSecond, Ari
     let adjusted = numerator
         .checked_add(adjustment)
         .ok_or(ArithmeticError::Overflow)?;
-    Ok(RatePerSecond(adjusted / denominator))
+    Ok(RatePerSecond(
+        adjusted
+            .checked_div(denominator)
+            .ok_or(ArithmeticError::Overflow)?,
+    ))
 }
 
 /// Converts simple APR basis points to per-second WAD, rounding downward.
@@ -2233,7 +2237,11 @@ pub fn apr_bps_to_rate_per_second_down(value: AprBps) -> Result<RatePerSecond, A
     let denominator = U256::from(10_000_u64)
         .checked_mul(U256::from(SECONDS_PER_YEAR))
         .ok_or(ArithmeticError::Overflow)?;
-    Ok(RatePerSecond(numerator / denominator))
+    Ok(RatePerSecond(
+        numerator
+            .checked_div(denominator)
+            .ok_or(ArithmeticError::Overflow)?,
+    ))
 }
 
 /// Converts utilization basis points to exact WAD utilization units.

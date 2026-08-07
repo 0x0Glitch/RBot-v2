@@ -1,4 +1,5 @@
 //! Representative and fail-closed configuration validation tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::path::PathBuf;

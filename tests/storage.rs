@@ -1,4 +1,5 @@
 //! Atomic JSON actor, durability, recovery, rewind, and backup tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1534,6 +1535,9 @@ fn sample_plan(snapshot: &ExactVaultSnapshot) -> V2Plan {
         snapshot: snapshot.context.clone(),
         config_revision: snapshot.context.static_config_revision,
         topology_revision: snapshot.context.dynamic_topology_revision,
+        read_set_revision: 0,
+        latest_relevant_event_block: snapshot.context.block.number,
+        planner_generation: 0,
         actions: vec![V2Action::Allocate {
             position: morpho_v2_reallocator::domain::PositionKey(B256::repeat_byte(0x31)),
             adapter: morpho_v2_reallocator::domain::AdapterAddress(Address::with_last_byte(0x20)),
@@ -1651,5 +1655,21 @@ async fn segmented_journal_recovers_partial_tail_and_restored_backup()
         Some(block(130, 130, 129))
     );
     restored.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_mailbox_exposes_bounded_queue_telemetry() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("state.json"), 4, 1)?;
+    let handle = service.handle();
+    assert_eq!(handle.queue_stats().depth, 0);
+    let _ = handle.load_cursor(1).await?;
+    let stats = handle.queue_stats();
+    assert_eq!(stats.depth, 0);
+    assert_eq!(stats.oldest_age_millis, 0);
+    assert!(stats.high_water >= 1);
+    service.shutdown().await?;
     Ok(())
 }

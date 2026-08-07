@@ -1,4 +1,5 @@
 //! Runtime state, read-only HTTP, metrics, and real alert-transport tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::{sync::Arc, time::Duration};
@@ -290,16 +291,45 @@ async fn supervisor_cancels_other_services_on_failure() -> Result<(), Box<dyn st
         Ok(())
     })?;
     supervisor.spawn("failure", async {
-        Err(ServiceFailure {
-            reason: "deterministic test failure",
-        })
+        Err(ServiceFailure::fatal("deterministic test failure"))
     })?;
     assert!(matches!(
         supervisor.run().await,
-        Err(SupervisorError::Service {
+        Err(SupervisorError::FatalService {
             name: "failure",
             ..
         })
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn supervisor_restarts_a_panicked_worker_without_stopping_process_health()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let shutdown = ShutdownSignal::default();
+    let health = HealthState::default();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut supervisor = Supervisor::new(shutdown.clone(), health.clone(), Duration::from_secs(2));
+    let worker_attempts = Arc::clone(&attempts);
+    let worker_shutdown = shutdown.clone();
+    supervisor.spawn_restartable("restartable", move || {
+        let attempt = worker_attempts.fetch_add(1, Ordering::SeqCst);
+        let shutdown = worker_shutdown.clone();
+        async move {
+            if attempt == 0 {
+                panic!("deterministic worker panic");
+            }
+            shutdown.cancel();
+            Ok(())
+        }
+    })?;
+    assert!(supervisor.run().await.is_ok());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(!health.liveness().live);
     Ok(())
 }

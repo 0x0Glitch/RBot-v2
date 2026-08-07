@@ -600,7 +600,8 @@ fn monotone_maximum(
                 high.checked_sub(low)
                     .and_then(|distance| distance.checked_add(U256::ONE))
                     .ok_or(SimulationError::Arithmetic)?
-                    / U256::from(2_u8),
+                    .checked_div(U256::from(2_u8))
+                    .ok_or(SimulationError::Arithmetic)?,
             )
             .ok_or(SimulationError::Arithmetic)?;
         if predicate(midpoint)? {

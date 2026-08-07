@@ -7,6 +7,7 @@ use std::{
 
 use alloy::primitives::{Address, B256, U256};
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::{
     api::{
@@ -34,7 +35,8 @@ use crate::{
         identity::{RuntimeIdentities, RuntimeIdentityError},
         idle_ledger_service::{apply_idle_logs, rebuild_idle_ledger},
         messages::ChainUpdate,
-        planning_service::{PlanningServiceError, refresh_priority_plan, strategy_market_ids},
+        planning_revision::{DirtyAccumulator, PlanningWorkSet},
+        planning_service::{PlanningServiceError, strategy_market_ids},
         readiness::{ReadinessInputs, evaluate_readiness},
     },
     state::{
@@ -250,6 +252,9 @@ pub struct CanonicalStateService<P> {
     signer_ready: bool,
     last_exact_head: Option<BlockRef>,
     pending_latest_snapshots: BTreeMap<VaultAddress, ExactVaultSnapshot>,
+    dirty: DirtyAccumulator,
+    planning_work: PlanningWorkSet,
+    planning_triggers: Option<watch::Sender<PlanningWorkSet>>,
     alerts: Option<Arc<AlertDispatcher>>,
 }
 
@@ -267,6 +272,8 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         metrics: Arc<OperationalMetrics>,
     ) -> Result<Self, StateServiceError> {
         let sources = EventSourceRegistry::from_config(&config)?;
+        let mut dirty = DirtyAccumulator::default();
+        dirty.mark_startup(&config);
         Ok(Self {
             config,
             identities,
@@ -282,6 +289,9 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             signer_ready: false,
             last_exact_head: None,
             pending_latest_snapshots: BTreeMap::new(),
+            dirty,
+            planning_work: PlanningWorkSet::default(),
+            planning_triggers: None,
             alerts: None,
         })
     }
@@ -300,8 +310,26 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         self
     }
 
+    /// Attaches the replaceable latest-plan notification channel. Canonical events themselves
+    /// remain durably ordered in storage and never pass through this channel.
+    #[must_use]
+    pub fn with_planning_triggers(mut self, sender: watch::Sender<PlanningWorkSet>) -> Self {
+        self.planning_triggers = Some(sender);
+        self
+    }
+
+    /// Removes execution readiness before a failed state worker is reconstructed from durable
+    /// canonical state. The process and read-only control plane remain available.
+    pub async fn mark_worker_unavailable(&mut self) -> Result<(), StateServiceError> {
+        self.last_exact_head = None;
+        self.pending_latest_snapshots.clear();
+        self.mark_catching_up().await?;
+        self.publish_readiness(false, false).await
+    }
+
     /// Applies one storage-acknowledged canonical update in strict publication order.
     pub async fn apply_update(&mut self, update: ChainUpdate) -> Result<(), StateServiceError> {
+        self.health.record_state_heartbeat();
         match update {
             ChainUpdate::CanonicalBlock { block, logs, .. } => {
                 self.apply_block(block, &logs).await?;
@@ -341,6 +369,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 self.vaults.clear();
                 self.last_exact_head = None;
                 self.pending_latest_snapshots.clear();
+                self.dirty.mark_reorg(&self.config, common_ancestor.number);
                 self.rebuild_through(common_ancestor).await?;
             }
             ChainUpdate::ProviderDegraded(status) => {
@@ -381,7 +410,29 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         }
         let sources = &self.sources;
         for log in logs {
+            if let Some(source) = sources.source(log.address) {
+                let raw = RawEventLog {
+                    address: log.address,
+                    topics: log.topics.into_iter().flatten().collect(),
+                    data: log.data.clone(),
+                };
+                if let Some(decoded) = decode_watched_event(source, &raw)? {
+                    self.dirty.merge_invalidations(
+                        &self.config,
+                        block.number,
+                        decoded.invalidations,
+                    );
+                }
+            }
             apply_log_to_vaults(sources, &mut self.vaults, log)?;
+        }
+        if !logs.is_empty() {
+            for vault in self.dirty.dirty_vaults() {
+                self.planning_work.vaults.remove(&vault);
+            }
+            if let Some(sender) = &self.planning_triggers {
+                sender.send_replace(self.planning_work.clone());
+            }
         }
         for vault in &self.config.app.vaults {
             let ledger = self
@@ -514,6 +565,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
 
     async fn refresh_exact_at_head(&mut self, head: BlockRef) -> Result<(), StateServiceError> {
         let mut all_exact_ready = true;
+        let mut captured_snapshot = false;
         for vault in &self.config.app.vaults {
             if vault.deployment_block > head.number {
                 all_exact_ready = false;
@@ -525,6 +577,18 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 .map(|state| (state.topology.clone(), state.idle_ledger.clone()))
                 .ok_or(StateServiceError::NonCanonicalUpdate)?;
             let previous_snapshot = self.api.snapshot(vault.address).await;
+            if !self.dirty.is_vault_dirty(vault.address)
+                && let Some(previous) = previous_snapshot.as_ref()
+            {
+                all_exact_ready &= exact_ready_for_mode(self.config.app.node.mode, previous);
+                self.runtime
+                    .update(vault.address, |status| {
+                        status.canonical_head = Some(head);
+                        Ok(())
+                    })
+                    .await?;
+                continue;
+            }
             // Startup verifies every locked runtime. The snapshot manifest rechecks every
             // authoritative target in the selected snapshot context, and final preflight
             // separately revalidates mutable proxy links. Repeating the full latest-code sweep
@@ -656,6 +720,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             self.storage
                 .persist_snapshot(snapshot.clone(), snapshot_block.timestamp)
                 .await?;
+            captured_snapshot = true;
             let projection = project_snapshot_to_head(&snapshot, head, vault)?;
             self.record_independent_rate_event(
                 vault,
@@ -733,16 +798,18 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 snapshot.capabilities.can_allocate,
                 pending_transaction.is_some(),
             ) {
-                let _ = refresh_priority_plan(
-                    &self.config,
-                    vault,
-                    &snapshot,
-                    &projection,
-                    &self.storage,
-                    &self.api,
-                    &self.runtime,
-                )
-                .await?;
+                if let Some(revision) = self.dirty.bind_snapshot(
+                    vault.address,
+                    snapshot.context.dynamic_topology_revision,
+                    self.config.revision,
+                    snapshot.context.block,
+                    snapshot.snapshot_hash,
+                ) {
+                    self.planning_work.vaults.insert(vault.address, revision);
+                    if let Some(sender) = &self.planning_triggers {
+                        sender.send_replace(self.planning_work.clone());
+                    }
+                }
             } else {
                 self.api.clear_plan(vault.address).await;
                 self.runtime
@@ -764,9 +831,11 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 i64::try_from(head.timestamp).unwrap_or(i64::MAX),
             )
             .map_err(|_| StateServiceError::Metric)?;
-        self.metrics
-            .increment("reallocator_snapshot_success")
-            .map_err(|_| StateServiceError::Metric)?;
+        if captured_snapshot {
+            self.metrics
+                .increment("reallocator_snapshot_success")
+                .map_err(|_| StateServiceError::Metric)?;
+        }
         self.publish_readiness(true, all_exact_ready).await
     }
 
@@ -1156,7 +1225,7 @@ fn episode_partition_preserved(
 fn rate_per_second_to_apr_bps_down(rate: U256) -> u64 {
     rate.checked_mul(U256::from(SECONDS_PER_YEAR))
         .and_then(|annual| annual.checked_mul(U256::from(10_000_u64)))
-        .map(|scaled| scaled / U256::from(WAD))
+        .and_then(|scaled| scaled.checked_div(U256::from(WAD)))
         .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(u64::MAX)
 }
@@ -1164,7 +1233,7 @@ fn rate_per_second_to_apr_bps_down(rate: U256) -> u64 {
 fn utilization_wad_to_bps_down(utilization: U256) -> u64 {
     utilization
         .checked_mul(U256::from(10_000_u64))
-        .map(|scaled| scaled / U256::from(WAD))
+        .and_then(|scaled| scaled.checked_div(U256::from(WAD)))
         .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(u64::MAX)
 }
@@ -1444,7 +1513,8 @@ fn transient_snapshot_context(error: &StateServiceError) -> bool {
         | StateServiceError::Snapshot(SnapshotError::Multicall(
             MulticallError::CursorNotAtHead
             | MulticallError::ContextChanged
-            | MulticallError::ContextMismatch,
+            | MulticallError::ContextMismatch
+            | MulticallError::AuthoritativeCallFailed { .. },
         )) => true,
         StateServiceError::Snapshot(SnapshotError::Multicall(MulticallError::Provider(error))) => {
             error.is_transient_outage()
@@ -1677,5 +1747,13 @@ mod tests {
             .unwrap_or_else(|error| panic!("event classification failed: {error}")),
             None
         );
+    }
+
+    #[test]
+    fn authoritative_adapter_read_revert_is_retryable_without_process_failure() {
+        let error = StateServiceError::Snapshot(SnapshotError::Multicall(
+            MulticallError::AuthoritativeCallFailed { index: 3 },
+        ));
+        assert!(transient_snapshot_context(&error));
     }
 }

@@ -18,8 +18,8 @@ use crate::{
         logs::{RawEventLog, StateInvalidation, decode_watched_event},
         multicall::AtomicSnapshotProvider,
         provider::{
-            AccountFundingProvider, AccountNonceProvider, ChainDataProvider, ProviderError,
-            RpcErrorCategory, SignedTransactionSubmitter, TransactionLookupProvider,
+            AccountFundingProvider, AccountNonceProvider, ChainDataProvider, NonceRecoveryProvider,
+            ProviderError, RpcErrorCategory, SignedTransactionSubmitter, TransactionLookupProvider,
             TransactionSimulationProvider, parse_quantity,
         },
         receipts::validate_receipt,
@@ -40,6 +40,7 @@ use crate::{
     runtime::{
         controller::{ControllerError, RuntimeRegistry, RuntimeVaultState},
         current_state_source::LiveCurrentStateSource,
+        failure::{FailureDisposition, SignerQuarantineReason, VaultQuarantineReason},
         identity::RuntimeIdentities,
         planning_service::{PlanningServiceError, refresh_priority_plan},
         preflight_source::LiveRatePreflightSource,
@@ -129,34 +130,45 @@ pub enum ExecutionServiceError {
     /// The exclusive signer nonce was consumed by an unknown transaction.
     #[error("exclusive signer nonce was consumed by an unknown transaction")]
     UnknownNonce,
+    /// Independent recovery providers returned incompatible confirmed nonce or transaction data.
+    #[error("nonce recovery providers disagree")]
+    ProviderDisagreement,
 }
 
 impl ExecutionServiceError {
-    /// Returns whether continuing could violate a local durability or code invariant.
+    /// Classifies runtime faults without turning recoverable dependency failures into process
+    /// termination.
     #[must_use]
-    pub const fn is_process_fatal(&self) -> bool {
+    pub const fn disposition(&self) -> FailureDisposition {
         match self {
-            Self::Storage(_)
-            | Self::Controller(_)
-            | Self::FeeRange
-            | Self::Recovery
-            | Self::PersistentProviderFailure
-            | Self::WalletFunding
-            | Self::SignerInfrastructure
-            | Self::UnknownNonce => true,
+            Self::UnknownNonce => FailureDisposition::QuarantineSigner {
+                reason: SignerQuarantineReason::UnknownNonceConsumption,
+            },
+            Self::ProviderDisagreement => FailureDisposition::QuarantineSigner {
+                reason: SignerQuarantineReason::ProviderDisagreement,
+            },
+            Self::Recovery | Self::FeeRange => FailureDisposition::QuarantineSigner {
+                reason: SignerQuarantineReason::InvalidReservation,
+            },
+            Self::Storage(_) | Self::WalletFunding | Self::SignerInfrastructure => {
+                FailureDisposition::QuarantineSigner {
+                    reason: SignerQuarantineReason::DurabilityOrIdentity,
+                }
+            }
             Self::Preflight(PreflightError::Storage(_))
             | Self::Preflight(PreflightError::Source(
                 crate::transaction::final_preflight::PreflightSourceError::FatalAt(_),
             ))
             | Self::Pending(PendingPolicyError::Storage(_))
-            | Self::Receipt(ReceiptTrackingError::Storage(_))
-            | Self::Conformance(ReceiptReconciliationError::Storage(_))
-            | Self::CurrentState(CurrentStateError::Storage(_)) => true,
-            Self::Conformance(
-                ReceiptReconciliationError::Provider(_)
-                | ReceiptReconciliationError::TransactionUnavailable,
-            )
-            | Self::CurrentState(CurrentStateError::Source(
+            | Self::Receipt(ReceiptTrackingError::Storage(_)) => {
+                FailureDisposition::QuarantineSigner {
+                    reason: SignerQuarantineReason::DurabilityOrIdentity,
+                }
+            }
+            Self::Conformance(_) => FailureDisposition::QuarantineVault {
+                reason: VaultQuarantineReason::AccountingUnavailable,
+            },
+            Self::CurrentState(CurrentStateError::Source(
                 CurrentStateSourceError::ContextNotReady
                 | CurrentStateSourceError::RetryableAt(_)
                 | CurrentStateSourceError::ProviderOutageAt(_),
@@ -164,19 +176,29 @@ impl ExecutionServiceError {
             | Self::Preflight(PreflightError::Source(
                 crate::transaction::final_preflight::PreflightSourceError::RetryableAt(_)
                 | crate::transaction::final_preflight::PreflightSourceError::ProviderOutageAt(_),
-            )) => false,
+            )) => FailureDisposition::Retry {
+                backoff: std::time::Duration::from_secs(2),
+            },
             Self::Preflight(PreflightError::Signing(_))
-            | Self::Pending(PendingPolicyError::Signer(_))
-            | Self::Conformance(_)
-            | Self::CurrentState(_)
-            | Self::Planning(_) => true,
+            | Self::Pending(PendingPolicyError::Signer(_)) => {
+                FailureDisposition::QuarantineSigner {
+                    reason: SignerQuarantineReason::DurabilityOrIdentity,
+                }
+            }
+            Self::CurrentState(_) | Self::Planning(_) => FailureDisposition::RefreshAndReplan,
+            Self::PersistentProviderFailure => FailureDisposition::Retry {
+                backoff: std::time::Duration::from_secs(5),
+            },
             Self::Provider(_)
             | Self::Chain(_)
-            | Self::Preflight(_)
             | Self::Receipt(_)
             | Self::Pending(_)
             | Self::DailyGasBudget
-            | Self::DailyTransactionBudget => false,
+            | Self::DailyTransactionBudget => FailureDisposition::Retry {
+                backoff: std::time::Duration::from_secs(5),
+            },
+            Self::Preflight(_) => FailureDisposition::RefreshAndReplan,
+            Self::Controller(_) => FailureDisposition::RestartWorker,
         }
     }
 }
@@ -238,6 +260,7 @@ pub struct LiveExecutionService<P> {
     config: Arc<ValidatedConfig>,
     identities: RuntimeIdentities,
     provider: Arc<P>,
+    recovery_providers: Vec<Arc<dyn NonceRecoveryProvider>>,
     storage: StorageHandle,
     api: ApiDataStore,
     runtime: RuntimeRegistry,
@@ -256,6 +279,7 @@ impl<P> LiveExecutionService<P> {
         config: Arc<ValidatedConfig>,
         identities: RuntimeIdentities,
         provider: Arc<P>,
+        recovery_providers: Vec<Arc<dyn NonceRecoveryProvider>>,
         storage: StorageHandle,
         api: ApiDataStore,
         runtime: RuntimeRegistry,
@@ -267,6 +291,7 @@ impl<P> LiveExecutionService<P> {
             config,
             identities,
             provider,
+            recovery_providers,
             storage,
             api,
             runtime,
@@ -298,6 +323,128 @@ where
         + Send
         + Sync,
 {
+    /// Reads only the confirmed `latest` nonce and requires every responding recovery provider to
+    /// agree. A temporarily unavailable provider is retried by the controller; disagreement is a
+    /// signer quarantine condition and never permits a new reservation.
+    async fn confirmed_nonce(&self, signer: Address) -> Result<u64, ExecutionServiceError> {
+        let mut observed = None;
+        let mut first_error = None;
+        for provider in &self.recovery_providers {
+            match provider.account_nonce(signer).await {
+                Ok(nonce) if observed.is_some_and(|current| current != nonce) => {
+                    self.pause_signer_account(
+                        signer,
+                        "confirmed nonce recovery providers disagree",
+                    )
+                    .await?;
+                    return Err(ExecutionServiceError::ProviderDisagreement);
+                }
+                Ok(nonce) => observed = Some(nonce),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        match observed {
+            Some(nonce) => Ok(nonce),
+            None => Err(first_error
+                .map(ExecutionServiceError::Provider)
+                .unwrap_or(ExecutionServiceError::Recovery)),
+        }
+    }
+
+    async fn recovery_transaction_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<crate::chain::provider::RpcTransaction>, ExecutionServiceError> {
+        let mut observed = None;
+        let mut first_error = None;
+        for provider in &self.recovery_providers {
+            match provider.transaction_by_hash(hash).await {
+                Ok(Some(transaction))
+                    if observed
+                        .as_ref()
+                        .is_some_and(|current| current != &transaction) =>
+                {
+                    return Err(ExecutionServiceError::ProviderDisagreement);
+                }
+                Ok(Some(transaction)) => observed = Some(transaction),
+                Ok(None) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if observed.is_some() || first_error.is_none() {
+            Ok(observed)
+        } else {
+            Err(first_error
+                .map(ExecutionServiceError::Provider)
+                .unwrap_or(ExecutionServiceError::Recovery))
+        }
+    }
+
+    async fn recovery_receipt_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<crate::chain::provider::RpcReceipt>, ExecutionServiceError> {
+        let mut observed = None;
+        let mut first_error = None;
+        for provider in &self.recovery_providers {
+            match provider.receipt_by_hash(hash).await {
+                Ok(Some(receipt))
+                    if observed.as_ref().is_some_and(|current| current != &receipt) =>
+                {
+                    return Err(ExecutionServiceError::ProviderDisagreement);
+                }
+                Ok(Some(receipt)) => observed = Some(receipt),
+                Ok(None) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if observed.is_some() || first_error.is_none() {
+            Ok(observed)
+        } else {
+            Err(first_error
+                .map(ExecutionServiceError::Provider)
+                .unwrap_or(ExecutionServiceError::Recovery))
+        }
+    }
+
+    async fn recovery_transaction_by_sender_nonce_in_block(
+        &self,
+        signer: Address,
+        nonce: u64,
+        block: BlockRef,
+    ) -> Result<Option<crate::chain::provider::RpcTransaction>, ExecutionServiceError> {
+        let mut observed = None;
+        let mut first_error = None;
+        for provider in &self.recovery_providers {
+            match provider
+                .transaction_by_sender_nonce_in_block(signer, nonce, block)
+                .await
+            {
+                Ok(Some(transaction))
+                    if observed
+                        .as_ref()
+                        .is_some_and(|current| current != &transaction) =>
+                {
+                    return Err(ExecutionServiceError::ProviderDisagreement);
+                }
+                Ok(Some(transaction)) => observed = Some(transaction),
+                Ok(None) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if observed.is_some() || first_error.is_none() {
+            Ok(observed)
+        } else {
+            Err(first_error
+                .map(ExecutionServiceError::Provider)
+                .unwrap_or(ExecutionServiceError::Recovery))
+        }
+    }
+
     /// Advances every signer lane once, with bounded infrastructure-failure escalation.
     pub async fn tick(&self) -> Result<(), ExecutionServiceError> {
         let result = self.tick_once().await;
@@ -420,7 +567,9 @@ where
         let head = ChainDataProvider::latest_header(self.provider.as_ref()).await?;
         self.ensure_daily_transaction_budget(vault.signer_address, head.timestamp)
             .await?;
-        let nonce = self.provider.account_nonce(vault.signer_address).await?;
+        // Confirmed/latest nonce plus the durable unresolved row is the complete nonce truth.
+        // HyperEVM's pending tag is neither queried nor required.
+        let nonce = self.confirmed_nonce(vault.signer_address).await?;
         let maximum_fee = u128::try_from(self.config.app.execution.maximum_fee_per_gas_wei)
             .map_err(|_| ExecutionServiceError::FeeRange)?;
         let initial_fee = maximum_fee
@@ -541,6 +690,22 @@ where
             .load_cursor(self.config.app.chain.chain_id)
             .await?
             .ok_or(ExecutionServiceError::Recovery)?;
+        // Startup and steady-state recovery use the same ordering: durable ownership first,
+        // confirmed/latest nonce second. A future local reservation can never be repaired by
+        // guessing or by reserving another nonce.
+        let confirmed_nonce = self.confirmed_nonce(pending.signer).await?;
+        if pending.nonce > confirmed_nonce {
+            self.pause_signer(
+                vault.address,
+                "durable unresolved nonce is ahead of the confirmed account nonce",
+            )
+            .await?;
+            return Err(ExecutionServiceError::Recovery);
+        }
+        if pending.nonce < confirmed_nonce && self.canonical_receipt(&pending).await?.is_none() {
+            self.classify_consumed_nonce(vault, &pending, head).await?;
+            return Ok(());
+        }
         match pending.state {
             TransactionState::NonceReserved => {
                 self.storage
@@ -766,22 +931,15 @@ where
             | TransactionState::Failed => return Err(ExecutionServiceError::Recovery),
             TransactionState::Cancelled => return Ok(()),
             TransactionState::ForeignNonceConsumed => {
+                // The durable terminal row is the signer quarantine. Startup recovery reaches
+                // the same state without depending on in-memory flags; do not emit the same P0
+                // or error every five seconds after the first classification.
                 self.pause_signer(
                     vault.address,
                     "configured signer nonce was consumed by an unknown transaction",
                 )
                 .await?;
-                self.emit_alert(
-                    AlertSeverity::P0,
-                    AlertKind::SignedTransactionAmbiguity,
-                    Some(vault.address),
-                    "Exclusive allocator nonce was consumed externally",
-                    "an unknown transaction used the bot's exclusive signer nonce; Execute is stopped",
-                    None,
-                    head.timestamp,
-                )
-                .await;
-                return Err(ExecutionServiceError::UnknownNonce);
+                return Ok(());
             }
         }
         Ok(())
@@ -798,7 +956,7 @@ where
             .ok_or(ExecutionServiceError::Recovery)?;
         let already_included = self.canonical_receipt(pending).await?.is_some();
         if !already_included {
-            if let Some(transaction) = self.provider.transaction_by_hash(expected_hash).await? {
+            if let Some(transaction) = self.recovery_transaction_by_hash(expected_hash).await? {
                 if transaction.hash != expected_hash
                     || transaction.from != pending.signer
                     || parse_quantity("transaction.nonce", &transaction.nonce)? != pending.nonce
@@ -809,7 +967,7 @@ where
                     return Err(ExecutionServiceError::Recovery);
                 }
             } else {
-                let account_nonce = self.provider.account_nonce_at(pending.signer, head).await?;
+                let account_nonce = self.confirmed_nonce(pending.signer).await?;
                 if account_nonce > pending.nonce {
                     self.classify_consumed_nonce(vault, pending, head).await?;
                     return Ok(());
@@ -819,11 +977,12 @@ where
                         .await?;
                     return Ok(());
                 }
-                if pending.last_broadcast_block.is_none() {
-                    self.cancel_unbroadcast_signed(vault, pending, head).await?;
-                    return Ok(());
-                }
-                if !self.rebroadcast_due(pending, head).await? {
+                // A network-send timeout never proves rejection. Signed bytes already own the
+                // nonce, so first recovery broadcasts them immediately; subsequent attempts obey
+                // the bounded identical-rebroadcast clock.
+                if pending.last_broadcast_block.is_some()
+                    && !self.rebroadcast_due(pending, head).await?
+                {
                     return Ok(());
                 }
                 let raw = pending
@@ -905,7 +1064,7 @@ where
         let transaction_visible = if receipt_visible {
             true
         } else if let Some(transaction) =
-            self.provider.transaction_by_hash(transaction_hash).await?
+            self.recovery_transaction_by_hash(transaction_hash).await?
         {
             validate_recovered_attempt(vault, pending, kind, &transaction)?;
             true
@@ -1001,71 +1160,13 @@ where
         .map_err(|_| ExecutionServiceError::Recovery)
     }
 
-    async fn cancel_unbroadcast_signed(
-        &self,
-        vault: &crate::config::ValidatedVaultConfig,
-        pending: &crate::storage::models::UnresolvedTransaction,
-        head: BlockRef,
-    ) -> Result<(), ExecutionServiceError> {
-        let validated = self.validated_pending(vault, pending)?;
-        let maximum = u128::try_from(self.config.app.execution.maximum_fee_per_gas_wei)
-            .map_err(|_| ExecutionServiceError::FeeRange)?;
-        let (max_fee_per_gas, max_priority_fee_per_gas) = cancellation_fees(
-            validated.current_max_fee_per_gas(),
-            validated.current_max_priority_fee_per_gas(),
-            maximum,
-        )?;
-        self.ensure_daily_gas_budget(
-            head.timestamp,
-            U256::from(21_000_u64)
-                .checked_mul(U256::from(max_fee_per_gas))
-                .ok_or(ExecutionServiceError::FeeRange)?,
-        )
-        .await?;
-        let outcome = execute_pending_attempt(
-            &self.storage,
-            self.signer.as_ref(),
-            self.provider.as_ref(),
-            &self.config.app.execution,
-            PendingAttemptRequest {
-                pending: validated,
-                expected_state: TransactionState::Signed,
-                decision: PendingDecision::Cancel(CancellationReason::ProviderAmbiguity),
-                signer_request_id: derive_pending_request_id(
-                    pending.transaction_id,
-                    PendingDecision::Cancel(CancellationReason::ProviderAmbiguity),
-                    head,
-                ),
-                max_fee_per_gas,
-                max_priority_fee_per_gas,
-                cancellation_gas_limit: 21_000,
-                created_at: head.timestamp,
-                signed_block: head.number,
-            },
-        )
-        .await?;
-        if let PendingAttemptOutcome::SubmissionIndeterminate {
-            transaction_hash,
-            category,
-        } = outcome
-        {
-            tracing::warn!(
-                %transaction_hash,
-                transaction_id = %pending.transaction_id.0,
-                rpc_error_category = ?category,
-                "stale never-broadcast routine bytes were not released; durable cancellation recovery owns the nonce lane"
-            );
-        }
-        Ok(())
-    }
-
     async fn reconcile_nonce_or_rebroadcast(
         &self,
         vault: &crate::config::ValidatedVaultConfig,
         pending: &crate::storage::models::UnresolvedTransaction,
         head: BlockRef,
     ) -> Result<bool, ExecutionServiceError> {
-        let account_nonce = self.provider.account_nonce_at(pending.signer, head).await?;
+        let account_nonce = self.confirmed_nonce(pending.signer).await?;
         if account_nonce > pending.nonce {
             self.classify_consumed_nonce(vault, pending, head).await?;
             return Ok(true);
@@ -1078,7 +1179,7 @@ where
         let latest_hash = pending
             .transaction_hash
             .ok_or(ExecutionServiceError::Recovery)?;
-        if let Some(transaction) = self.provider.transaction_by_hash(latest_hash).await? {
+        if let Some(transaction) = self.recovery_transaction_by_hash(latest_hash).await? {
             validate_recovered_routine_transaction(vault, pending, &transaction)?;
             // An included transaction can become visible through the receipt provider before the
             // canonical ingestion cursor reaches its block. During that bounded startup gap the
@@ -1169,8 +1270,7 @@ where
                 continue;
             };
             let Some(transaction) = self
-                .provider
-                .transaction_by_sender_nonce_in_block(pending.signer, pending.nonce, block)
+                .recovery_transaction_by_sender_nonce_in_block(pending.signer, pending.nonce, block)
                 .await?
             else {
                 continue;
@@ -1279,14 +1379,51 @@ where
         vault: VaultAddress,
         reason: &'static str,
     ) -> Result<(), ControllerError> {
-        self.runtime
-            .update(vault, |status| {
-                status.transition(
-                    RuntimeVaultState::PausedSignerFailure,
-                    Some(reason.to_owned()),
-                )
-            })
-            .await
+        let signer = self
+            .config
+            .app
+            .vaults
+            .iter()
+            .find(|configured| configured.address == vault)
+            .map(|configured| configured.signer_address);
+        if let Some(signer) = signer {
+            self.pause_signer_account(signer, reason).await
+        } else {
+            self.runtime
+                .update(vault, |status| {
+                    status.transition(
+                        RuntimeVaultState::PausedSignerFailure,
+                        Some(reason.to_owned()),
+                    )
+                })
+                .await
+        }
+    }
+
+    async fn pause_signer_account(
+        &self,
+        signer: Address,
+        reason: &'static str,
+    ) -> Result<(), ControllerError> {
+        let vaults = self
+            .config
+            .app
+            .vaults
+            .iter()
+            .filter(|vault| vault.signer_address == signer)
+            .map(|vault| vault.address)
+            .collect::<Vec<_>>();
+        for vault in vaults {
+            self.runtime
+                .update(vault, |status| {
+                    status.transition(
+                        RuntimeVaultState::PausedSignerFailure,
+                        Some(reason.to_owned()),
+                    )
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     async fn recover_orphaned(
@@ -1295,7 +1432,7 @@ where
         pending: &crate::storage::models::UnresolvedTransaction,
         head: BlockRef,
     ) -> Result<(), ExecutionServiceError> {
-        let account_nonce = self.provider.account_nonce_at(pending.signer, head).await?;
+        let account_nonce = self.confirmed_nonce(pending.signer).await?;
         if account_nonce > pending.nonce {
             self.classify_consumed_nonce(vault, pending, head).await?;
             return Ok(());
@@ -1638,7 +1775,7 @@ where
         }
         let mut found = None;
         for hash in &pending.known_transaction_hashes {
-            let Some(receipt) = self.provider.receipt_by_hash(*hash).await? else {
+            let Some(receipt) = self.recovery_receipt_by_hash(*hash).await? else {
                 continue;
             };
             if found.is_some() {
@@ -1732,6 +1869,7 @@ where
                 &self.storage,
                 &self.api,
                 &self.runtime,
+                None,
             )
             .await?;
         }
@@ -2092,6 +2230,7 @@ mod tests {
             conformance::{ConformanceError, ReceiptReconciliationError},
             current_state::{CurrentStateError, CurrentStateSourceError},
         },
+        runtime::failure::FailureDisposition,
         transaction::final_preflight::{PreflightError, PreflightSourceError},
     };
 
@@ -2133,34 +2272,51 @@ mod tests {
 
     #[test]
     fn preflight_dependency_failures_have_explicit_supervisor_policy() {
-        assert!(
+        assert!(matches!(
             ExecutionServiceError::Preflight(PreflightError::Source(
                 PreflightSourceError::FatalAt("storage"),
             ))
-            .is_process_fatal()
-        );
-        assert!(
-            !ExecutionServiceError::Preflight(PreflightError::Source(
+            .disposition(),
+            FailureDisposition::QuarantineSigner { .. }
+        ));
+        assert!(matches!(
+            ExecutionServiceError::Preflight(PreflightError::Source(
                 PreflightSourceError::RetryableAt("provider"),
             ))
-            .is_process_fatal()
-        );
+            .disposition(),
+            FailureDisposition::Retry { .. }
+        ));
         let source_outage = ExecutionServiceError::Preflight(PreflightError::Source(
             PreflightSourceError::ProviderOutageAt("provider"),
         ));
-        assert!(!source_outage.is_process_fatal());
+        assert!(matches!(
+            source_outage.disposition(),
+            FailureDisposition::Retry { .. }
+        ));
         assert!(provider_dependency_failed(&source_outage));
         let semantic_retry = ExecutionServiceError::Preflight(PreflightError::Source(
             PreflightSourceError::RetryableAt("provider"),
         ));
         assert!(!provider_dependency_failed(&semantic_retry));
-        assert!(ExecutionServiceError::WalletFunding.is_process_fatal());
-        assert!(ExecutionServiceError::UnknownNonce.is_process_fatal());
-        assert!(ExecutionServiceError::PersistentProviderFailure.is_process_fatal());
+        assert!(matches!(
+            ExecutionServiceError::WalletFunding.disposition(),
+            FailureDisposition::QuarantineSigner { .. }
+        ));
+        assert!(matches!(
+            ExecutionServiceError::UnknownNonce.disposition(),
+            FailureDisposition::QuarantineSigner { .. }
+        ));
+        assert!(matches!(
+            ExecutionServiceError::PersistentProviderFailure.disposition(),
+            FailureDisposition::Retry { .. }
+        ));
         let identity = ExecutionServiceError::Preflight(PreflightError::Source(
             PreflightSourceError::FatalAt("snapshot_identity"),
         ));
-        assert!(identity.is_process_fatal());
+        assert!(matches!(
+            identity.disposition(),
+            FailureDisposition::QuarantineSigner { .. }
+        ));
         assert!(contract_identity_failed(&identity));
     }
 

@@ -1,4 +1,5 @@
 //! Production release gate and host process ownership regression tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::path::PathBuf;

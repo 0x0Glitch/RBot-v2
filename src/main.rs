@@ -19,13 +19,16 @@ use morpho_v2_reallocator::api::{ApiDataStore, ReadOnlyApiState, router};
 use morpho_v2_reallocator::chain::{
     ChainError,
     heads::{ChainService, ChainServiceConfig},
-    provider::{ChainDataProvider, HttpProvider, ProviderError, RpcErrorCategory},
+    provider::{
+        ChainDataProvider, HttpProvider, NonceRecoveryProvider, ProviderError, RpcErrorCategory,
+    },
 };
 use morpho_v2_reallocator::cli::{Cli, Command, ConfigCommand};
 use morpho_v2_reallocator::config::{
     AppConfig, RpcRole, RuntimeMode, SigningConfig, SnapshotMode, ValidatedConfig,
     ValidatedRpcConfig,
 };
+use morpho_v2_reallocator::domain::BlockRef;
 use morpho_v2_reallocator::protocol_lock::{
     ProtocolLock, RemoteSignerIdentity, ValidatedProtocolLock,
 };
@@ -37,6 +40,8 @@ use morpho_v2_reallocator::runtime::{
     execution_service::{ExecutionServiceError, LiveExecutionService},
     identity::RuntimeIdentities,
     messages::{CHAIN_TO_STATE_CAPACITY, ChainUpdate},
+    planning_coordinator::PlanningCoordinator,
+    planning_revision::PlanningWorkSet,
     process_guard::ProcessGuards,
     readiness::{ReadinessInputs, evaluate_readiness},
     shutdown::{DEFAULT_SHUTDOWN_TIMEOUT, ShutdownSignal, install_os_shutdown},
@@ -283,6 +288,11 @@ async fn run_supervised(
         .transpose()
         .map_err(|error| error.to_string())?
         .map(Arc::new);
+    let mut recovery_providers = Vec::<Arc<dyn NonceRecoveryProvider>>::new();
+    recovery_providers.push(Arc::clone(&primary) as Arc<dyn NonceRecoveryProvider>);
+    if let Some(provider) = checkpoint.as_ref() {
+        recovery_providers.push(Arc::clone(provider) as Arc<dyn NonceRecoveryProvider>);
+    }
     let observed_read_chain = ChainDataProvider::chain_id(read.as_ref())
         .await
         .map_err(|error| error.to_string())?;
@@ -349,6 +359,8 @@ async fn run_supervised(
     let sources = EventSourceRegistry::from_config(&config).map_err(|error| error.to_string())?;
     let provider_ready = Arc::new(AtomicBool::new(true));
     let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(CHAIN_TO_STATE_CAPACITY);
+    let (head_hints_tx, head_hints_rx) = tokio::sync::watch::channel(None);
+    let (planning_tx, planning_rx) = tokio::sync::watch::channel(PlanningWorkSet::default());
     let chain = Arc::new(
         ChainService::new(
             Arc::clone(&primary),
@@ -366,28 +378,17 @@ async fn run_supervised(
         )
         .map_err(|error| error.to_string())?
         .with_log_filter(Arc::new(sources.clone()))
+        .with_head_hints(head_hints_tx)
         .with_provider_readiness(Arc::clone(&provider_ready)),
     );
     chain
         .verify_provider_identity()
         .await
         .map_err(|error| error.to_string())?;
-    let state_service = CanonicalStateService::new(
-        Arc::clone(&config),
-        identities.clone(),
-        read,
-        storage_handle.clone(),
-        runtime.clone(),
-        data.clone(),
-        health.clone(),
-        Arc::clone(&metrics),
-    )
-    .map_err(|error| error.to_string())?
-    .with_signer_ready(signer_ready)
-    .with_alerts(Arc::clone(&alerts));
-    let listener = tokio::net::TcpListener::bind(bind)
+    let listener_probe = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| error.to_string())?;
+    drop(listener_probe);
     let api_state = ReadOnlyApiState {
         health: health.clone(),
         runtime: runtime.clone(),
@@ -398,55 +399,130 @@ async fn run_supervised(
     let shutdown = ShutdownSignal::default();
     let mut supervisor =
         Supervisor::new(shutdown.clone(), health.clone(), DEFAULT_SHUTDOWN_TIMEOUT);
+    let chain_for_worker = Arc::clone(&chain);
+    let chain_websocket = websocket_url_env.clone();
     let chain_shutdown = shutdown.clone();
+    let chain_alerts = Arc::clone(&alerts);
+    let chain_health = health.clone();
     supervisor
-        .spawn(
-            "chain",
+        .spawn_restartable("chain", move || {
             run_chain_service(
-                chain,
-                websocket_url_env,
-                chain_shutdown,
-                Arc::clone(&alerts),
-            ),
-        )
+                Arc::clone(&chain_for_worker),
+                chain_websocket.clone(),
+                chain_shutdown.clone(),
+                Arc::clone(&chain_alerts),
+                chain_health.clone(),
+            )
+        })
         .map_err(|error| error.to_string())?;
     if let Some(signer) = signer {
-        let execution = LiveExecutionService::new(
-            Arc::clone(&config),
-            identities,
-            Arc::clone(&primary),
-            storage_handle.clone(),
-            data.clone(),
-            runtime.clone(),
-            signer,
-            ExecutionReservationManager::default(),
-            Arc::clone(&provider_ready),
-        )
-        .with_alerts(Arc::clone(&alerts));
+        let execution = Arc::new(
+            LiveExecutionService::new(
+                Arc::clone(&config),
+                identities,
+                Arc::clone(&primary),
+                recovery_providers,
+                storage_handle.clone(),
+                data.clone(),
+                runtime.clone(),
+                signer,
+                ExecutionReservationManager::default(),
+                Arc::clone(&provider_ready),
+            )
+            .with_alerts(Arc::clone(&alerts)),
+        );
         let execution_shutdown = shutdown.clone();
         supervisor
-            .spawn(
-                "execution",
-                run_execution_service(execution, execution_shutdown),
-            )
+            .spawn_restartable("execution", move || {
+                run_execution_service(Arc::clone(&execution), execution_shutdown.clone())
+            })
             .map_err(|error| error.to_string())?;
     }
+    let updates_rx = Arc::new(tokio::sync::Mutex::new(updates_rx));
+    let state_config = Arc::clone(&config);
+    let state_identities =
+        RuntimeIdentities::from_config(&config, &lock).map_err(|error| error.to_string())?;
+    let state_read = read;
+    let state_storage = storage_handle.clone();
+    let state_runtime = runtime.clone();
+    let state_data = data.clone();
+    let state_health = health.clone();
+    let state_metrics = Arc::clone(&metrics);
+    let state_alerts = Arc::clone(&alerts);
     let state_shutdown = shutdown.clone();
+    let state_head_hints = head_hints_rx;
     supervisor
-        .spawn(
-            "state",
-            run_state_service(state_service, updates_rx, state_shutdown),
-        )
+        .spawn_restartable("state", move || {
+            let state = CanonicalStateService::new(
+                Arc::clone(&state_config),
+                state_identities.clone(),
+                Arc::clone(&state_read),
+                state_storage.clone(),
+                state_runtime.clone(),
+                state_data.clone(),
+                state_health.clone(),
+                Arc::clone(&state_metrics),
+            )
+            .map(|state| {
+                state
+                    .with_signer_ready(signer_ready)
+                    .with_alerts(Arc::clone(&state_alerts))
+                    .with_planning_triggers(planning_tx.clone())
+            });
+            run_state_service(
+                state,
+                Arc::clone(&updates_rx),
+                state_head_hints.clone(),
+                state_shutdown.clone(),
+            )
+        })
         .map_err(|error| error.to_string())?;
+    let planning_config = Arc::clone(&config);
+    let planning_storage = storage_handle.clone();
+    let planning_data = data.clone();
+    let planning_runtime = runtime.clone();
+    let planning_metrics = Arc::clone(&metrics);
+    let planning_shutdown = shutdown.clone();
+    supervisor
+        .spawn_restartable("planning", move || {
+            let coordinator = PlanningCoordinator::new(
+                Arc::clone(&planning_config),
+                planning_storage.clone(),
+                planning_data.clone(),
+                planning_runtime.clone(),
+                Arc::clone(&planning_metrics),
+                planning_rx.clone(),
+            );
+            let shutdown = planning_shutdown.clone();
+            async move {
+                coordinator
+                    .run(shutdown)
+                    .await
+                    .map_err(|_| ServiceFailure::restart("planning coordinator failed"))
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    let api_bind = bind;
     let api_shutdown = shutdown.clone();
     supervisor
-        .spawn("api", async move {
-            axum::serve(listener, router(api_state))
-                .with_graceful_shutdown(async move { api_shutdown.cancelled().await })
-                .await
-                .map_err(|_| ServiceFailure {
-                    reason: "read-only API server failed",
-                })
+        .spawn_restartable("api", move || {
+            run_api_service(api_bind, api_state.clone(), api_shutdown.clone())
+        })
+        .map_err(|error| error.to_string())?;
+    let watchdog_health = health.clone();
+    let watchdog_storage = storage_handle.clone();
+    let watchdog_metrics = Arc::clone(&metrics);
+    let watchdog_alerts = Arc::clone(&alerts);
+    let watchdog_shutdown = shutdown.clone();
+    supervisor
+        .spawn_restartable("watchdog", move || {
+            run_systemd_watchdog(
+                watchdog_health.clone(),
+                watchdog_storage.clone(),
+                Arc::clone(&watchdog_metrics),
+                Arc::clone(&watchdog_alerts),
+                watchdog_shutdown.clone(),
+            )
         })
         .map_err(|error| error.to_string())?;
 
@@ -509,21 +585,21 @@ async fn run_chain_service(
     websocket_url_env: Option<String>,
     shutdown: ShutdownSignal,
     alerts: Arc<AlertDispatcher>,
+    health: HealthState,
 ) -> Result<(), ServiceFailure> {
     let consecutive_failures = Arc::new(AtomicU32::new(0));
     let Some(websocket_url_env) = websocket_url_env else {
-        return run_polling_chain_service(chain, shutdown, alerts, consecutive_failures).await;
+        return run_polling_chain_service(chain, shutdown, alerts, consecutive_failures, health)
+            .await;
     };
-    let raw_endpoint = std::env::var(websocket_url_env).map_err(|_| ServiceFailure {
-        reason: "WebSocket endpoint configuration is invalid",
-    })?;
-    let endpoint = url::Url::parse(&raw_endpoint).map_err(|_| ServiceFailure {
-        reason: "WebSocket endpoint configuration is invalid",
-    })?;
+    let raw_endpoint = std::env::var(websocket_url_env)
+        .map_err(|_| ServiceFailure::restart("WebSocket endpoint configuration is invalid"))?;
+    let endpoint = url::Url::parse(&raw_endpoint)
+        .map_err(|_| ServiceFailure::restart("WebSocket endpoint configuration is invalid"))?;
     if !matches!(endpoint.scheme(), "ws" | "wss") {
-        return Err(ServiceFailure {
-            reason: "WebSocket endpoint configuration is invalid",
-        });
+        return Err(ServiceFailure::restart(
+            "WebSocket endpoint configuration is invalid",
+        ));
     }
     let provider = match tokio::time::timeout(
         Duration::from_secs(5),
@@ -537,7 +613,14 @@ async fn run_chain_service(
                 service = "chain",
                 "WebSocket unavailable; continuing with authoritative HTTP polling"
             );
-            return run_polling_chain_service(chain, shutdown, alerts, consecutive_failures).await;
+            return run_polling_chain_service(
+                chain,
+                shutdown,
+                alerts,
+                consecutive_failures,
+                health,
+            )
+            .await;
         }
     };
     let subscription =
@@ -548,8 +631,14 @@ async fn run_chain_service(
                     service = "chain",
                     "WebSocket subscription unavailable; continuing with authoritative HTTP polling"
                 );
-                return run_polling_chain_service(chain, shutdown, alerts, consecutive_failures)
-                    .await;
+                return run_polling_chain_service(
+                    chain,
+                    shutdown,
+                    alerts,
+                    consecutive_failures,
+                    health,
+                )
+                .await;
             }
         };
     let mut hints = subscription.into_stream();
@@ -558,14 +647,20 @@ async fn run_chain_service(
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
-            _ = fallback.tick() => poll_canonical_chain(&chain, &shutdown, &alerts, &consecutive_failures).await?,
+            _ = fallback.tick() => poll_canonical_chain(&chain, &shutdown, &alerts, &consecutive_failures, &health).await?,
             hint = hints.next() => match hint {
-                Some(_) => poll_canonical_chain(&chain, &shutdown, &alerts, &consecutive_failures).await?,
+                Some(_) => poll_canonical_chain(&chain, &shutdown, &alerts, &consecutive_failures, &health).await?,
                 None if shutdown.is_cancelled() => return Ok(()),
                 None => {
                     tracing::warn!(service = "chain", "WebSocket subscription ended; continuing with authoritative HTTP polling");
-                    return run_polling_chain_service(chain, shutdown, alerts, consecutive_failures)
-                        .await;
+                    return run_polling_chain_service(
+                        chain,
+                        shutdown,
+                        alerts,
+                        consecutive_failures,
+                        health,
+                    )
+                    .await;
                 },
             },
         }
@@ -577,13 +672,14 @@ async fn run_polling_chain_service(
     shutdown: ShutdownSignal,
     alerts: Arc<AlertDispatcher>,
     consecutive_failures: Arc<AtomicU32>,
+    health: HealthState,
 ) -> Result<(), ServiceFailure> {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
-            _ = interval.tick() => poll_canonical_chain(&chain, &shutdown, &alerts, &consecutive_failures).await?,
+            _ = interval.tick() => poll_canonical_chain(&chain, &shutdown, &alerts, &consecutive_failures, &health).await?,
         }
     }
 }
@@ -593,8 +689,9 @@ async fn poll_canonical_chain(
     shutdown: &ShutdownSignal,
     alerts: &AlertDispatcher,
     consecutive_failures: &AtomicU32,
+    health: &HealthState,
 ) -> Result<(), ServiceFailure> {
-    match chain.poll_once().await {
+    let result = match chain.poll_once().await {
         Ok(_) => {
             consecutive_failures.store(0, Ordering::Release);
             Ok(())
@@ -613,11 +710,11 @@ async fn poll_canonical_chain(
         Err(error) => {
             tracing::error!(service = "chain", %error, "canonical chain service failed");
             eprintln!("chain service failed: {error}");
-            Err(ServiceFailure {
-                reason: "canonical chain service failed",
-            })
+            Err(ServiceFailure::restart("canonical chain service failed"))
         }
-    }
+    };
+    health.record_chain_heartbeat();
+    result
 }
 
 async fn emit_persistent_chain_alert(alerts: &AlertDispatcher) {
@@ -660,24 +757,54 @@ fn retryable_chain_error(error: &ChainError) -> bool {
 }
 
 async fn run_state_service(
-    mut state: CanonicalStateService<HttpProvider>,
-    mut updates: tokio::sync::mpsc::Receiver<ChainUpdate>,
+    state: Result<
+        CanonicalStateService<HttpProvider>,
+        morpho_v2_reallocator::runtime::state_service::StateServiceError,
+    >,
+    updates: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ChainUpdate>>>,
+    mut head_hints: tokio::sync::watch::Receiver<Option<BlockRef>>,
     shutdown: ShutdownSignal,
 ) -> Result<(), ServiceFailure> {
+    let mut state =
+        state.map_err(|_| ServiceFailure::restart("state worker reconstruction failed"))?;
     loop {
         tokio::select! {
+            // Ordered canonical events must drain before a replaceable head is used for planning.
+            biased;
             () = shutdown.cancelled() => return Ok(()),
-            update = updates.recv() => match update {
+            update = async {
+                let mut receiver = updates.lock().await;
+                receiver.recv().await
+            } => match update {
                 Some(update) => {
                     if let Err(error) = state.apply_update(update).await {
                         tracing::error!(service = "state", %error, "canonical state service failed");
+                        if let Err(readiness_error) = state.mark_worker_unavailable().await {
+                            tracing::error!(service = "state", %readiness_error, "failed to remove state readiness before worker restart");
+                        }
                         eprintln!("state service failed: {error}");
-                        return Err(ServiceFailure { reason: "canonical state service failed" });
+                        return Err(ServiceFailure::restart("canonical state service failed"));
                     }
                 }
                 None if shutdown.is_cancelled() => return Ok(()),
-                None => return Err(ServiceFailure { reason: "canonical update channel closed" }),
-            }
+                None => return Err(ServiceFailure::restart("canonical update channel closed")),
+            },
+            changed = head_hints.changed() => match changed {
+                Ok(()) => {
+                    let head = *head_hints.borrow_and_update();
+                    if let Some(head) = head
+                        && let Err(error) = state.apply_update(ChainUpdate::CanonicalHead(head)).await
+                    {
+                        tracing::error!(service = "state", %error, "latest head processing failed");
+                        if let Err(readiness_error) = state.mark_worker_unavailable().await {
+                            tracing::error!(service = "state", %readiness_error, "failed to remove state readiness before worker restart");
+                        }
+                        return Err(ServiceFailure::restart("latest head processing failed"));
+                    }
+                }
+                Err(_) if shutdown.is_cancelled() => return Ok(()),
+                Err(_) => return Err(ServiceFailure::restart("latest head watch closed")),
+            },
         }
     }
 }
@@ -764,7 +891,7 @@ fn build_execute_signer(
 }
 
 async fn run_execution_service(
-    execution: LiveExecutionService<HttpProvider>,
+    execution: Arc<LiveExecutionService<HttpProvider>>,
     shutdown: ShutdownSignal,
 ) -> Result<(), ServiceFailure> {
     // The allocator key owns one durable nonce lane. A conservative five-second cadence leaves
@@ -779,20 +906,135 @@ async fn run_execution_service(
                 match execution.tick().await {
                     Ok(()) => {}
                     Err(error @ ExecutionServiceError::Preflight(
-                        PreflightError::HeadChanged
+                        PreflightError::RefreshAndReplan
                         | PreflightError::NonceBusy
                         | PreflightError::Reservation(_)
                     )) => {
                         tracing::debug!(service = "execution", %error, "bounded execution attempt deferred");
                     }
-                    Err(error) if error.is_process_fatal() => {
-                        tracing::error!(service = "execution", %error, "execution service failed");
-                        eprintln!("execution service failed: {error}");
-                        return Err(ServiceFailure { reason: "execution service failed" });
-                    }
                     Err(error) => {
-                        tracing::warn!(service = "execution", %error, "allocator lane remains fail-closed; retrying after the next sealed-block interval");
+                        use morpho_v2_reallocator::runtime::failure::FailureDisposition;
+                        match error.disposition() {
+                            FailureDisposition::RestartWorker => {
+                                tracing::error!(service = "execution", %error, "execution worker requires reconstruction");
+                                return Err(ServiceFailure::restart("execution worker requires reconstruction"));
+                            }
+                            FailureDisposition::FatalProcessIntegrity => {
+                                return Err(ServiceFailure::fatal("execution process integrity failed"));
+                            }
+                            FailureDisposition::Retry { backoff } => {
+                                tracing::warn!(service = "execution", %error, backoff_ms = backoff.as_millis(), "execution dependency unavailable; retrying");
+                            }
+                            FailureDisposition::RefreshAndReplan => {
+                                tracing::debug!(service = "execution", %error, "pre-sign work superseded; refreshing exact state");
+                            }
+                            FailureDisposition::QuarantineVault { reason } => {
+                                tracing::error!(service = "execution", %error, ?reason, "vault execution quarantined; process remains observable");
+                            }
+                            FailureDisposition::QuarantineSigner { reason } => {
+                                tracing::error!(service = "execution", %error, ?reason, "signer lane quarantined; process remains observable");
+                            }
+                        }
                     }
+                }
+            }
+        }
+    }
+}
+
+async fn run_api_service(
+    bind: std::net::SocketAddr,
+    state: ReadOnlyApiState,
+    shutdown: ShutdownSignal,
+) -> Result<(), ServiceFailure> {
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(|_| ServiceFailure::restart("read-only API bind failed"))?;
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+        .map_err(|_| ServiceFailure::restart("read-only API server failed"))
+}
+
+async fn run_systemd_watchdog(
+    health: HealthState,
+    storage: morpho_v2_reallocator::storage::actor::StorageHandle,
+    metrics: Arc<OperationalMetrics>,
+    alerts: Arc<AlertDispatcher>,
+    shutdown: ShutdownSignal,
+) -> Result<(), ServiceFailure> {
+    let Some(watchdog_window) = sd_notify::watchdog_enabled() else {
+        let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
+        shutdown.cancelled().await;
+        let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+        return Ok(());
+    };
+    let interval_duration = watchdog_window
+        .checked_div(3)
+        .unwrap_or(Duration::from_secs(1))
+        .max(Duration::from_secs(1));
+    let mut interval = tokio::time::interval(interval_duration);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut previous = health.watchdog_heartbeats();
+    let mut ready_notified = false;
+    let mut storage_high_water_alerted = false;
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => {
+                let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+                return Ok(());
+            }
+            _ = interval.tick() => {
+                let queue = storage.queue_stats();
+                for (name, value) in [
+                    ("reallocator_storage_queue_depth", queue.depth),
+                    ("reallocator_storage_queue_high_water", queue.high_water),
+                    ("reallocator_storage_oldest_command_age_milliseconds", usize::try_from(queue.oldest_age_millis).unwrap_or(usize::MAX)),
+                ] {
+                    metrics
+                        .set(name, i64::try_from(value).unwrap_or(i64::MAX))
+                        .map_err(|_| ServiceFailure::restart("storage mailbox metric registration failed"))?;
+                }
+                if queue.depth >= DEFAULT_STORAGE_CHANNEL_CAPACITY.saturating_mul(3).saturating_div(4)
+                    && !storage_high_water_alerted
+                {
+                    tracing::error!(depth = queue.depth, high_water = queue.high_water, oldest_ms = queue.oldest_age_millis, "storage mailbox high-water threshold reached");
+                    if let Ok(alert) = Alert::new(
+                        AlertSeverity::P1,
+                        AlertKind::ServiceFailure,
+                        None,
+                        "Storage mailbox is approaching capacity".to_owned(),
+                        format!("depth={} high_water={} oldest_ms={}", queue.depth, queue.high_water, queue.oldest_age_millis),
+                        None,
+                        unix_timestamp().unwrap_or_default(),
+                    ) && alerts.emit(alert).await.is_err() {
+                        tracing::error!("storage mailbox alert delivery failed");
+                    }
+                    storage_high_water_alerted = true;
+                } else if queue.depth < DEFAULT_STORAGE_CHANNEL_CAPACITY.saturating_div(2) {
+                    storage_high_water_alerted = false;
+                }
+                let current = health.watchdog_heartbeats();
+                let storage_responsive = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    storage.load_cursor(0),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok());
+                let workers_progressed = current.0 > previous.0
+                    && current.1 > previous.1
+                    && current.2 > previous.2;
+                if storage_responsive && workers_progressed {
+                    if !ready_notified {
+                        sd_notify::notify(&[sd_notify::NotifyState::Ready])
+                            .map_err(|_| ServiceFailure::restart("systemd READY notification failed"))?;
+                        ready_notified = true;
+                    }
+                    sd_notify::notify(&[sd_notify::NotifyState::Watchdog])
+                        .map_err(|_| ServiceFailure::restart("systemd watchdog notification failed"))?;
+                    previous = current;
+                } else {
+                    tracing::error!(storage_responsive, workers_progressed, "watchdog withheld: supervisor, storage, or event loop is not responsive");
                 }
             }
         }

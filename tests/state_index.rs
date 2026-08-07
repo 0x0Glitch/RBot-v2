@@ -1,4 +1,5 @@
 //! Topology, pending administration, cap semantics, and durable rewind tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::collections::BTreeSet;
