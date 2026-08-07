@@ -1,37 +1,47 @@
 //! Live exact-state bridge for one-head rate-rebalance preflight.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Instant;
 
-use alloy::primitives::{U256, keccak256};
+use alloy::primitives::U256;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::{
     api::ApiDataStore,
-    chain::{multicall::AtomicSnapshotProvider, provider::TransactionLookupProvider},
-    config::ValidatedConfig,
+    chain::{
+        multicall::{AtomicSnapshotProvider, MulticallError},
+        provider::TransactionLookupProvider,
+    },
+    config::{SnapshotMode, ValidatedConfig},
     domain::{BlockRef, IdleLockLedgerSnapshot, PlanReason, RateObjectiveBranch, VaultAddress},
     planner::{
-        objective::rate_spread,
+        objective::complete_strategy_spread,
         simulator::{no_plan_terminal_existing_shareholder_assets, simulate_actions},
     },
     runtime::{
-        identity::RuntimeIdentities,
-        idle_ledger_service::rebuild_idle_ledger,
+        identity::{RuntimeIdentities, RuntimeIdentityError},
+        idle_ledger_service::{IdleLedgerServiceError, rebuild_idle_ledger},
         planning_service::{
             build_validated_capital_plan, build_validated_liquidity_plan, build_validated_rate_plan,
         },
-        state_service::{EventSourceRegistry, replay_topology_through},
+        state_service::{EventSourceRegistry, StateServiceError, replay_topology_through},
     },
     state::{
         idle_locks::IdleLockLedger,
         projection::{ProjectedVaultView, project_snapshot_to_head},
-        snapshot::{SnapshotBlueprint, bind_idle_lock_ledger, build_exact_snapshot},
+        snapshot::{
+            CanonicalSnapshotTimestamps, SnapshotBlueprint, SnapshotError, bind_idle_lock_ledger,
+            build_exact_snapshot,
+        },
     },
     storage::actor::StorageHandle,
     transaction::final_preflight::{
         ExactPreflightSource, InclusionAssumption, InclusionScenarioKind, PreflightSourceError,
-        PreparedPreflightPlan,
+        PreparedPreflightPlan, inclusion_assumptions,
     },
 };
 
@@ -45,10 +55,12 @@ pub struct LiveRatePreflightSource<P> {
     storage: StorageHandle,
     api: ApiDataStore,
     rebuilding_head: Arc<RwLock<Option<BlockRef>>>,
+    provider_ready: Arc<AtomicBool>,
 }
 
 impl<P> LiveRatePreflightSource<P> {
     /// Creates a source that can rebuild only the named configured vault.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         config: Arc<ValidatedConfig>,
@@ -58,6 +70,7 @@ impl<P> LiveRatePreflightSource<P> {
         provider: Arc<P>,
         storage: StorageHandle,
         api: ApiDataStore,
+        provider_ready: Arc<AtomicBool>,
     ) -> Self {
         Self {
             config,
@@ -68,6 +81,7 @@ impl<P> LiveRatePreflightSource<P> {
             storage,
             api,
             rebuilding_head: Arc::new(RwLock::new(None)),
+            provider_ready,
         }
     }
 }
@@ -80,7 +94,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> ExactPreflightSource
         self.storage
             .load_cursor(self.config.app.chain.chain_id)
             .await
-            .map_err(|_| PreflightSourceError::Failed)?
+            .map_err(|_| PreflightSourceError::FatalAt("event_cursor_load"))?
             .ok_or(PreflightSourceError::Failed)
     }
 
@@ -89,21 +103,33 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> ExactPreflightSource
         head: BlockRef,
         scenarios: &[InclusionAssumption; 3],
     ) -> Result<PreparedPreflightPlan, PreflightSourceError> {
-        if self.event_cursor().await? != head {
+        if self.config.app.snapshot.mode == SnapshotMode::PinnedBlock
+            && self.event_cursor().await? != head
+        {
             return Err(PreflightSourceError::ContextChanged);
         }
-        *self.rebuilding_head.write().await = Some(head);
         let result = self.rebuild_at_head(head, scenarios).await;
-        if result.is_err() {
-            *self.rebuilding_head.write().await = None;
+        match &result {
+            Ok(prepared) => {
+                *self.rebuilding_head.write().await = Some(prepared.plan.plan().snapshot.block);
+            }
+            Err(_) => {
+                *self.rebuilding_head.write().await = None;
+            }
         }
         result
     }
 
     async fn invalidation_queued(&self) -> Result<bool, PreflightSourceError> {
+        if !self.provider_ready.load(Ordering::Acquire) {
+            return Ok(true);
+        }
         let Some(expected) = *self.rebuilding_head.read().await else {
             return Ok(true);
         };
+        if self.config.app.snapshot.mode == SnapshotMode::AtomicLatest {
+            return Ok(false);
+        }
         Ok(self.event_cursor().await? != expected)
     }
 }
@@ -114,6 +140,11 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
         head: BlockRef,
         scenarios: &[InclusionAssumption; 3],
     ) -> Result<PreparedPreflightPlan, PreflightSourceError> {
+        let started = Instant::now();
+        self.identities
+            .verify_proxy_links(self.provider.as_ref())
+            .await
+            .map_err(classify_identity_error)?;
         let vault = self
             .config
             .app
@@ -122,48 +153,42 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             .find(|vault| vault.address == self.vault)
             .ok_or(PreflightSourceError::FailedAt("configured_vault"))?;
         let sources = EventSourceRegistry::from_config(&self.config)
-            .map_err(|_| PreflightSourceError::FailedAt("event_source_registry"))?;
-        let topology = replay_topology_through(&self.config, &sources, &self.storage, vault, head)
-            .await
-            .map_err(|_| PreflightSourceError::FailedAt("topology_replay"))?;
+            .map_err(|_| PreflightSourceError::FatalAt("event_source_registry"))?;
+        let replay_head = if self.config.app.snapshot.mode == SnapshotMode::AtomicLatest {
+            self.event_cursor().await?
+        } else {
+            head
+        };
+        let topology =
+            replay_topology_through(&self.config, &sources, &self.storage, vault, replay_head)
+                .await
+                .map_err(classify_topology_error)?;
+        tracing::debug!(
+            stage = "topology",
+            elapsed_ms = started.elapsed().as_millis(),
+            "exact preflight rebuild progress"
+        );
         let active_episode = self
             .storage
             .load_active_rate_episode(vault.address, vault.rate_group.id)
             .await
-            .map_err(|_| PreflightSourceError::FailedAt("active_episode_load"))?;
+            .map_err(|_| PreflightSourceError::FatalAt("active_episode_load"))?;
         let published_reason = self.reason;
         let episode = if published_reason == PlanReason::RateRebalance {
             Some(active_episode.ok_or(PreflightSourceError::Failed)?)
         } else {
             None
         };
-        let topology_revision = topology
-            .revision()
-            .map_err(|_| PreflightSourceError::FailedAt("topology_revision"))?;
-        if episode.as_ref().is_some_and(|episode| {
-            episode.config_revision != self.config.revision
-                || episode.topology_revision != topology_revision
-                || scenarios
-                    .iter()
-                    .map(|scenario| scenario.projected_timestamp)
-                    .max()
-                    .is_none_or(|latest| latest >= episode.expires_at)
-        }) {
-            return Err(PreflightSourceError::Failed);
+        if self.config.app.snapshot.mode == SnapshotMode::PinnedBlock
+            && scenarios
+                .iter()
+                .any(|scenario| scenario.canonical_block != head)
+        {
+            return Err(PreflightSourceError::ContextChanged);
         }
-        let maximum_scenario_timestamp = scenarios
-            .iter()
-            .map(|scenario| scenario.projected_timestamp)
-            .max()
-            .ok_or(PreflightSourceError::Failed)?;
-        let administrative_horizon_timestamp = maximum_scenario_timestamp
-            .checked_add(self.config.app.execution.receipt_confirmation_evm_blocks)
-            .ok_or(PreflightSourceError::Failed)?;
-        let expected_inclusion_timestamp = scenarios
-            .iter()
-            .find(|scenario| scenario.kind == InclusionScenarioKind::Expected)
-            .map(|scenario| scenario.projected_timestamp)
-            .ok_or(PreflightSourceError::Failed)?;
+        // Future inclusion opportunities do not imply a number of elapsed seconds. All protocol
+        // calculations use the timestamp of the exact canonical block being signed against.
+        let timestamps = CanonicalSnapshotTimestamps::from_block(replay_head);
         let blueprint = SnapshotBlueprint {
             chain: &self.config.app.chain,
             snapshot_policy: &self.config.app.snapshot,
@@ -172,20 +197,56 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             topology: &topology,
             code_hashes: self.identities.code_hashes(),
             static_config_revision: self.config.revision,
-            event_cursor: head,
+            event_cursor: replay_head,
             idle_locks: IdleLockLedgerSnapshot::default(),
-            administrative_horizon_timestamp,
-            expected_inclusion_timestamp,
+            administrative_horizon_timestamp: timestamps.administrative_horizon_timestamp,
+            expected_inclusion_timestamp: timestamps.expected_inclusion_timestamp,
             rate_episode_state_verified: true,
         };
-        let mut snapshot = build_exact_snapshot(self.provider.as_ref(), &blueprint)
-            .await
-            .map_err(|_| PreflightSourceError::FailedAt("exact_snapshot"))?;
+        let mut snapshot = if self.config.app.snapshot.mode == SnapshotMode::AtomicLatest {
+            self.api
+                .snapshot(vault.address)
+                .await
+                .ok_or(PreflightSourceError::RetryableAt(
+                    "latest_snapshot_unavailable",
+                ))?
+        } else {
+            build_exact_snapshot(self.provider.as_ref(), &blueprint)
+                .await
+                .map_err(classify_snapshot_error)?
+        };
+        let head = snapshot.context.block;
+        let scenarios = if self.config.app.snapshot.mode == SnapshotMode::AtomicLatest {
+            inclusion_assumptions(
+                head,
+                self.config.app.execution.expected_inclusion_opportunities,
+                self.config.app.execution.maximum_inclusion_opportunities,
+                scenarios[0].max_fee_per_gas,
+            )
+            .map_err(|_| PreflightSourceError::FatalAt("inclusion_assumptions"))?
+        } else {
+            *scenarios
+        };
+        let topology_revision = topology
+            .revision()
+            .map_err(|_| PreflightSourceError::FailedAt("topology_revision"))?;
+        if episode.as_ref().is_some_and(|episode| {
+            episode.config_revision != self.config.revision
+                || episode.topology_revision != topology_revision
+                || head.timestamp >= episode.expires_at
+        }) {
+            return Err(PreflightSourceError::Failed);
+        }
+        tracing::debug!(
+            stage = "atomic_snapshot",
+            elapsed_ms = started.elapsed().as_millis(),
+            "exact preflight rebuild progress"
+        );
         let durable_snapshot = self
             .storage
             .load_exact_snapshot(vault.address, head)
             .await
-            .map_err(|_| PreflightSourceError::FailedAt("idle_ledger_checkpoint_load"))?;
+            .map_err(|_| PreflightSourceError::FatalAt("idle_ledger_checkpoint_load"))?;
         let idle_locks = if let Some(durable) = durable_snapshot.filter(|durable| {
             durable.idle_locks.verified && durable.parent.idle_assets == snapshot.parent.idle_assets
         }) {
@@ -204,7 +265,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                     snapshot.parent.idle_assets,
                 )
                 .await
-                .map_err(|_| PreflightSourceError::FailedAt("idle_ledger_replay"))?
+                .map_err(classify_idle_ledger_error)?
             };
             ledger
                 .snapshot()
@@ -214,21 +275,26 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             .map_err(|_| PreflightSourceError::FailedAt("idle_ledger_bind"))?;
         self.identities
             .validate_snapshot(&snapshot)
-            .map_err(|_| PreflightSourceError::FailedAt("snapshot_identity"))?;
+            .map_err(|_| PreflightSourceError::FatalAt("snapshot_identity"))?;
+        if !snapshot.capabilities.can_allocate {
+            return Err(PreflightSourceError::FailedAt("allocation_capability"));
+        }
         self.storage
             .persist_snapshot(snapshot.clone(), head.timestamp)
             .await
-            .map_err(|_| PreflightSourceError::FailedAt("snapshot_persist"))?;
+            .map_err(|_| PreflightSourceError::FatalAt("snapshot_persist"))?;
         self.api.record_snapshot(snapshot.clone()).await;
+        tracing::debug!(
+            stage = "snapshot_durable",
+            elapsed_ms = started.elapsed().as_millis(),
+            "exact preflight rebuild progress"
+        );
 
         let projections = scenarios
             .iter()
             .map(|scenario| {
-                projected_scenario_head(head, *scenario)
-                    .and_then(|projected_head| {
-                        project_snapshot_to_head(&snapshot, projected_head, vault)
-                            .map_err(|_| PreflightSourceError::FailedAt("scenario_projection"))
-                    })
+                project_snapshot_to_head(&snapshot, scenario.canonical_block, vault)
+                    .map_err(|_| PreflightSourceError::FailedAt("scenario_projection"))
                     .map(|projection| (scenario.kind, projection))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -255,6 +321,11 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
         }
         .map_err(|_| PreflightSourceError::FailedAt("semantic_plan_build"))?
         .ok_or(PreflightSourceError::FailedAt("semantic_plan_absent"))?;
+        tracing::debug!(
+            stage = "semantic_plan",
+            elapsed_ms = started.elapsed().as_millis(),
+            "exact preflight rebuild progress"
+        );
         for (_, projection) in &projections {
             validate_scenario(
                 &snapshot,
@@ -269,30 +340,66 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
         Ok(PreparedPreflightPlan {
             plan: prepared.plan,
             action_projections: prepared.action_projections,
+            scenarios,
         })
     }
 }
 
-fn projected_scenario_head(
-    head: BlockRef,
-    scenario: InclusionAssumption,
-) -> Result<BlockRef, PreflightSourceError> {
-    let number = head
-        .number
-        .checked_add(scenario.fast_block_offset)
-        .ok_or(PreflightSourceError::Failed)?;
-    let mut identity = Vec::with_capacity(56);
-    identity.extend_from_slice(head.hash.as_slice());
-    identity.extend_from_slice(&number.to_be_bytes());
-    identity.extend_from_slice(&scenario.projected_timestamp.to_be_bytes());
-    identity.extend_from_slice(&scenario.max_fee_per_gas.to_be_bytes());
-    Ok(BlockRef {
-        number,
-        hash: keccak256(identity),
-        parent_hash: head.hash,
-        timestamp: scenario.projected_timestamp,
-        gas_limit: head.gas_limit,
-    })
+fn classify_identity_error(error: RuntimeIdentityError) -> PreflightSourceError {
+    match error {
+        RuntimeIdentityError::Provider(category) if category.is_transient_outage() => {
+            PreflightSourceError::ProviderOutageAt("runtime_identity")
+        }
+        RuntimeIdentityError::Provider(_) => PreflightSourceError::RetryableAt("runtime_identity"),
+        RuntimeIdentityError::ChainMismatch
+        | RuntimeIdentityError::Configuration(_)
+        | RuntimeIdentityError::Runtime(_) => PreflightSourceError::FatalAt("runtime_identity"),
+    }
+}
+
+fn classify_topology_error(error: StateServiceError) -> PreflightSourceError {
+    match error {
+        StateServiceError::Storage(_) => PreflightSourceError::FatalAt("topology_replay_storage"),
+        _ => PreflightSourceError::FatalAt("topology_replay"),
+    }
+}
+
+fn classify_snapshot_error(error: SnapshotError) -> PreflightSourceError {
+    match error {
+        SnapshotError::Multicall(MulticallError::Provider(error)) => {
+            if error.is_transient_outage() {
+                PreflightSourceError::ProviderOutageAt("exact_snapshot_provider")
+            } else {
+                PreflightSourceError::RetryableAt("exact_snapshot_provider")
+            }
+        }
+        SnapshotError::Multicall(
+            MulticallError::ContextChanged
+            | MulticallError::ContextMismatch
+            | MulticallError::CursorNotAtHead,
+        ) => PreflightSourceError::ContextChanged,
+        _ => PreflightSourceError::FatalAt("exact_snapshot"),
+    }
+}
+
+fn classify_idle_ledger_error(error: IdleLedgerServiceError) -> PreflightSourceError {
+    match error {
+        IdleLedgerServiceError::Storage(_) => {
+            PreflightSourceError::FatalAt("idle_ledger_replay_storage")
+        }
+        IdleLedgerServiceError::Provider(error) if error.is_transient_outage() => {
+            PreflightSourceError::ProviderOutageAt("idle_ledger_replay_provider")
+        }
+        IdleLedgerServiceError::Provider(_) | IdleLedgerServiceError::TransactionIdentity => {
+            PreflightSourceError::RetryableAt("idle_ledger_replay_provider")
+        }
+        IdleLedgerServiceError::Event(_)
+        | IdleLedgerServiceError::Ledger(_)
+        | IdleLedgerServiceError::Arithmetic
+        | IdleLedgerServiceError::EndBalanceMismatch => {
+            PreflightSourceError::FatalAt("idle_ledger_replay")
+        }
+    }
 }
 
 fn validate_scenario(
@@ -314,61 +421,42 @@ fn validate_scenario(
     }
     if reason == PlanReason::RateRebalance {
         let episode = episode.ok_or(PreflightSourceError::Failed)?;
+        let objective = config.app.strategy.objective;
         let before_portfolio =
-            rate_spread(episode.evaluation_markets.iter().filter_map(|market| {
-                projection
-                    .markets
-                    .get(market)
-                    .map(|state| &state.spot_borrow_rate)
-            }));
-        let before_controllable =
-            rate_spread(episode.controllable_markets.iter().filter_map(|market| {
-                projection
-                    .markets
-                    .get(market)
-                    .map(|state| &state.spot_borrow_rate)
-            }));
-        let after_portfolio = rate_spread(episode.evaluation_markets.iter().filter_map(|market| {
-            state
-                .markets
-                .get(market)
-                .map(|state| &state.spot_borrow_rate)
-        }));
+            complete_strategy_spread(&episode.evaluation_markets, &projection.markets, objective)
+                .ok_or(PreflightSourceError::FatalAt("scenario_portfolio_market"))?;
+        let before_controllable = complete_strategy_spread(
+            &episode.controllable_markets,
+            &projection.markets,
+            objective,
+        )
+        .ok_or(PreflightSourceError::FatalAt(
+            "scenario_controllable_market",
+        ))?;
+        let after_portfolio =
+            complete_strategy_spread(&episode.evaluation_markets, &state.markets, objective)
+                .ok_or(PreflightSourceError::FatalAt(
+                    "scenario_post_portfolio_market",
+                ))?;
         let after_controllable =
-            rate_spread(episode.controllable_markets.iter().filter_map(|market| {
-                state
-                    .markets
-                    .get(market)
-                    .map(|state| &state.spot_borrow_rate)
-            }));
+            complete_strategy_spread(&episode.controllable_markets, &state.markets, objective)
+                .ok_or(PreflightSourceError::FatalAt(
+                    "scenario_post_controllable_market",
+                ))?;
         let (before, after, minimum_improvement) = match episode.objective_branch {
             RateObjectiveBranch::Portfolio => (
                 before_portfolio,
                 after_portfolio,
-                config
-                    .app
-                    .strategy
-                    .minimum_portfolio_improvement_rate_per_second
-                    .0,
+                config.app.strategy.minimum_improvement(true),
             ),
             RateObjectiveBranch::Controllable => (
                 before_controllable,
                 after_controllable,
-                config
-                    .app
-                    .strategy
-                    .minimum_controllable_improvement_rate_per_second
-                    .0,
+                config.app.strategy.minimum_improvement(false),
             ),
         };
         let maximum_allowed = before
-            .checked_add(
-                config
-                    .app
-                    .strategy
-                    .portfolio_spread_tolerance_rate_per_second
-                    .0,
-            )
+            .checked_add(config.app.strategy.portfolio_spread_tolerance())
             .unwrap_or(U256::MAX);
         if after > maximum_allowed || before.saturating_sub(after) < minimum_improvement {
             return Err(PreflightSourceError::Failed);
@@ -392,4 +480,40 @@ fn validate_scenario(
         return Err(PreflightSourceError::FailedAt("scenario_terminal_guard"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_snapshot_error;
+    use crate::{
+        chain::{
+            multicall::MulticallError,
+            provider::{ProviderError, RpcErrorCategory},
+        },
+        state::snapshot::SnapshotError,
+        transaction::final_preflight::PreflightSourceError,
+    };
+
+    #[test]
+    fn exact_preflight_preserves_outage_class_without_misclassifying_revert() {
+        let outage = classify_snapshot_error(SnapshotError::Multicall(MulticallError::Provider(
+            ProviderError::Transport { method: "eth_call" },
+        )));
+        assert_eq!(
+            outage,
+            PreflightSourceError::ProviderOutageAt("exact_snapshot_provider")
+        );
+
+        let deterministic = classify_snapshot_error(SnapshotError::Multicall(
+            MulticallError::Provider(ProviderError::Rpc {
+                method: "eth_call",
+                code: 3,
+                category: RpcErrorCategory::Unknown,
+            }),
+        ));
+        assert_eq!(
+            deterministic,
+            PreflightSourceError::RetryableAt("exact_snapshot_provider")
+        );
+    }
 }

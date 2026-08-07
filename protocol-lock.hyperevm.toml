@@ -2,7 +2,7 @@ schema_version = 1
 chain_id = 999
 
 [[contract]]
-name = "vault-v2-canary"
+name = "vault-v2"
 kind = "vault_v2"
 address = "0x51254785367d73A10a2Ea7d44B8e97b749BfbE8b"
 runtime_code_hash = "0x65f95156d47bd9fc7eeff3ef189fb705760b672217716ccb810f7d5bbcedc443"
@@ -118,7 +118,8 @@ compiler_version = "0.6.12"
 optimizer_enabled = true
 optimizer_runs = 1000000
 constructor_immutables = {}
-proxy_policy = "pinned_immutable_proxy"
+proxy_policy = "pinned_proxy"
+proxy_implementation = { storage_slot = "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3", address = "0x003F73f58cA78880dA3642c5cb71D7459b3fe4F8", runtime_code_hash = "0x8cfef4ac48d43548c119ca5858411f006f968896d98d7ed43d4ccad2ae9d355e" }
 behavior_profile = "hyper-evm-usdc-runtime-and-decimals"
 
 [[contract]]

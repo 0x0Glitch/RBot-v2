@@ -38,7 +38,7 @@ fn execute_config() -> morpho_v2_reallocator::config::ValidatedConfig {
 fn protocol_lock() -> ValidatedProtocolLock {
     ValidatedProtocolLock {
         schema_version: PROTOCOL_LOCK_SCHEMA_VERSION,
-        chain_id: 999,
+        chain_id: 31_337,
         contracts: Vec::new(),
         remote_signer: RemoteSignerIdentity {
             service_identity: "signer.example.com".to_owned(),
@@ -83,7 +83,7 @@ fn evidence(
     ProductionReleaseEvidence {
         schema_version: 1,
         stage,
-        chain_id: 999,
+        chain_id: config.app.chain.chain_id,
         config_revision: config.revision.to_string(),
         protocol_lock_digest: lock.digest.to_string(),
         build_revision: "a".repeat(40),

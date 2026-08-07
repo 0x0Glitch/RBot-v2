@@ -41,7 +41,7 @@ pub enum CapabilityReason {
     IdleLockUnverified,
     /// Rate episode durability is not verified.
     RateEpisodeUnverified,
-    /// Strict profile liquidity adapter is zero, unsupported, or below its floor.
+    /// Strict profile liquidity adapter is zero, unsupported, or not enabled.
     LiquidityAdapterUnsupported,
     /// Dedicated signer does not currently hold the native allocator role.
     AllocatorRoleMissing,
@@ -90,9 +90,9 @@ pub struct CapabilityInputs<'a> {
     pub enabled_adapters: &'a BTreeSet<AdapterAddress>,
     /// Delayed parent/adapter operations.
     pub pending_admin: &'a [PendingAdminOperation],
-    /// Latest accepted inclusion timestamp plus confirmation/reconciliation allowance.
+    /// Exact canonical block timestamp used to assess executable administrative operations.
     pub administrative_horizon_timestamp: u64,
-    /// Exact expected inclusion timestamp used for reward evidence.
+    /// Exact canonical block timestamp used as the start of reward validity.
     pub expected_inclusion_timestamp: u64,
     /// Whether canonical idle-lock reconstruction is verified.
     pub lock_ledger_verified: bool,
@@ -246,28 +246,30 @@ pub fn classify_capabilities(
         reasons.insert(CapabilityReason::RateEpisodeUnverified);
     }
 
-    let liquidity_adapter_ready = if input.config.require_supported_nonzero_liquidity_adapter {
+    // Current liquidity is a repairable service condition, not a static capability. Requiring the
+    // floor here deadlocks maintenance precisely when a withdrawal takes the adapter below it.
+    // The liquidity planner and final-preflight simulator independently require the post-action
+    // floor and atomic-exit coverage before any transaction can be signed.
+    let liquidity_adapter_supported = if input.config.require_supported_nonzero_liquidity_adapter {
         if let (Some(configured), Some(state)) =
             (&input.config.liquidity_adapter, input.liquidity_adapter)
         {
             state.adapter == configured.address
                 && input.parent.liquidity_adapter == configured.address.0
                 && input.parent.liquidity_data.is_empty()
-                && state.real_assets >= input.config.minimum_liquidity_adapter_assets
                 && input.enabled_adapters.contains(&configured.address)
         } else {
             input.positions.values().any(|position| {
                 position.adapter.0 == input.parent.liquidity_adapter
                     && crate::domain::encode_adapter_data(&position.market_params)
                         == input.parent.liquidity_data
-                    && position.expected_assets >= input.config.minimum_liquidity_adapter_assets
                     && input.enabled_adapters.contains(&position.adapter)
             })
         }
     } else {
         true
     };
-    if !liquidity_adapter_ready {
+    if !liquidity_adapter_supported {
         reasons.insert(CapabilityReason::LiquidityAdapterUnsupported);
     }
     let allocator_ready = input
@@ -286,7 +288,7 @@ pub fn classify_capabilities(
         && !pending_relevant
         && lock_ready
         && input.rate_episode_state_verified
-        && liquidity_adapter_ready
+        && liquidity_adapter_supported
         && allocator_ready;
     let supported_deallocation = gates_are_zero && !hard_accounting_pause && !pending_relevant;
     Ok(CapabilityReport {
@@ -500,6 +502,36 @@ mod tests {
             rate_episode_state_verified: true,
         });
         assert!(matches!(ready, Ok(report) if report.capabilities.can_allocate));
+
+        let mut underfloor_position = position.clone();
+        underfloor_position.expected_assets = vault
+            .minimum_liquidity_adapter_assets
+            .saturating_sub(U256::ONE);
+        let underfloor_positions =
+            BTreeMap::from([(underfloor_position.position_key, underfloor_position)]);
+        let underfloor = classify_capabilities(CapabilityInputs {
+            config: vault,
+            strategy: &config.app.strategy,
+            parent: &parent,
+            adapters: &adapters,
+            liquidity_adapter: None,
+            positions: &underfloor_positions,
+            markets: &markets,
+            caps: &caps,
+            enabled_adapters: &enabled,
+            pending_admin: &[],
+            administrative_horizon_timestamp: 1_900_000_100,
+            expected_inclusion_timestamp: 1_900_000_001,
+            lock_ledger_verified: true,
+            unattributed_idle_assets: U256::ZERO,
+            rate_episode_state_verified: true,
+        });
+        assert!(matches!(
+            underfloor,
+            Ok(report)
+                if report.capabilities.can_allocate
+                    && !report.reasons.contains(&CapabilityReason::LiquidityAdapterUnsupported)
+        ));
 
         position.actual_morpho_supply_shares = U256::from(99_999_999_u64);
         let deficit_positions = BTreeMap::from([(position.position_key, position.clone())]);

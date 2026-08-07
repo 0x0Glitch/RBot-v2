@@ -1,205 +1,221 @@
 {
-  "schema_version": 4,
-  "node": {
-    "instance_id": "felix-v2-reallocator-hyperevm",
-    "mode": "shadow",
-    "data_dir": "/var/lib/morpho-v2-reallocator",
-    "full_reconciliation_interval": "2m",
-    "topology_reconciliation_interval": "15m"
-  },
-  "chain": {
-    "name": "hyperevm",
-    "chain_id": 999,
-    "morpho_blue": "0x0000000000000000000000000000000000000010",
-    "multicall3": "0x0000000000000000000000000000000000000011",
-    "expected_multicall3_code_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-    "event_start_block": 1234567,
-    "maximum_log_range": 50,
-    "reorg_rescan_blocks": 64,
-    "fast_block_gas_limit": 2000000,
-    "slow_block_gas_limit": 30000000,
-    "providers": [
-      {
-        "name": "primary",
-        "roles": [
-          "head",
-          "logs",
-          "read",
-          "simulate",
-          "submit",
-          "receipt"
-        ],
-        "production_grade": true,
-        "supports_websocket": true,
-        "supports_historical_state": false,
-        "http_url_env": "MORPHO_V2_RPC_PRIMARY",
-        "websocket_url_env": "MORPHO_V2_RPC_PRIMARY_WSS"
+  "schema_version": 6,
+  "normal": {
+    "node": {
+      "instance_id": "morpho-v2-reallocator-example",
+      "mode": "shadow",
+      "data_dir": "/var/lib/morpho-v2-reallocator"
+    },
+    "chain": {
+      "name": "example-evm",
+      "chain_id": 31337,
+      "morpho_blue": "0x0000000000000000000000000000000000000010",
+      "multicall3": "0x0000000000000000000000000000000000000011",
+      "expected_multicall3_code_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "event_start_block": 1234567,
+      "providers": [
+        {
+          "name": "primary",
+          "roles": [
+            "head",
+            "logs",
+            "read",
+            "simulate",
+            "submit",
+            "receipt"
+          ],
+          "production_grade": true,
+          "supports_websocket": true,
+          "supports_historical_state": false,
+          "http_url_env": "MORPHO_V2_RPC_PRIMARY",
+          "websocket_url_env": "MORPHO_V2_RPC_PRIMARY_WSS"
+        },
+        {
+          "name": "official-fallback",
+          "roles": [
+            "checkpoint",
+            "read",
+            "receipt"
+          ],
+          "production_grade": false,
+          "supports_websocket": false,
+          "supports_historical_state": false,
+          "http_url_env": "MORPHO_V2_RPC_FALLBACK"
+        }
+      ]
+    },
+    "signing": {
+      "kind": "remote_signer",
+      "endpoint_env": "MORPHO_V2_SIGNER_ENDPOINT"
+    },
+    "alerts": {
+      "telegram": {
+        "enabled": true,
+        "bot_token_env": "MORPHO_TELEGRAM_BOT_TOKEN",
+        "chat_id": "-1000000000000",
+        "message_thread_id": 42
       },
+      "pagerduty": {
+        "enabled": true,
+        "integration_key_env": "MORPHO_PAGERDUTY_KEY"
+      }
+    },
+    "vaults": [
       {
-        "name": "official-fallback",
-        "roles": [
-          "checkpoint",
-          "read",
-          "receipt"
+        "name": "example-usdc-v2",
+        "address": "0x0000000000000000000000000000000000000100",
+        "asset": "0x0000000000000000000000000000000000000001",
+        "asset_decimals": 6,
+        "expected_vault_code_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+        "deployment_block": 2345000,
+        "signer_address": "0x0000000000000000000000000000000000000002",
+        "strict_zero_routine_idle": true,
+        "minimum_action_assets": "1000000",
+        "maximum_rounding_dust_assets": "1000",
+        "maximum_immediate_rebalance_loss_assets": "10000",
+        "maximum_terminal_value_sacrifice_assets": "0",
+        "minimum_active_positions_after_economic_exit": 1,
+        "maximum_movement_per_hour_assets": "2000000000000",
+        "maximum_movement_per_day_assets": "10000000000000",
+        "minimum_independent_event_assets": "1000000",
+        "minimum_atomic_exit_coverage_assets": "100000000",
+        "minimum_liquidity_adapter_assets": "100000000",
+        "minimum_deposit_headroom_assets": "100000000",
+        "deposit_headroom_search_upper_bound_assets": "1000000000000",
+        "minimum_source_token_liquidity_assets": "100000000",
+        "lock_operator_clearance_required": true,
+        "unattributed_idle_fail_closed": true,
+        "require_supported_nonzero_liquidity_adapter": true,
+        "require_zero_gates": true,
+        "required_vault_dead_address": "0x000000000000000000000000000000000000dead",
+        "minimum_market_dead_supply_shares": "1000000000",
+        "approved_allocators": [
+          "0x0000000000000000000000000000000000000002"
         ],
-        "production_grade": false,
-        "supports_websocket": false,
-        "supports_historical_state": false,
-        "http_url_env": "MORPHO_V2_RPC_FALLBACK"
+        "approved_sentinels": [
+          "0x0000000000000000000000000000000000000003"
+        ],
+        "rate_groups": [
+          {
+            "name": "core",
+            "minimum_assets": "0",
+            "target_assets": "1000000000000",
+            "maximum_assets": "2000000000000",
+            "allow_cross_group_movement": false
+          }
+        ],
+        "adapters": [
+          {
+            "address": "0x0000000000000000000000000000000000000020",
+            "kind": "morpho_market_v1_adapter_v2",
+            "expected_code_hash": "0x3333333333333333333333333333333333333333333333333333333333333333",
+            "maximum_markets": 20
+          }
+        ],
+        "positions": [
+          {
+            "adapter": "0x0000000000000000000000000000000000000020",
+            "loan_token": "0x0000000000000000000000000000000000000001",
+            "collateral_token": "0x0000000000000000000000000000000000000030",
+            "oracle": "0x0000000000000000000000000000000000000040",
+            "irm": "0x0000000000000000000000000000000000000050",
+            "lltv": "860000000000000000",
+            "market_id": "0x2c828b94209517da283816b1d3b4ba7023ab490ec725568d0d042877f6169ffe",
+            "mode": "active",
+            "rate_group": "core",
+            "minimum_position_assets": "0",
+            "maximum_position_assets": "1000000000000",
+            "minimum_source_liquidity_assets": "100000000",
+            "maximum_source_utilization_wad": "950000000000000000",
+            "minimum_relevance_entry_assets": "2000000",
+            "minimum_relevance_exit_assets": "1000000",
+            "minimum_rate_relevant_market_supply_assets": "100000000",
+            "minimum_rate_relevant_market_borrow_assets": "100000000",
+            "minimum_destination_market_supply_assets": "100000000",
+            "minimum_destination_market_supply_shares": "1000000000",
+            "maximum_action_assets": "1000000000000",
+            "allow_active_complete_exit": false,
+            "complete_exit_dust_threshold_assets": "1000",
+            "reward_policy": {
+              "mode": "no_material_rewards",
+              "checked_at_block": 2345678,
+              "valid_until_timestamp": 4102444800,
+              "evidence_hash": "0x4444444444444444444444444444444444444444444444444444444444444444"
+            }
+          }
+        ]
       }
     ]
   },
-  "snapshot": {
-    "mode": "atomic_latest",
-    "strict_signing_context": true,
-    "maximum_background_snapshot_age_blocks": 2,
-    "maximum_signing_snapshot_age_blocks": 0,
-    "maximum_snapshot_retries": 5,
-    "maximum_snapshot_to_sign_latency": "750ms",
-    "maximum_sign_to_broadcast_latency": "100ms"
-  },
-  "execution": {
-    "expected_inclusion_fast_blocks": 2,
-    "maximum_inclusion_fast_blocks": 24,
-    "maximum_rate_rebalance_pending_fast_blocks": 24,
-    "maximum_capital_deployment_pending_fast_blocks": 24,
-    "maximum_liquidity_maintenance_pending_fast_blocks": 24,
-    "identical_rebroadcast_after_fast_blocks": 6,
-    "replacement_after_fast_blocks": 12,
-    "cancel_when_fast_blocks_remaining": 4,
-    "receipt_confirmation_evm_blocks": 2,
-    "maximum_actions": 8,
-    "maximum_signed_transaction_gas": 1800000,
-    "gas_headroom_bps": 1500,
-    "maximum_fee_per_gas_wei": "100000000000",
-    "maximum_daily_gas_spend_wei": "500000000000000000"
-  },
-  "solver": {
-    "maximum_nodes": 200000,
-    "maximum_amount_candidates_per_position": 32,
-    "maximum_source_sets": 1024,
-    "maximum_destination_sets": 1024,
-    "allow_incomplete_rate_solver": false
-  },
-  "strategy": {
-    "objective": "spot_borrow_rate_spread",
-    "entry_spread_apr_bps": 30,
-    "target_spread_apr_bps": 5,
-    "target_tolerance_apr_bps": 1,
-    "minimum_portfolio_improvement_apr_bps": 3,
-    "minimum_controllable_improvement_apr_bps": 3,
-    "portfolio_spread_tolerance_apr_bps": 0,
-    "confirmation_fast_blocks": 2,
-    "immediate_tranche_bps": 5000,
-    "persistent_confirmation_duration": "30s",
-    "minimum_independent_rate_events": 3,
-    "minimum_independent_event_span": "10s",
-    "minimum_independent_event_rate_impact_apr_bps": 1,
-    "maximum_rate_episode_duration": "10m",
-    "extreme_spread_bypass_enabled": false,
-    "benefit_horizon": "6h",
-    "maximum_daily_transactions": 24
-  },
-  "signing": {
-    "kind": "remote_signer",
-    "endpoint_env": "MORPHO_V2_SIGNER_ENDPOINT"
-  },
-  "alerts": {
-    "telegram": {
-      "enabled": true,
-      "bot_token_env": "MORPHO_TELEGRAM_BOT_TOKEN",
-      "chat_id": "-1000000000000",
-      "message_thread_id": 42
+  "advanced": {
+    "node": {
+      "full_reconciliation_interval": "2m",
+      "topology_reconciliation_interval": "15m"
     },
-    "pagerduty": {
-      "enabled": true,
-      "integration_key_env": "MORPHO_PAGERDUTY_KEY"
+    "chain": {
+      "maximum_log_range": 1000,
+      "reorg_rescan_blocks": 64,
+      "block_opportunity_policy": {
+        "kind": "every_canonical_block"
+      }
+    },
+    "snapshot": {
+      "mode": "atomic_latest",
+      "strict_signing_context": true,
+      "maximum_background_snapshot_age_blocks": 2,
+      "maximum_signing_snapshot_age_blocks": 0,
+      "maximum_snapshot_retries": 5,
+      "maximum_evm_timestamp_lag_seconds": 0,
+      "maximum_snapshot_to_sign_latency": "750ms",
+      "maximum_sign_to_broadcast_latency": "5s"
+    },
+    "execution": {
+      "expected_inclusion_opportunities": 2,
+      "maximum_inclusion_opportunities": 24,
+      "maximum_rate_rebalance_pending_opportunities": 24,
+      "maximum_capital_deployment_pending_opportunities": 24,
+      "maximum_liquidity_maintenance_pending_opportunities": 24,
+      "identical_rebroadcast_after_opportunities": 6,
+      "replacement_after_opportunities": 12,
+      "cancel_when_opportunities_remaining": 4,
+      "receipt_confirmation_evm_blocks": 2,
+      "maximum_actions": 8,
+      "maximum_signed_transaction_gas": 1800000,
+      "gas_headroom_bps": 1500,
+      "maximum_fee_per_gas_wei": "100000000000",
+      "maximum_daily_gas_spend_wei": "500000000000000000"
+    },
+    "solver": {
+      "maximum_nodes": 200000,
+      "maximum_amount_candidates_per_position": 32,
+      "maximum_source_sets": 1024,
+      "maximum_destination_sets": 1024,
+      "allow_incomplete_rate_solver": false
+    },
+    "strategy": {
+      "objective": "spot_borrow_rate_spread",
+      "entry_spread_apr_bps": 10,
+      "target_spread_apr_bps": 5,
+      "target_tolerance_apr_bps": 0,
+      "utilization_entry_spread_bps": 25,
+      "utilization_target_spread_bps": 10,
+      "utilization_target_tolerance_bps": 0,
+      "utilization_minimum_improvement_bps": 1,
+      "utilization_portfolio_spread_tolerance_bps": 0,
+      "minimum_portfolio_improvement_apr_bps": 3,
+      "minimum_controllable_improvement_apr_bps": 3,
+      "portfolio_spread_tolerance_apr_bps": 0,
+      "confirmation_opportunities": 2,
+      "immediate_tranche_bps": 9000,
+      "persistent_confirmation_duration": "30s",
+      "minimum_independent_rate_events": 3,
+      "minimum_independent_event_span": "10s",
+      "minimum_independent_event_rate_impact_apr_bps": 1,
+      "minimum_independent_event_utilization_impact_bps": 1,
+      "maximum_rate_episode_duration": "10m",
+      "extreme_spread_bypass_enabled": false,
+      "benefit_horizon": "6h",
+      "maximum_daily_transactions": 24
     }
-  },
-  "vaults": [
-    {
-      "name": "felix-usdc-v2",
-      "address": "0x0000000000000000000000000000000000000100",
-      "asset": "0x0000000000000000000000000000000000000001",
-      "asset_decimals": 6,
-      "expected_vault_code_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
-      "deployment_block": 2345000,
-      "signer_address": "0x0000000000000000000000000000000000000002",
-      "strict_zero_routine_idle": true,
-      "minimum_action_assets": "1000000",
-      "maximum_rounding_dust_assets": "1000",
-      "maximum_immediate_rebalance_loss_assets": "10000",
-      "maximum_terminal_value_sacrifice_assets": "0",
-      "minimum_active_positions_after_economic_exit": 1,
-      "maximum_movement_per_hour_assets": "2000000000000",
-      "maximum_movement_per_day_assets": "10000000000000",
-      "minimum_independent_event_assets": "1000000",
-      "minimum_atomic_exit_coverage_assets": "100000000",
-      "minimum_liquidity_adapter_assets": "100000000",
-      "minimum_deposit_headroom_assets": "100000000",
-      "deposit_headroom_search_upper_bound_assets": "1000000000000",
-      "minimum_source_token_liquidity_assets": "100000000",
-      "lock_operator_clearance_required": true,
-      "unattributed_idle_fail_closed": true,
-      "require_supported_nonzero_liquidity_adapter": true,
-      "require_zero_gates": true,
-      "required_vault_dead_address": "0x000000000000000000000000000000000000dead",
-      "minimum_market_dead_supply_shares": "1000000000",
-      "approved_allocators": [
-        "0x0000000000000000000000000000000000000002"
-      ],
-      "approved_sentinels": [
-        "0x0000000000000000000000000000000000000003"
-      ],
-      "rate_groups": [
-        {
-          "name": "core",
-          "minimum_assets": "0",
-          "target_assets": "1000000000000",
-          "maximum_assets": "2000000000000",
-          "allow_cross_group_movement": false
-        }
-      ],
-      "adapters": [
-        {
-          "address": "0x0000000000000000000000000000000000000020",
-          "kind": "morpho_market_v1_adapter_v2",
-          "expected_code_hash": "0x3333333333333333333333333333333333333333333333333333333333333333",
-          "maximum_markets": 20
-        }
-      ],
-      "positions": [
-        {
-          "adapter": "0x0000000000000000000000000000000000000020",
-          "loan_token": "0x0000000000000000000000000000000000000001",
-          "collateral_token": "0x0000000000000000000000000000000000000030",
-          "oracle": "0x0000000000000000000000000000000000000040",
-          "irm": "0x0000000000000000000000000000000000000050",
-          "lltv": "860000000000000000",
-          "market_id": "0x2c828b94209517da283816b1d3b4ba7023ab490ec725568d0d042877f6169ffe",
-          "mode": "active",
-          "rate_group": "core",
-          "minimum_position_assets": "0",
-          "maximum_position_assets": "1000000000000",
-          "minimum_source_liquidity_assets": "100000000",
-          "maximum_source_utilization_wad": "950000000000000000",
-          "minimum_relevance_entry_assets": "2000000",
-          "minimum_relevance_exit_assets": "1000000",
-          "minimum_rate_relevant_market_supply_assets": "100000000",
-          "minimum_rate_relevant_market_borrow_assets": "100000000",
-          "minimum_destination_market_supply_assets": "100000000",
-          "minimum_destination_market_supply_shares": "1000000000",
-          "maximum_action_assets": "1000000000000",
-          "allow_active_complete_exit": false,
-          "complete_exit_dust_threshold_assets": "1000",
-          "reward_policy": {
-            "mode": "no_material_rewards",
-            "checked_at_block": 2345678,
-            "valid_until_timestamp": 4102444800,
-            "evidence_hash": "0x4444444444444444444444444444444444444444444444444444444444444444"
-          }
-        }
-      ]
-    }
-  ]
+  }
 }

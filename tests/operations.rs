@@ -3,16 +3,20 @@
 
 use std::{sync::Arc, time::Duration};
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, Bytes, U256};
 use morpho_v2_reallocator::{
     api::{ApiDataStore, ReadOnlyApiState, router},
     config::RuntimeMode,
-    domain::VaultAddress,
+    domain::{TransactionId, VaultAddress},
     runtime::{
         controller::{ControllerError, RuntimeRegistry, RuntimeVaultState},
         readiness::{ReadinessInputs, evaluate_readiness},
         shutdown::ShutdownSignal,
         supervisor::{ServiceFailure, Supervisor, SupervisorError},
+    },
+    storage::{
+        actor::StorageService,
+        models::{NonceReservation, SignedTransactionRecord, TransactionState},
     },
     telemetry::{
         alerts::{Alert, AlertDispatcher, AlertKind, AlertSeverity, AlertTransport},
@@ -23,6 +27,7 @@ use morpho_v2_reallocator::{
     },
 };
 use secrecy::SecretString;
+use tempfile::TempDir;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_string_contains, method, path},
@@ -176,6 +181,66 @@ async fn read_only_http_serves_health_metrics_and_rejects_posts()
     );
     shutdown.cancel();
     server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_transaction_cache_hydrates_from_durable_json()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("state.json"), 8, 1_900_000_000)?;
+    let storage = service.handle();
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    let signer = Address::with_last_byte(0x22);
+    let transaction_id = TransactionId(B256::repeat_byte(0x33));
+    let calldata = Bytes::from_static(&[0x12, 0x34]);
+    storage
+        .reserve_nonce(NonceReservation {
+            transaction_id,
+            plan_id: None,
+            vault,
+            signer,
+            nonce: 4,
+            calldata_hash: alloy::primitives::keccak256(&calldata),
+            calldata,
+            max_fee_per_gas: U256::from(100_u64),
+            max_priority_fee_per_gas: U256::from(2_u64),
+            gas_limit: 500_000,
+            movement_assets: U256::from(1_000_u64),
+            created_block: 10,
+            created_at: 1_900_000_000,
+        })
+        .await?;
+    let raw = Bytes::from_static(&[0x02, 0x44, 0x55]);
+    let transaction_hash = alloy::primitives::keccak256(&raw);
+    storage
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id,
+            transaction_hash,
+            raw_signed_transaction: raw,
+            updated_at: 1_900_000_001,
+        })
+        .await?;
+
+    let runtime = RuntimeRegistry::default();
+    runtime.initialize([vault]).await;
+    runtime
+        .update(vault, |status| {
+            status.transition(RuntimeVaultState::CatchingUp, None)
+        })
+        .await?;
+    let data = ApiDataStore::default();
+    data.refresh_transactions(&storage, &runtime).await?;
+    assert_eq!(
+        data.transactions().await,
+        vec![morpho_v2_reallocator::api::dto::TransactionView {
+            transaction_hash,
+            state: TransactionState::Signed,
+            included_block: None,
+            revision: 1,
+        }]
+    );
+    service.shutdown().await?;
     Ok(())
 }
 

@@ -448,7 +448,17 @@ fn wrong_envelope_status_event_and_transfer_fail_closed() {
     );
 
     let mut wrong_shares = fixture();
-    wrong_shares.action.changed_shares = U256::from(98_u64);
+    wrong_shares.receipt.logs[3] = event_log(
+        IMorphoMarketV1AdapterV2::Allocate {
+            marketId: wrong_shares.action.market.0,
+            newAllocation: wrong_shares.action.expected_assets_after,
+            mintedShares: U256::from(98_u64),
+        },
+        wrong_shares.action.adapter.0,
+        wrong_shares.receipt.transaction_hash,
+        wrong_shares.receipt.block_hash,
+        3,
+    );
     assert_eq!(
         validate_receipt_conformance(
             &wrong_shares.expectation(),
@@ -467,6 +477,40 @@ fn wrong_envelope_status_event_and_transfer_fail_closed() {
             &missing_transfer.receipt,
         ),
         Err(ConformanceError::Transfer)
+    );
+}
+
+#[test]
+fn inclusion_time_share_rounding_is_accepted_when_official_events_agree() {
+    let mut fixture = fixture();
+    let actual_shares = U256::from(98_u64);
+    fixture.receipt.logs[1] = event_log(
+        IMorpho::Supply {
+            id: fixture.action.market.0,
+            caller: fixture.action.adapter.0,
+            onBehalf: fixture.action.adapter.0,
+            assets: fixture.action.requested_assets,
+            shares: actual_shares,
+        },
+        fixture.morpho,
+        fixture.receipt.transaction_hash,
+        fixture.receipt.block_hash,
+        1,
+    );
+    fixture.receipt.logs[3] = event_log(
+        IMorphoMarketV1AdapterV2::Allocate {
+            marketId: fixture.action.market.0,
+            newAllocation: fixture.action.expected_assets_after,
+            mintedShares: actual_shares,
+        },
+        fixture.action.adapter.0,
+        fixture.receipt.transaction_hash,
+        fixture.receipt.block_hash,
+        3,
+    );
+    assert!(
+        validate_receipt_conformance(&fixture.expectation(), &fixture.observed, &fixture.receipt)
+            .is_ok()
     );
 }
 

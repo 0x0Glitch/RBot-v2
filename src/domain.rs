@@ -131,6 +131,8 @@ pub struct StateContext {
     pub chain_id: u64,
     /// Canonical block.
     pub block: BlockRef,
+    /// Timestamp observed by Solidity inside the authoritative aggregate.
+    pub evm_timestamp: u64,
     /// Strength of the read binding.
     pub block_hash_binding: BlockHashBinding,
     /// Hash of static validated configuration.
@@ -744,6 +746,9 @@ pub struct ExactVaultSnapshot {
     /// Direct adapters.
     #[serde(with = "crate::serde_helpers::btree_map")]
     pub adapters: BTreeMap<AdapterAddress, DirectAdapterState>,
+    /// Exact current parent adapter set read from the vault array and `isAdapter` getters.
+    #[serde(default)]
+    pub enabled_adapters: BTreeSet<AdapterAddress>,
     /// Supported liquidity-only adapter, when configured.
     pub liquidity_adapter: Option<VaultV1LiquidityAdapterState>,
     /// Direct positions.
@@ -866,7 +871,7 @@ pub enum V2Action {
     },
 }
 
-/// Applicable rate-spread objective branch.
+/// Applicable spread-objective branch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -890,7 +895,7 @@ pub struct SolverCertificate {
     pub search_complete_for_lattice: bool,
     /// Frozen rate episode, when applicable.
     pub rate_episode_id: Option<B256>,
-    /// Rate objective branch, when applicable.
+    /// Spread objective branch, when applicable.
     pub objective_branch: Option<RateObjectiveBranch>,
     /// Whether any candidate could reach the target band.
     pub target_reachable: bool,
@@ -903,9 +908,9 @@ pub struct SolverCertificate {
 pub struct PlanProjection {
     /// Total requested movement in vault-asset units.
     pub movement_assets: U256,
-    /// Pre-action applicable rate spread in per-second WAD units.
+    /// Pre-action spread in the selected objective's native WAD domain.
     pub before_spread: U256,
-    /// Post-action applicable rate spread in per-second WAD units.
+    /// Post-action spread in the selected objective's native WAD domain.
     pub after_spread: U256,
     /// Immediate action-local loss in vault-asset units.
     pub immediate_loss_assets: U256,

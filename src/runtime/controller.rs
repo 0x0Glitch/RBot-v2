@@ -86,6 +86,8 @@ impl RuntimeVaultState {
                     | Self::LockAccountingUncertain
                     | Self::PausedUnsupportedConfiguration
                     | Self::PausedSignerFailure
+                    | Self::PausedTransactionFailure
+                    | Self::PausedReconciliationFailure
             ),
             Self::Observe | Self::Shadow => matches!(
                 next,
@@ -113,10 +115,13 @@ impl RuntimeVaultState {
             Self::PendingTransaction => matches!(
                 next,
                 Self::Automatic
+                    | Self::CatchingUp
                     | Self::PendingDeployment
                     | Self::IdleLocksActive
+                    | Self::LockAccountingUncertain
                     | Self::PausedTransactionFailure
                     | Self::PausedReconciliationFailure
+                    | Self::PausedUnsupportedConfiguration
                     | Self::PausedSignerFailure
                     | Self::Recovery
             ),
@@ -125,6 +130,7 @@ impl RuntimeVaultState {
                 Self::Observe
                     | Self::Shadow
                     | Self::Automatic
+                    | Self::CatchingUp
                     | Self::PendingTransaction
                     | Self::PendingDeployment
                     | Self::IdleLocksActive
@@ -173,7 +179,7 @@ pub struct VaultRuntimeStatus {
     pub episode_id: Option<EpisodeId>,
     /// Current unresolved lifecycle identity.
     pub transaction_id: Option<TransactionId>,
-    /// Current exact rate spread.
+    /// Current exact spread in the configured objective's WAD domain.
     pub current_rate_spread: Option<U256>,
     /// Stable, secret-free reason for a pause or degradation.
     pub reason: Option<String>,
@@ -217,6 +223,12 @@ impl VaultRuntimeStatus {
         reason: Option<String>,
     ) -> Result<(), ControllerError> {
         if !self.state.permits(next) {
+            tracing::error!(
+                vault = %self.vault.0,
+                from = ?self.state,
+                to = ?next,
+                "rejected vault runtime transition"
+            );
             return Err(ControllerError::InvalidTransition);
         }
         self.state = next;
@@ -325,5 +337,33 @@ mod tests {
                 .transition(RuntimeVaultState::LockAccountingUncertain, None)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn provider_catch_up_can_overlay_every_operational_pending_state() {
+        let vault = VaultAddress(Address::with_last_byte(2));
+        for pending in [
+            RuntimeVaultState::PendingTransaction,
+            RuntimeVaultState::PendingDeployment,
+            RuntimeVaultState::IdleLocksActive,
+        ] {
+            let mut status = VaultRuntimeStatus::starting(vault);
+            assert!(
+                status
+                    .transition(RuntimeVaultState::CatchingUp, None)
+                    .is_ok()
+            );
+            assert!(status.transition(pending, None).is_ok());
+            assert!(
+                status
+                    .transition(RuntimeVaultState::CatchingUp, None)
+                    .is_ok()
+            );
+            assert!(
+                status
+                    .transition(RuntimeVaultState::PendingTransaction, None)
+                    .is_ok()
+            );
+        }
     }
 }

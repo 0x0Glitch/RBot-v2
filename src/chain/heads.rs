@@ -1,7 +1,10 @@
 //! Durable canonical head polling, catch-up, checkpointing, and replay.
 
 use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use alloy::primitives::{Address, B256};
 use futures::{StreamExt, stream};
@@ -13,14 +16,19 @@ use crate::storage::actor::StorageHandle;
 use crate::storage::models::{CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord};
 
 use super::ChainError;
-use super::provider::{ChainDataProvider, ProviderError, ProviderRole};
-use super::receipts::{validate_receipt, validate_receipts, validate_standalone_log, watched_logs};
+use super::provider::{ChainDataProvider, ProviderError, ProviderRole, RpcLog, parse_quantity};
+use super::receipts::{validate_receipt, validate_standalone_log, watched_logs};
 use super::reorg::find_common_ancestor;
 
-const MAX_OFFICIAL_LOG_RANGE: u64 = 50;
 const ADDRESS_GROUP_SIZE: usize = 64;
 const MAX_CATCH_UP_CONCURRENCY: usize = 8;
 const MAX_PUBLISHED_CATCH_UP_BLOCKS: u64 = 8;
+
+/// Fail-closed predicate for retaining only execution-relevant canonical logs.
+pub trait CanonicalLogFilter: Send + Sync {
+    /// Returns whether a strictly attributable log must enter durable replay state.
+    fn retain(&self, log: &CanonicalLogRecord) -> Result<bool, ChainError>;
+}
 
 /// Canonical chain-service settings after fail-closed validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,14 +43,19 @@ pub struct ChainServiceConfig {
     pub reorg_rescan_blocks: u64,
     /// Exact watched address set.
     pub watched_addresses: BTreeSet<Address>,
+    /// Scan relevant logs and retain only a bounded recent header window during large catch-up.
+    ///
+    /// This is used by latest-state chains where events invalidate planning state but historical
+    /// state calls are neither required nor assumed to be available.
+    pub latest_only: bool,
 }
 
 impl ChainServiceConfig {
-    /// Enforces hard HyperEVM request and rewind bounds.
+    /// Enforces positive request and rewind bounds.
     pub fn validate(self) -> Result<Self, ChainError> {
-        if self.maximum_log_range == 0 || self.maximum_log_range > MAX_OFFICIAL_LOG_RANGE {
+        if self.maximum_log_range == 0 {
             return Err(ChainError::InvalidConfiguration(
-                "maximum_log_range must be in 1..=50",
+                "maximum_log_range must be positive",
             ));
         }
         if self.reorg_rescan_blocks == 0 {
@@ -61,6 +74,8 @@ pub struct ChainService<P> {
     storage: StorageHandle,
     updates: mpsc::Sender<ChainUpdate>,
     config: ChainServiceConfig,
+    log_filter: Option<Arc<dyn CanonicalLogFilter>>,
+    provider_ready: Option<Arc<AtomicBool>>,
 }
 
 impl<P: ChainDataProvider> ChainService<P> {
@@ -101,7 +116,23 @@ impl<P: ChainDataProvider> ChainService<P> {
             storage,
             updates,
             config,
+            log_filter: None,
+            provider_ready: None,
         })
+    }
+
+    /// Installs a strict deployment-aware log filter before any canonical data is persisted.
+    #[must_use]
+    pub fn with_log_filter(mut self, filter: Arc<dyn CanonicalLogFilter>) -> Self {
+        self.log_filter = Some(filter);
+        self
+    }
+
+    /// Shares the independent-provider trust gate directly with the execution owner.
+    #[must_use]
+    pub fn with_provider_readiness(mut self, ready: Arc<AtomicBool>) -> Self {
+        self.provider_ready = Some(ready);
+        self
     }
 
     /// Verifies primary/checkpoint chain identity before catch-up is trusted.
@@ -138,16 +169,27 @@ impl<P: ChainDataProvider> ChainService<P> {
                     .number
                     .saturating_sub(self.config.event_start_block)
                     .saturating_add(1);
-                self.catch_up_from(
-                    self.config.event_start_block,
-                    latest,
-                    span <= MAX_PUBLISHED_CATCH_UP_BLOCKS,
-                )
-                .await?
+                if self.config.latest_only && span > MAX_PUBLISHED_CATCH_UP_BLOCKS {
+                    self.catch_up_latest_only(self.config.event_start_block, latest)
+                        .await?;
+                } else {
+                    self.catch_up_from(
+                        self.config.event_start_block,
+                        latest,
+                        span <= MAX_PUBLISHED_CATCH_UP_BLOCKS,
+                    )
+                    .await?;
+                }
             }
             Some(old_head) => {
                 let same_height = latest.number == old_head.number;
-                let cursor_still_canonical = if latest.number >= old_head.number {
+                let direct_extension = latest.number == old_head.number.saturating_add(1);
+                let cursor_still_canonical = if direct_extension {
+                    // The already-fetched next header proves the stored cursor's hash directly.
+                    // Avoid re-reading the previous height on the steady-state fast-block path;
+                    // a mismatching parent enters the same bounded rewind logic below.
+                    latest.parent_hash == old_head.hash
+                } else if latest.number >= old_head.number {
                     self.primary.header_by_number(old_head.number).await?.hash == old_head.hash
                 } else {
                     false
@@ -157,13 +199,152 @@ impl<P: ChainDataProvider> ChainService<P> {
                 } else if latest.number > old_head.number {
                     let start = old_head.number.saturating_add(1);
                     let span = latest.number.saturating_sub(start).saturating_add(1);
-                    self.catch_up_from(start, latest, span <= MAX_PUBLISHED_CATCH_UP_BLOCKS)
-                        .await?;
+                    if self.config.latest_only && span > MAX_PUBLISHED_CATCH_UP_BLOCKS {
+                        self.catch_up_latest_only(start, latest).await?;
+                    } else {
+                        self.catch_up_from(start, latest, span <= MAX_PUBLISHED_CATCH_UP_BLOCKS)
+                            .await?;
+                    }
                 }
             }
         }
         self.send_update(ChainUpdate::CanonicalHead(latest)).await?;
         Ok(latest)
+    }
+
+    /// Reconstructs all event-derived invalidation state without reading every skipped header.
+    /// Exact current calls remain authoritative after the final canonical head is published.
+    async fn catch_up_latest_only(&self, start: u64, latest: BlockRef) -> Result<(), ChainError> {
+        if start > latest.number {
+            return Ok(());
+        }
+        let addresses = self
+            .config
+            .watched_addresses
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut queries = Vec::new();
+        let mut from = start;
+        while from <= latest.number {
+            let to = from
+                .saturating_add(self.config.maximum_log_range.saturating_sub(1))
+                .min(latest.number);
+            for group in addresses.chunks(ADDRESS_GROUP_SIZE) {
+                queries.push((from, to, group.to_vec()));
+            }
+            from = to.saturating_add(1);
+        }
+
+        let results = stream::iter(queries)
+            .map(|(from, to, addresses)| async move {
+                let logs = self.primary.logs(from, to, &addresses).await?;
+                Ok::<_, ChainError>((from, to, logs))
+            })
+            .buffered(MAX_CATCH_UP_CONCURRENCY);
+        futures::pin_mut!(results);
+        let mut relevant_blocks = BTreeSet::new();
+        while let Some(result) = results.next().await {
+            let (from, to, logs) = result?;
+            for log in logs {
+                if let Some(number) = self.retained_log_hint(from, to, &log)? {
+                    relevant_blocks.insert(number);
+                }
+            }
+        }
+
+        // Retaining the complete bounded rewind window keeps common-ancestor discovery sound
+        // after the sparse catch-up has completed. Every relevant block outside this window is
+        // also retained, so no watched event is omitted from durable topology replay.
+        let recent_start = latest
+            .number
+            .saturating_sub(self.config.reorg_rescan_blocks)
+            .saturating_add(1)
+            .max(start);
+        relevant_blocks.extend(recent_start..=latest.number);
+
+        let bundles = stream::iter(relevant_blocks)
+            .map(|number| async move {
+                let block = if number == latest.number {
+                    latest
+                } else {
+                    self.primary.header_by_number(number).await?
+                };
+                let (receipts, logs) = self.fallback_bundle(block).await?;
+                Ok::<_, ChainError>((block, receipts, logs))
+            })
+            .buffered(MAX_CATCH_UP_CONCURRENCY);
+        futures::pin_mut!(bundles);
+        let mut previous_recent: Option<BlockRef> = None;
+        while let Some(bundle) = bundles.next().await {
+            let (block, receipts, logs) = bundle?;
+            if block.number >= recent_start {
+                if let Some(previous) = previous_recent
+                    && (block.number != previous.number.saturating_add(1)
+                        || block.parent_hash != previous.hash)
+                {
+                    return Err(ChainError::InvalidBundle(
+                        "canonical head changed during latest-only catch-up",
+                    ));
+                }
+                previous_recent = Some(block);
+            }
+            self.persist_bundle(block, &receipts, logs).await?;
+        }
+
+        // A newer head may exist now, but the exact head selected at the start must still be
+        // canonical. The next bounded poll will advance from it normally.
+        if self.primary.header_by_number(latest.number).await?.hash != latest.hash {
+            return Err(ChainError::InvalidBundle(
+                "selected latest head was reorganized during catch-up",
+            ));
+        }
+        Ok(())
+    }
+
+    fn retained_log_hint(
+        &self,
+        from: u64,
+        to: u64,
+        log: &RpcLog,
+    ) -> Result<Option<u64>, ChainError> {
+        if log.removed {
+            return Err(ChainError::InvalidBundle(
+                "latest-only range query returned a removed log",
+            ));
+        }
+        if !self.config.watched_addresses.contains(&log.address) {
+            return Err(ChainError::InvalidBundle(
+                "latest-only range query returned an unwatched address",
+            ));
+        }
+        let number = parse_quantity(
+            "log.block_number",
+            log.block_number
+                .as_deref()
+                .ok_or(ChainError::InvalidBundle("log has no block number"))?,
+        )?;
+        let hash = log.block_hash.ok_or(ChainError::InvalidBundle(
+            "latest-only range log has no block hash",
+        ))?;
+        if !(from..=to).contains(&number) {
+            return Err(ChainError::InvalidBundle(
+                "latest-only range log is outside its requested canonical range",
+            ));
+        }
+        // Decode and apply the deployment-aware event filter before fetching a header. This is
+        // especially important for shared assets such as USDC, whose unrelated transfers may
+        // appear in nearly every block. Exact attribution is repeated against the real header
+        // and complete transaction receipt before durable persistence.
+        let hint_block = BlockRef {
+            number,
+            hash,
+            parent_hash: B256::ZERO,
+            timestamp: 0,
+            gas_limit: 0,
+        };
+        let converted = validate_standalone_log(self.config.chain_id, hint_block, log.clone())?;
+        Ok(self.retain_log(&converted)?.then_some(number))
     }
 
     /// Treats a WebSocket head as a latency hint; HTTP polling remains authoritative.
@@ -194,14 +375,11 @@ impl<P: ChainDataProvider> ChainService<P> {
                 } else {
                     self.primary.header_by_number(number).await?
                 };
-                let (receipts, logs) = if !publish_blocks {
-                    // Historical replay needs receipts only for transactions that
-                    // emitted watched logs. Fetching every unrelated receipt is
-                    // expensive and provides no additional canonical state.
-                    self.fallback_bundle(block).await?
-                } else {
-                    self.block_bundle(block).await?
-                };
+                // Query only watched addresses, then fetch and validate the complete receipt
+                // for every returned transaction. Full block-receipt responses can take longer
+                // than the block interval on busy chains even when there are no relevant logs,
+                // which would make same-head execution permanently unreachable.
+                let (receipts, logs) = self.fallback_bundle(block).await?;
                 Ok::<_, ChainError>((block, receipts, logs))
             })
             .buffered(MAX_CATCH_UP_CONCURRENCY);
@@ -216,29 +394,7 @@ impl<P: ChainDataProvider> ChainService<P> {
                     "canonical head changed during bounded catch-up",
                 ));
             }
-            self.storage
-                .apply_canonical_block_with_receipts(
-                    CanonicalBlockRecord {
-                        chain_id: self.config.chain_id,
-                        block,
-                    },
-                    logs.clone(),
-                    receipts
-                        .iter()
-                        .map(|receipt| CanonicalReceiptRecord {
-                            chain_id: self.config.chain_id,
-                            transaction_hash: receipt.transaction_hash,
-                            block_number: receipt.block_number,
-                            block_hash: receipt.block_hash,
-                            transaction_index: receipt.transaction_index,
-                            status: receipt.status,
-                            gas_used: receipt.gas_used,
-                            logs: receipt.logs.clone(),
-                        })
-                        .collect(),
-                    block.timestamp,
-                )
-                .await?;
+            self.persist_bundle(block, &receipts, logs.clone()).await?;
             if publish_blocks {
                 self.send_update(ChainUpdate::CanonicalBlock {
                     block,
@@ -246,9 +402,46 @@ impl<P: ChainDataProvider> ChainService<P> {
                     logs,
                 })
                 .await?;
+                // Publish an intermediate canonical head immediately after its durable block.
+                // The exact-state owner may be holding a latest-only snapshot reported at this
+                // height; giving it this checkpoint lets it verify replay through that exact
+                // block before later catch-up blocks are applied.
+                self.send_update(ChainUpdate::CanonicalHead(block)).await?;
             }
             previous = Some(block);
         }
+        Ok(())
+    }
+
+    async fn persist_bundle(
+        &self,
+        block: BlockRef,
+        receipts: &[ReceiptRecord],
+        logs: Vec<CanonicalLogRecord>,
+    ) -> Result<(), ChainError> {
+        self.storage
+            .apply_canonical_block_with_receipts(
+                CanonicalBlockRecord {
+                    chain_id: self.config.chain_id,
+                    block,
+                },
+                logs,
+                receipts
+                    .iter()
+                    .map(|receipt| CanonicalReceiptRecord {
+                        chain_id: self.config.chain_id,
+                        transaction_hash: receipt.transaction_hash,
+                        block_number: receipt.block_number,
+                        block_hash: receipt.block_hash,
+                        transaction_index: receipt.transaction_index,
+                        status: receipt.status,
+                        gas_used: receipt.gas_used,
+                        logs: receipt.logs.clone(),
+                    })
+                    .collect(),
+                block.timestamp,
+            )
+            .await?;
         Ok(())
     }
 
@@ -279,29 +472,6 @@ impl<P: ChainDataProvider> ChainService<P> {
             .await
     }
 
-    async fn block_bundle(
-        &self,
-        block: BlockRef,
-    ) -> Result<(Vec<ReceiptRecord>, Vec<CanonicalLogRecord>), ChainError> {
-        match self.primary.block_receipts(block.number).await {
-            Ok(receipts) => {
-                let receipts = validate_receipts(self.config.chain_id, block, receipts)?;
-                let logs = watched_logs(&receipts, &self.config.watched_addresses);
-                let watched_transactions = logs
-                    .iter()
-                    .map(|log| log.transaction_hash)
-                    .collect::<BTreeSet<_>>();
-                let receipts = receipts
-                    .into_iter()
-                    .filter(|receipt| watched_transactions.contains(&receipt.transaction_hash))
-                    .collect();
-                Ok((receipts, logs))
-            }
-            Err(ProviderError::MethodUnsupported { .. }) => self.fallback_bundle(block).await,
-            Err(error) => Err(error.into()),
-        }
-    }
-
     async fn fallback_bundle(
         &self,
         block: BlockRef,
@@ -321,7 +491,9 @@ impl<P: ChainDataProvider> ChainService<P> {
                         "fallback provider returned an unwatched address",
                     ));
                 }
-                queried_logs.push(converted);
+                if self.retain_log(&converted)? {
+                    queried_logs.push(converted);
+                }
             }
         }
         queried_logs.sort_by_key(|log| (log.transaction_index, log.log_index));
@@ -350,23 +522,47 @@ impl<P: ChainDataProvider> ChainService<P> {
                 ));
             }
         }
-        let mut receipt_logs = watched_logs(&receipts, &self.config.watched_addresses);
+        let mut receipt_logs =
+            self.filter_logs(watched_logs(&receipts, &self.config.watched_addresses))?;
         receipt_logs.sort_by_key(|log| (log.transaction_index, log.log_index));
         if receipt_logs != queried_logs {
-            return Err(ChainError::InvalidBundle(
-                "fallback log query and fetched receipts disagree",
-            ));
+            return Err(ChainError::ProviderViewInconsistent);
         }
         Ok((receipts, queried_logs))
     }
 
+    fn retain_log(&self, log: &CanonicalLogRecord) -> Result<bool, ChainError> {
+        self.log_filter
+            .as_ref()
+            .map_or(Ok(true), |filter| filter.retain(log))
+    }
+
+    fn filter_logs(
+        &self,
+        logs: Vec<CanonicalLogRecord>,
+    ) -> Result<Vec<CanonicalLogRecord>, ChainError> {
+        logs.into_iter()
+            .filter_map(|log| match self.retain_log(&log) {
+                Ok(true) => Some(Ok(log)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
     async fn compare_checkpoint(&self, latest: BlockRef) -> Result<(), ChainError> {
         let Some(checkpoint) = self.checkpoint.as_ref() else {
+            if let Some(ready) = &self.provider_ready {
+                ready.store(true, Ordering::Release);
+            }
             return Ok(());
         };
         let candidate = match checkpoint.header_by_number(latest.number).await {
             Ok(candidate) => candidate,
             Err(error) => {
+                if let Some(ready) = &self.provider_ready {
+                    ready.store(false, Ordering::Release);
+                }
                 let status = ProviderStatus {
                     provider: checkpoint.name().to_owned(),
                     reason: "canonical checkpoint unavailable".to_owned(),
@@ -377,6 +573,9 @@ impl<P: ChainDataProvider> ChainService<P> {
             }
         };
         if candidate.hash != latest.hash || candidate.parent_hash != latest.parent_hash {
+            if let Some(ready) = &self.provider_ready {
+                ready.store(false, Ordering::Release);
+            }
             let status = ProviderStatus {
                 provider: checkpoint.name().to_owned(),
                 reason: format!("canonical hash disagreement at block {}", latest.number),
@@ -386,6 +585,9 @@ impl<P: ChainDataProvider> ChainService<P> {
             return Err(ChainError::ProviderDisagreement {
                 block_number: latest.number,
             });
+        }
+        if let Some(ready) = &self.provider_ready {
+            ready.store(true, Ordering::Release);
         }
         Ok(())
     }

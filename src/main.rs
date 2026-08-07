@@ -5,7 +5,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
@@ -14,13 +17,14 @@ use clap::Parser;
 use futures::StreamExt;
 use morpho_v2_reallocator::api::{ApiDataStore, ReadOnlyApiState, router};
 use morpho_v2_reallocator::chain::{
+    ChainError,
     heads::{ChainService, ChainServiceConfig},
-    provider::{ChainDataProvider, HttpProvider},
+    provider::{ChainDataProvider, HttpProvider, ProviderError, RpcErrorCategory},
 };
 use morpho_v2_reallocator::cli::{Cli, Command, ConfigCommand};
 use morpho_v2_reallocator::config::{
-    AppConfig, RpcRole, RuntimeMode, SigningConfig, ValidatedConfig, ValidatedRpcConfig,
-    is_test_chain_id,
+    AppConfig, RpcRole, RuntimeMode, SigningConfig, SnapshotMode, ValidatedConfig,
+    ValidatedRpcConfig,
 };
 use morpho_v2_reallocator::protocol_lock::{
     ProtocolLock, RemoteSignerIdentity, ValidatedProtocolLock,
@@ -55,8 +59,14 @@ use morpho_v2_reallocator::transaction::{
 };
 use secrecy::SecretString;
 
+const PERSISTENT_CHAIN_FAILURE_THRESHOLD: u32 = 3;
+const ALERT_REPEAT_SUPPRESSION_SECONDS: u64 = 3_600;
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Operators commonly keep RPC and signer secrets in the ignored local `.env` file.
+    // Existing process environment values take precedence; absence of the file is valid.
+    let _ = dotenvy::dotenv();
     if let Err(error) = initialize_tracing() {
         eprintln!("logging initialization failed: {error}");
         return ExitCode::FAILURE;
@@ -204,9 +214,9 @@ fn initialize_tracing() -> Result<(), String> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .json()
-        .with_current_span(false)
-        .with_span_list(false)
+        .compact()
+        .with_ansi(false)
+        .with_target(false)
         .try_init()
         .map_err(|_| "global tracing subscriber is already initialized".to_owned())
 }
@@ -236,23 +246,38 @@ async fn run_supervised(
         release_evidence_path,
     )?;
     if let Some(stage) = authorization.stage {
-        tracing::info!(?stage, "reviewed Execute release gate passed");
+        tracing::info!(?stage, "execute enabled");
     }
+    tracing::info!(
+        mode = ?config.app.node.mode,
+        chain = %config.app.chain.name,
+        chain_id = config.app.chain.chain_id,
+        vaults = config.app.vaults.len(),
+        "bot started"
+    );
     let identities =
         RuntimeIdentities::from_config(&config, &lock).map_err(|error| error.to_string())?;
-    let primary_config =
-        provider_for_roles(&config, &[RpcRole::Head, RpcRole::Logs, RpcRole::Receipt])?;
+    let primary_config = provider_for_roles(
+        &config,
+        &[
+            RpcRole::Head,
+            RpcRole::Logs,
+            RpcRole::Read,
+            RpcRole::Simulate,
+            RpcRole::Submit,
+            RpcRole::Receipt,
+        ],
+    )?;
     let websocket_url_env = primary_config.websocket_url_env.clone();
-    let read_config = provider_for_roles(&config, &[RpcRole::Read])?;
-    let checkpoint_config = config
-        .app
-        .chain
-        .rpc
-        .iter()
-        .find(|provider| provider.roles.contains(&RpcRole::Checkpoint));
+    let checkpoint_config = config.app.chain.rpc.iter().find(|provider| {
+        provider.name != primary_config.name
+            && [RpcRole::Checkpoint, RpcRole::Read, RpcRole::Receipt]
+                .iter()
+                .all(|role| provider.roles.contains(role))
+    });
     let primary =
         Arc::new(HttpProvider::from_config(primary_config).map_err(|error| error.to_string())?);
-    let read = Arc::new(HttpProvider::from_config(read_config).map_err(|error| error.to_string())?);
+    let read = Arc::clone(&primary);
     let checkpoint = checkpoint_config
         .map(HttpProvider::from_config)
         .transpose()
@@ -313,9 +338,16 @@ async fn run_supervised(
     metrics
         .set("reallocator_json_format_info", 1)
         .map_err(|error| error.to_string())?;
+    metrics
+        .set("reallocator_providers_ready", 1)
+        .map_err(|error| error.to_string())?;
     let alerts = Arc::new(build_alert_dispatcher(&config)?);
     let data = ApiDataStore::default();
+    data.refresh_transactions(&storage_handle, &runtime)
+        .await
+        .map_err(|error| error.to_string())?;
     let sources = EventSourceRegistry::from_config(&config).map_err(|error| error.to_string())?;
+    let provider_ready = Arc::new(AtomicBool::new(true));
     let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(CHAIN_TO_STATE_CAPACITY);
     let chain = Arc::new(
         ChainService::new(
@@ -329,9 +361,12 @@ async fn run_supervised(
                 maximum_log_range: config.app.chain.maximum_log_range,
                 reorg_rescan_blocks: config.app.chain.reorg_rescan_blocks,
                 watched_addresses: sources.watched_addresses(),
+                latest_only: config.app.snapshot.mode == SnapshotMode::AtomicLatest,
             },
         )
-        .map_err(|error| error.to_string())?,
+        .map_err(|error| error.to_string())?
+        .with_log_filter(Arc::new(sources.clone()))
+        .with_provider_readiness(Arc::clone(&provider_ready)),
     );
     chain
         .verify_provider_identity()
@@ -367,7 +402,12 @@ async fn run_supervised(
     supervisor
         .spawn(
             "chain",
-            run_chain_service(chain, websocket_url_env, chain_shutdown),
+            run_chain_service(
+                chain,
+                websocket_url_env,
+                chain_shutdown,
+                Arc::clone(&alerts),
+            ),
         )
         .map_err(|error| error.to_string())?;
     if let Some(signer) = signer {
@@ -380,7 +420,9 @@ async fn run_supervised(
             runtime.clone(),
             signer,
             ExecutionReservationManager::default(),
-        );
+            Arc::clone(&provider_ready),
+        )
+        .with_alerts(Arc::clone(&alerts));
         let execution_shutdown = shutdown.clone();
         supervisor
             .spawn(
@@ -420,7 +462,12 @@ async fn run_supervised(
         }
     });
     let supervised_result = supervisor.run().await;
+    let alert_timestamp = unix_timestamp().unwrap_or_default();
+    let recent_specific_p0 = alerts.history().await.iter().rev().any(|alert| {
+        alert.severity == AlertSeverity::P0 && alert_timestamp.saturating_sub(alert.created_at) < 60
+    });
     if supervised_result.is_err()
+        && !recent_specific_p0
         && let Ok(alert) = Alert::new(
             AlertSeverity::P0,
             AlertKind::ServiceFailure,
@@ -428,7 +475,7 @@ async fn run_supervised(
             "Morpho V2 reallocator supervised service stopped".to_owned(),
             "a critical supervised service failed; Execute is disabled and local structured logs require immediate review".to_owned(),
             None,
-            unix_timestamp().unwrap_or_default(),
+            alert_timestamp,
         )
         && alerts.emit(alert).await.is_err()
     {
@@ -451,7 +498,9 @@ fn provider_for_roles<'a>(
         .chain
         .rpc
         .iter()
-        .find(|provider| roles.iter().all(|role| provider.roles.contains(role)))
+        .find(|provider| {
+            provider.production_grade && roles.iter().all(|role| provider.roles.contains(role))
+        })
         .ok_or_else(|| "no single configured provider owns every required runtime role".to_owned())
 }
 
@@ -459,9 +508,11 @@ async fn run_chain_service(
     chain: Arc<ChainService<HttpProvider>>,
     websocket_url_env: Option<String>,
     shutdown: ShutdownSignal,
+    alerts: Arc<AlertDispatcher>,
 ) -> Result<(), ServiceFailure> {
+    let consecutive_failures = Arc::new(AtomicU32::new(0));
     let Some(websocket_url_env) = websocket_url_env else {
-        return run_polling_chain_service(chain, shutdown).await;
+        return run_polling_chain_service(chain, shutdown, alerts, consecutive_failures).await;
     };
     let raw_endpoint = std::env::var(websocket_url_env).map_err(|_| ServiceFailure {
         reason: "WebSocket endpoint configuration is invalid",
@@ -474,29 +525,48 @@ async fn run_chain_service(
             reason: "WebSocket endpoint configuration is invalid",
         });
     }
-    let provider = ProviderBuilder::new()
-        .connect_ws(WsConnect::new(endpoint.as_str()))
-        .await
-        .map_err(|_| ServiceFailure {
-            reason: "WebSocket head connection failed",
-        })?;
-    let subscription = provider
-        .subscribe_blocks()
-        .await
-        .map_err(|_| ServiceFailure {
-            reason: "WebSocket head subscription failed",
-        })?;
+    let provider = match tokio::time::timeout(
+        Duration::from_secs(5),
+        ProviderBuilder::new().connect_ws(WsConnect::new(endpoint.as_str())),
+    )
+    .await
+    {
+        Ok(Ok(provider)) => provider,
+        Ok(Err(_)) | Err(_) => {
+            tracing::warn!(
+                service = "chain",
+                "WebSocket unavailable; continuing with authoritative HTTP polling"
+            );
+            return run_polling_chain_service(chain, shutdown, alerts, consecutive_failures).await;
+        }
+    };
+    let subscription =
+        match tokio::time::timeout(Duration::from_secs(5), provider.subscribe_blocks()).await {
+            Ok(Ok(subscription)) => subscription,
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(
+                    service = "chain",
+                    "WebSocket subscription unavailable; continuing with authoritative HTTP polling"
+                );
+                return run_polling_chain_service(chain, shutdown, alerts, consecutive_failures)
+                    .await;
+            }
+        };
     let mut hints = subscription.into_stream();
     let mut fallback = tokio::time::interval(Duration::from_secs(5));
     fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
-            _ = fallback.tick() => poll_canonical_chain(&chain, &shutdown).await?,
+            _ = fallback.tick() => poll_canonical_chain(&chain, &shutdown, &alerts, &consecutive_failures).await?,
             hint = hints.next() => match hint {
-                Some(_) => poll_canonical_chain(&chain, &shutdown).await?,
+                Some(_) => poll_canonical_chain(&chain, &shutdown, &alerts, &consecutive_failures).await?,
                 None if shutdown.is_cancelled() => return Ok(()),
-                None => return Err(ServiceFailure { reason: "WebSocket head subscription ended" }),
+                None => {
+                    tracing::warn!(service = "chain", "WebSocket subscription ended; continuing with authoritative HTTP polling");
+                    return run_polling_chain_service(chain, shutdown, alerts, consecutive_failures)
+                        .await;
+                },
             },
         }
     }
@@ -505,13 +575,15 @@ async fn run_chain_service(
 async fn run_polling_chain_service(
     chain: Arc<ChainService<HttpProvider>>,
     shutdown: ShutdownSignal,
+    alerts: Arc<AlertDispatcher>,
+    consecutive_failures: Arc<AtomicU32>,
 ) -> Result<(), ServiceFailure> {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
-            _ = interval.tick() => poll_canonical_chain(&chain, &shutdown).await?,
+            _ = interval.tick() => poll_canonical_chain(&chain, &shutdown, &alerts, &consecutive_failures).await?,
         }
     }
 }
@@ -519,10 +591,25 @@ async fn run_polling_chain_service(
 async fn poll_canonical_chain(
     chain: &Arc<ChainService<HttpProvider>>,
     shutdown: &ShutdownSignal,
+    alerts: &AlertDispatcher,
+    consecutive_failures: &AtomicU32,
 ) -> Result<(), ServiceFailure> {
     match chain.poll_once().await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            consecutive_failures.store(0, Ordering::Release);
+            Ok(())
+        }
         Err(_) if shutdown.is_cancelled() => Ok(()),
+        Err(error) if retryable_chain_error(&error) => {
+            let failures = consecutive_failures
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            tracing::warn!(service = "chain", %error, "canonical provider temporarily unavailable; retrying from the durable cursor");
+            if failures == PERSISTENT_CHAIN_FAILURE_THRESHOLD {
+                emit_persistent_chain_alert(alerts).await;
+            }
+            Ok(())
+        }
         Err(error) => {
             tracing::error!(service = "chain", %error, "canonical chain service failed");
             eprintln!("chain service failed: {error}");
@@ -530,6 +617,45 @@ async fn poll_canonical_chain(
                 reason: "canonical chain service failed",
             })
         }
+    }
+}
+
+async fn emit_persistent_chain_alert(alerts: &AlertDispatcher) {
+    let Ok(alert) = Alert::new(
+        AlertSeverity::P1,
+        AlertKind::CanonicalChainStopped,
+        None,
+        "Canonical RPC remained unavailable".to_owned(),
+        "three consecutive canonical polls failed; Execute remains disabled until exact canonical processing recovers".to_owned(),
+        None,
+        unix_timestamp().unwrap_or_default(),
+    ) else {
+        tracing::error!("persistent canonical RPC alert construction failed");
+        return;
+    };
+    if alerts.emit(alert).await.is_err() {
+        tracing::error!("persistent canonical RPC alert delivery failed");
+    }
+}
+
+fn retryable_chain_error(error: &ChainError) -> bool {
+    match error {
+        ChainError::Provider(
+            ProviderError::Transport { .. }
+            | ProviderError::MissingBlock
+            | ProviderError::HttpStatus { status: 429, .. }
+            | ProviderError::HttpStatus {
+                status: 500..=599, ..
+            },
+        ) => true,
+        ChainError::Provider(ProviderError::Rpc { category, .. }) => matches!(
+            category,
+            RpcErrorCategory::RateLimited
+                | RpcErrorCategory::ServerUnavailable
+                | RpcErrorCategory::TransportUnavailable
+        ),
+        ChainError::ProviderViewInconsistent => true,
+        _ => false,
     }
 }
 
@@ -564,13 +690,9 @@ fn build_execute_signer(
         return Ok(None);
     }
     match &config.app.signing {
-        SigningConfig::LocalDevelopment { private_key_env } => {
-            if !is_test_chain_id(config.app.chain.chain_id) {
-                return Err(
-                    "local-development signer is forbidden outside the explicit test-chain allowlist"
-                        .to_owned(),
-                );
-            }
+        SigningConfig::LocalDevelopment {
+            private_key_env, ..
+        } => {
             let vault = config
                 .app
                 .vaults
@@ -590,6 +712,10 @@ fn build_execute_signer(
                 .map_err(|_| "remote signer endpoint is invalid".to_owned())?;
             if endpoint.scheme() != "https"
                 || endpoint.host_str() != Some(lock.remote_signer.service_identity.as_str())
+                || !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.query().is_some()
+                || endpoint.fragment().is_some()
             {
                 return Err(
                     "remote signer HTTPS host differs from the pinned service identity".to_owned(),
@@ -641,9 +767,9 @@ async fn run_execution_service(
     execution: LiveExecutionService<HttpProvider>,
     shutdown: ShutdownSignal,
 ) -> Result<(), ServiceFailure> {
-    // The shared allocator is deliberately serviced on a conservative cadence. Canonical state
-    // ingestion remains event-driven, while this five-second interval gives the one durable nonce
-    // lane time to observe propagation or inclusion before making another lifecycle decision.
+    // The allocator key owns one durable nonce lane. A conservative five-second cadence leaves
+    // time for propagation, canonical receipt ingestion, and exact reconciliation before the next
+    // lifecycle decision while remaining inside the operator-approved 5–20 second range.
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -651,12 +777,14 @@ async fn run_execution_service(
             () = shutdown.cancelled() => return Ok(()),
             _ = interval.tick() => {
                 match execution.tick().await {
-                    Ok(())
-                    | Err(ExecutionServiceError::Preflight(
+                    Ok(()) => {}
+                    Err(error @ ExecutionServiceError::Preflight(
                         PreflightError::HeadChanged
                         | PreflightError::NonceBusy
                         | PreflightError::Reservation(_)
-                    )) => {}
+                    )) => {
+                        tracing::debug!(service = "execution", %error, "bounded execution attempt deferred");
+                    }
                     Err(error) if error.is_process_fatal() => {
                         tracing::error!(service = "execution", %error, "execution service failed");
                         eprintln!("execution service failed: {error}");
@@ -686,14 +814,17 @@ fn build_alert_dispatcher(config: &ValidatedConfig) -> Result<AlertDispatcher, S
     {
         transports.push(Arc::new(pagerduty));
     }
-    AlertDispatcher::new(transports, 300).map_err(|error| error.to_string())
+    AlertDispatcher::new(transports, ALERT_REPEAT_SUPPRESSION_SECONDS)
+        .map_err(|error| error.to_string())
 }
 
 async fn send_test_alert(config_path: &Path) -> Result<bool, String> {
     let config = load_config(config_path)?;
     let dispatcher = build_alert_dispatcher(&config)?;
     let alert = Alert::new(
-        AlertSeverity::P2,
+        // This is explicitly operator-triggered, so it intentionally crosses the normal P2
+        // external-delivery suppression and proves the configured destination end to end.
+        AlertSeverity::P1,
         AlertKind::ShadowPlan,
         None,
         "Morpho V2 reallocator alert delivery test".to_owned(),
@@ -758,12 +889,6 @@ fn static_doctor(
             format!("{:?}", report.stage).to_lowercase()
         }
         (SigningConfig::LocalDevelopment { .. }, RuntimeMode::Execute) => {
-            if !is_test_chain_id(config.app.chain.chain_id) {
-                return Err(
-                    "local-development Execute is outside the explicit test-chain allowlist"
-                        .to_owned(),
-                );
-            }
             if release_evidence_path.is_some() {
                 return Err(
                     "release evidence cannot authorize a local-development signer".to_owned(),
@@ -807,12 +932,6 @@ fn authorize_execute_startup(
     }
     match &config.app.signing {
         SigningConfig::LocalDevelopment { .. } => {
-            if !is_test_chain_id(config.app.chain.chain_id) {
-                return Err(
-                    "local-development signer is forbidden outside the explicit test-chain allowlist"
-                        .to_owned(),
-                );
-            }
             if release_evidence_path.is_some() {
                 return Err(
                     "release evidence cannot authorize a local-development signer".to_owned(),
@@ -904,7 +1023,9 @@ fn missing_runtime_environment(
                 required.insert(remote_signer.authentication_secret_env.as_str());
                 required.insert("MORPHO_V2_LOCK_DIR");
             }
-            SigningConfig::LocalDevelopment { private_key_env } => {
+            SigningConfig::LocalDevelopment {
+                private_key_env, ..
+            } => {
                 required.insert(private_key_env);
             }
         }
@@ -950,4 +1071,18 @@ fn enforce_non_writable_by_group_or_world(path: &Path, label: &str) -> Result<()
 #[cfg(not(unix))]
 fn enforce_non_writable_by_group_or_world(_path: &Path, _label: &str) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(test)]
+mod chain_retry_tests {
+    use super::retryable_chain_error;
+    use morpho_v2_reallocator::chain::ChainError;
+
+    #[test]
+    fn only_temporary_provider_view_mismatch_is_retryable() {
+        assert!(retryable_chain_error(&ChainError::ProviderViewInconsistent));
+        assert!(!retryable_chain_error(&ChainError::InvalidBundle(
+            "receipt block identity mismatch"
+        )));
+    }
 }

@@ -234,6 +234,12 @@ pub enum TransactionState {
     Failed = 12,
     /// The reserved nonce was canonically consumed by an unknown transaction.
     ForeignNonceConsumed = 13,
+    /// A known same-nonce cancellation was canonically included successfully.
+    Cancelled = 14,
+    /// Higher-fee identical-calldata bytes are durable but not yet durably broadcast.
+    ReplacementSigned = 15,
+    /// Same-nonce cancellation bytes are durable but not yet durably broadcast.
+    CancellationSigned = 16,
 }
 
 impl TransactionState {
@@ -246,6 +252,8 @@ impl TransactionState {
                 | Self::Signed
                 | Self::Submitted
                 | Self::Replaced
+                | Self::ReplacementSigned
+                | Self::CancellationSigned
                 | Self::CancellationSubmitted
                 | Self::Included
                 | Self::Confirmed
@@ -267,11 +275,17 @@ impl TransactionState {
             }
             Self::Signed => matches!(
                 next,
-                Self::Submitted | Self::ForeignNonceConsumed | Self::Failed
+                Self::Submitted
+                    | Self::CancellationSigned
+                    | Self::CancellationSubmitted
+                    | Self::ForeignNonceConsumed
+                    | Self::Failed
             ),
             Self::Submitted => matches!(
                 next,
-                Self::Replaced
+                Self::ReplacementSigned
+                    | Self::CancellationSigned
+                    | Self::Replaced
                     | Self::CancellationSubmitted
                     | Self::Included
                     | Self::Reverted
@@ -280,7 +294,9 @@ impl TransactionState {
             ),
             Self::Replaced => matches!(
                 next,
-                Self::Replaced
+                Self::ReplacementSigned
+                    | Self::CancellationSigned
+                    | Self::Replaced
                     | Self::CancellationSubmitted
                     | Self::Included
                     | Self::Reverted
@@ -291,8 +307,16 @@ impl TransactionState {
             Self::CancellationSubmitted => {
                 matches!(
                     next,
-                    Self::Included | Self::Reverted | Self::ForeignNonceConsumed | Self::Failed
+                    Self::Included
+                        | Self::Reverted
+                        | Self::ForeignNonceConsumed
+                        | Self::Failed
+                        | Self::Cancelled
                 )
+            }
+            Self::ReplacementSigned => matches!(next, Self::Replaced | Self::Failed),
+            Self::CancellationSigned => {
+                matches!(next, Self::CancellationSubmitted | Self::Failed)
             }
             Self::Included => matches!(
                 next,
@@ -302,6 +326,7 @@ impl TransactionState {
             Self::Orphaned => matches!(
                 next,
                 Self::Submitted
+                    | Self::CancellationSigned
                     | Self::CancellationSubmitted
                     | Self::Included
                     | Self::Reverted
@@ -313,6 +338,7 @@ impl TransactionState {
             | Self::Reverted
             | Self::Reconciled
             | Self::Failed
+            | Self::Cancelled
             | Self::ForeignNonceConsumed => false,
         }
     }
@@ -341,6 +367,9 @@ pub struct NonceReservation {
     pub max_priority_fee_per_gas: U256,
     /// Signed gas limit.
     pub gas_limit: u64,
+    /// Canonical semantic plan movement used by rolling execution limits.
+    #[serde(default)]
+    pub movement_assets: U256,
     /// Canonical head number at which this nonce was reserved.
     #[serde(default)]
     pub created_block: u64,
@@ -531,6 +560,19 @@ pub struct UnresolvedTransaction {
     pub last_broadcast_block: Option<u64>,
     /// Restricted kind of the latest durable signed attempt.
     pub last_attempt_kind: TransactionAttemptKind,
+}
+
+/// Secret-free durable transaction summary for operator observability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DurableTransactionSummary {
+    /// Vault whose routine action created the semantic transaction.
+    pub vault: VaultAddress,
+    /// Latest durably signed attempt hash.
+    pub transaction_hash: B256,
+    /// Current durable lifecycle state.
+    pub state: TransactionState,
+    /// Canonical inclusion block number, when known.
+    pub included_block: Option<u64>,
 }
 
 /// Result of an atomic canonical rewind.

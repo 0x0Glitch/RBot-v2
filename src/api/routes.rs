@@ -18,6 +18,7 @@ use crate::{
     domain::{ExactVaultSnapshot, V2Plan, VaultAddress},
     planner::episodes::RateSignalEpisode,
     runtime::controller::RuntimeRegistry,
+    storage::{StorageError, actor::StorageHandle},
     telemetry::{alerts::AlertDispatcher, health::HealthState},
 };
 
@@ -86,6 +87,38 @@ impl ApiDataStore {
             .write()
             .await
             .insert(transaction.transaction_hash, transaction);
+    }
+
+    /// Rebuilds the complete transaction cache from durable JSON state.
+    pub async fn refresh_transactions(
+        &self,
+        storage: &StorageHandle,
+        runtime: &RuntimeRegistry,
+    ) -> Result<(), StorageError> {
+        let summaries = storage.load_transaction_summaries().await?;
+        let revisions = runtime
+            .all()
+            .await
+            .into_iter()
+            .map(|status| (status.vault, status.revision))
+            .collect::<BTreeMap<_, _>>();
+        let views = summaries
+            .into_iter()
+            .map(|summary| TransactionView {
+                transaction_hash: summary.transaction_hash,
+                state: summary.state,
+                included_block: summary.included_block,
+                revision: revisions.get(&summary.vault).copied().unwrap_or_default(),
+            })
+            .map(|view| (view.transaction_hash, view))
+            .collect();
+        *self.transactions.write().await = views;
+        Ok(())
+    }
+
+    /// Returns every durable signed transaction in deterministic hash order.
+    pub async fn transactions(&self) -> Vec<TransactionView> {
+        self.transactions.read().await.values().cloned().collect()
     }
 }
 
@@ -225,16 +258,7 @@ async fn artifact<T: Clone + serde::Serialize>(
 }
 
 async fn transactions(State(state): State<ReadOnlyApiState>) -> Json<Vec<TransactionView>> {
-    Json(
-        state
-            .data
-            .transactions
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect(),
-    )
+    Json(state.data.transactions().await)
 }
 
 async fn transaction(State(state): State<ReadOnlyApiState>, Path(hash): Path<String>) -> Response {

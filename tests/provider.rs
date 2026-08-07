@@ -7,6 +7,7 @@ use alloy::primitives::{Address, B256, Bytes};
 use morpho_v2_reallocator::chain::provider::{
     CapabilityProbe, ChainDataProvider, HttpProvider, ProviderError, ProviderRole, RpcErrorCategory,
 };
+use morpho_v2_reallocator::config::BlockOpportunityPolicy;
 use serde_json::{Value, json};
 use url::Url;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
@@ -95,11 +96,14 @@ async fn capability_probe_covers_required_methods_with_one_latest_header_call()
                 signer: Address::with_last_byte(2),
                 known_transaction_hash: B256::repeat_byte(3),
             },
+            BlockOpportunityPolicy::HyperEvmFastBlocks {
+                gas_limit: 2_000_000,
+            },
         )
         .await?;
     assert_eq!(capabilities.chain_id, 999);
     assert_eq!(capabilities.latest_head.number, 10);
-    assert!(!capabilities.signer_uses_big_blocks);
+    assert_eq!(capabilities.signer_uses_big_blocks, Some(false));
 
     let requests = server.received_requests().await.unwrap();
     let methods = requests
@@ -135,6 +139,43 @@ async fn capability_probe_covers_required_methods_with_one_latest_header_call()
         1
     );
     assert!(!methods.iter().any(|method| method == "eth_blockNumber"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn standard_evm_capability_probe_skips_hyperevm_only_rpc()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(RpcResponder)
+        .mount(&server)
+        .await;
+    let provider = HttpProvider::new("test".to_owned(), Url::parse(&server.uri())?, all_roles())?;
+    let capabilities = provider
+        .probe_capabilities(
+            999,
+            &CapabilityProbe {
+                read_target: Address::with_last_byte(1),
+                read_calldata: Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]),
+                signer: Address::with_last_byte(2),
+                known_transaction_hash: B256::repeat_byte(3),
+            },
+            BlockOpportunityPolicy::EveryCanonicalBlock,
+        )
+        .await?;
+    assert_eq!(capabilities.signer_uses_big_blocks, None);
+
+    let requests = server.received_requests().await.unwrap();
+    let methods = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| {
+            body.get("method")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert!(!methods.iter().any(|method| method == "eth_usingBigBlocks"));
     Ok(())
 }
 

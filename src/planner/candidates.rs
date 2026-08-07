@@ -51,7 +51,16 @@ pub fn build_candidate_lattice(
             hash: keccak256(encoded),
         };
     }
-    let mut priority = Vec::new();
+    // Exact feasibility boundaries always survive small configured limits. Neighbor probes and
+    // binary fractions are useful refinements, but must never crowd out zero, the minimum action,
+    // or the maximum executable amount.
+    let mut priority = [U256::ZERO, minimum_action.min(maximum), maximum].to_vec();
+    priority.extend(
+        prioritized_boundaries
+            .iter()
+            .copied()
+            .map(|boundary| boundary.min(maximum)),
+    );
     for boundary in [U256::ZERO, minimum_action, maximum]
         .into_iter()
         .chain(prioritized_boundaries.iter().copied())

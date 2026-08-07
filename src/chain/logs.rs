@@ -302,6 +302,40 @@ pub enum EventDecodeError {
     NonCanonical(WatchedEventKind),
 }
 
+/// Decodes a log only when its first topic belongs to the configured watched event family.
+///
+/// Address-level RPC filters also return unrelated events from the same contract, such as
+/// inherited ERC-20 events on a vault or Morpho flash loans. Those events are not state
+/// triggers. Recognized watched signatures are still decoded strictly, so malformed or
+/// non-canonical safety-relevant events fail closed.
+pub fn decode_watched_event(
+    source: EventSource,
+    raw: &RawEventLog,
+) -> Result<Option<DecodedEvent>, EventDecodeError> {
+    if raw.address != source.address() {
+        return Err(EventDecodeError::AddressMismatch);
+    }
+    let Some(signature) = raw.topics.first().copied() else {
+        return Ok(None);
+    };
+    if !is_watched_signature(source, signature) {
+        return Ok(None);
+    }
+    decode_event(source, raw).map(Some)
+}
+
+/// Returns whether a signature belongs to the exact event family watched for a source role.
+#[must_use]
+pub fn is_watched_signature(source: EventSource, signature: B256) -> bool {
+    match source {
+        EventSource::Vault(_) => vault_kind(signature).is_some(),
+        EventSource::Adapter(_) => adapter_kind(signature).is_some(),
+        EventSource::Morpho(_) => morpho_kind(signature).is_some(),
+        EventSource::AdaptiveCurveIrm(_) => signature == IIrm::BorrowRateUpdate::SIGNATURE_HASH,
+        EventSource::Token(_) => signature == IERC20::Transfer::SIGNATURE_HASH,
+    }
+}
+
 /// Strictly decodes one raw log using only its configured contract role.
 pub fn decode_event(
     source: EventSource,

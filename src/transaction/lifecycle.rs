@@ -102,6 +102,7 @@ pub async fn reserve_durable_rebalance(
         max_fee_per_gas: U256::from(fields.max_fee_per_gas),
         max_priority_fee_per_gas: U256::from(fields.max_priority_fee_per_gas),
         gas_limit: fields.gas_limit,
+        movement_assets: plan.plan().projection.movement_assets,
         created_block: plan.plan().snapshot.block.number,
         created_at,
     };

@@ -1,12 +1,14 @@
 //! Embeds an exact clean Git revision when one is available at build time.
 
-use std::{env, process::Command};
+use std::{env, path::Path, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MORPHO_V2_BUILD_REVISION");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
-    println!("cargo:rerun-if-changed=.git/refs/heads");
+    if Path::new(".git").is_dir() {
+        println!("cargo:rerun-if-changed=.git/HEAD");
+        println!("cargo:rerun-if-changed=.git/index");
+        println!("cargo:rerun-if-changed=.git/refs/heads");
+    }
 
     let revision = env::var("MORPHO_V2_BUILD_REVISION")
         .ok()

@@ -16,10 +16,10 @@ use alloy::{
 use async_trait::async_trait;
 use morpho_v2_reallocator::{
     chain::provider::{
-        ChainDataProvider, ProviderError, ProviderRole, RpcLog, RpcReceipt,
+        AccountNonceProvider, ChainDataProvider, ProviderError, ProviderRole, RpcLog, RpcReceipt,
         SignedTransactionSubmitter, TransactionSimulationProvider,
     },
-    config::{AppConfig, ValidatedConfig},
+    config::{AppConfig, SnapshotMode, ValidatedConfig},
     domain::{
         BlockHashBinding, BlockRef, ExactVaultSnapshot, IdleLockLedgerSnapshot, ParentVaultState,
         PlanId, PlanProjection, PlanReason, SolverCertificate, StateContext, TransactionId,
@@ -33,7 +33,7 @@ use morpho_v2_reallocator::{
             PreflightError, PreflightSourceError, PreparedPreflightPlan,
             execute_one_head_preflight,
         },
-        firewall::{ValidatedPlan, canonical_plan_hash, validate_plan},
+        firewall::{ValidatedPlan, canonical_plan_hash, canonical_plan_id, validate_plan},
         signer::{
             RoutineSigner, SignCancellationRequest, SignRebalanceRequest, SignReplacementRequest,
             SignedEnvelope, SignerError, verify_rebalance_envelope,
@@ -74,12 +74,13 @@ fn validated_plan(config: &ValidatedConfig, head: BlockRef) -> ValidatedPlan {
     let position = &vault.positions[0];
     let amount = U256::from(1_000_000_u64);
     let mut plan = V2Plan {
-        plan_id: PlanId(B256::repeat_byte(0x71)),
+        plan_id: PlanId(B256::ZERO),
         reason: PlanReason::CapitalDeployment,
         vault: vault.address,
         snapshot: StateContext {
             chain_id: config.app.chain.chain_id,
             block: head,
+            evm_timestamp: head.timestamp,
             block_hash_binding: BlockHashBinding::Proven,
             static_config_revision: config.revision,
             dynamic_topology_revision: B256::repeat_byte(0x41),
@@ -106,11 +107,15 @@ fn validated_plan(config: &ValidatedConfig, head: BlockRef) -> ValidatedPlan {
             search_complete_for_lattice: true,
             rate_episode_id: None,
             objective_branch: None,
-            target_reachable: true,
-            target_reached: true,
+            target_reachable: false,
+            target_reached: false,
         },
         episode_id: None,
         plan_hash: B256::ZERO,
+    };
+    plan.plan_id = match canonical_plan_id(&plan) {
+        Ok(id) => id,
+        Err(error) => panic!("fixture plan ID must hash: {error}"),
     };
     plan.plan_hash = match canonical_plan_hash(&plan) {
         Ok(hash) => hash,
@@ -128,6 +133,7 @@ fn exact_snapshot(config: &ValidatedConfig, head: BlockRef) -> ExactVaultSnapsho
         context: StateContext {
             chain_id: config.app.chain.chain_id,
             block: head,
+            evm_timestamp: head.timestamp,
             block_hash_binding: BlockHashBinding::Proven,
             static_config_revision: config.revision,
             dynamic_topology_revision: B256::repeat_byte(0x41),
@@ -162,6 +168,7 @@ fn exact_snapshot(config: &ValidatedConfig, head: BlockRef) -> ExactVaultSnapsho
             required_dead_shares: U256::from(1_u64),
         },
         adapters: BTreeMap::new(),
+        enabled_adapters: BTreeSet::new(),
         liquidity_adapter: None,
         positions: BTreeMap::new(),
         markets: BTreeMap::new(),
@@ -238,6 +245,23 @@ impl ChainDataProvider for HeaderProvider {
 
 struct Simulator;
 
+struct NonceProvider(u64);
+
+#[async_trait]
+impl AccountNonceProvider for NonceProvider {
+    async fn account_nonce(&self, _signer: Address) -> Result<u64, ProviderError> {
+        Ok(self.0)
+    }
+
+    async fn account_nonce_at(
+        &self,
+        _signer: Address,
+        _block: BlockRef,
+    ) -> Result<u64, ProviderError> {
+        Ok(self.0)
+    }
+}
+
 #[async_trait]
 impl TransactionSimulationProvider for Simulator {
     async fn call_at(
@@ -259,7 +283,9 @@ impl TransactionSimulationProvider for Simulator {
         Ok(100_000)
     }
     async fn using_big_blocks(&self, _signer: Address) -> Result<bool, ProviderError> {
-        Ok(false)
+        Err(ProviderError::MethodUnsupported {
+            method: "eth_usingBigBlocks",
+        })
     }
 }
 
@@ -319,6 +345,7 @@ impl ExactPreflightSource for Source {
                     .map_err(|_| PreflightSourceError::Failed)?,
                 positive_loss_assets: U256::ZERO,
             }],
+            scenarios: *_scenarios,
         })
     }
     async fn invalidation_queued(&self) -> Result<bool, PreflightSourceError> {
@@ -367,7 +394,6 @@ fn request() -> ExecutePreflightRequest {
         nonce: 0,
         max_fee_per_gas: 100,
         max_priority_fee_per_gas: 2,
-        created_at: 1_900_000_100,
     }
 }
 
@@ -395,6 +421,7 @@ async fn successful_preflight_persists_signed_bytes_before_one_broadcast()
     };
     let result = execute_one_head_preflight(
         &HeaderProvider::new(vec![head]),
+        &NonceProvider(0),
         &Simulator,
         &submitter,
         &source,
@@ -427,7 +454,8 @@ async fn successful_preflight_persists_signed_bytes_before_one_broadcast()
 async fn head_change_after_unsigned_persistence_aborts_without_signing()
 -> Result<(), Box<dyn std::error::Error>> {
     let signer_key = PrivateKeySigner::random();
-    let config = config_for_signer(signer_key.address());
+    let mut config = config_for_signer(signer_key.address());
+    config.app.snapshot.mode = SnapshotMode::PinnedBlock;
     let vault = &config.app.vaults[0];
     let head = block(100, 0x64, 0x63);
     let moved = block(101, 0x65, 0x64);
@@ -447,7 +475,8 @@ async fn head_change_after_unsigned_persistence_aborts_without_signing()
         calls: AtomicUsize::new(0),
     };
     let error = execute_one_head_preflight(
-        &HeaderProvider::new(vec![head, head, head, moved]),
+        &HeaderProvider::new(vec![head, moved]),
+        &NonceProvider(0),
         &Simulator,
         &submitter,
         &source,
@@ -469,6 +498,100 @@ async fn head_change_after_unsigned_persistence_aborts_without_signing()
             .await?
             .is_none()
     );
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn nonce_change_at_the_signing_gate_aborts_without_signing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer_key = PrivateKeySigner::random();
+    let config = config_for_signer(signer_key.address());
+    let vault = &config.app.vaults[0];
+    let head = block(100, 0x64, 0x63);
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("nonce-change.json"), 32, 1)?;
+    let source = Source {
+        head,
+        plan: validated_plan(&config, head),
+        snapshot: exact_snapshot(&config, head),
+        storage: service.handle(),
+    };
+    let signer = LocalSigner {
+        signer: signer_key,
+        calls: AtomicUsize::new(0),
+    };
+    let submitter = Submitter {
+        calls: AtomicUsize::new(0),
+    };
+    let result = execute_one_head_preflight(
+        &HeaderProvider::new(vec![head]),
+        &NonceProvider(1),
+        &Simulator,
+        &submitter,
+        &source,
+        &service.handle(),
+        &signer,
+        &ExecutionReservationManager::default(),
+        &config,
+        vault,
+        request(),
+    )
+    .await;
+    assert!(matches!(result, Err(PreflightError::NonceChanged)));
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        service
+            .handle()
+            .load_unresolved(vault.signer_address)
+            .await?
+            .is_none()
+    );
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rolling_movement_limit_rejects_before_signing() -> Result<(), Box<dyn std::error::Error>> {
+    let signer_key = PrivateKeySigner::random();
+    let mut config = config_for_signer(signer_key.address());
+    let head = block(100, 0x64, 0x63);
+    let plan = validated_plan(&config, head);
+    config.app.vaults[0].maximum_movement_per_hour_assets = U256::from(999_999_u64);
+    let vault = config.app.vaults[0].clone();
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("movement.json"), 32, 1)?;
+    let source = Source {
+        head,
+        plan,
+        snapshot: exact_snapshot(&config, head),
+        storage: service.handle(),
+    };
+    let signer = LocalSigner {
+        signer: signer_key,
+        calls: AtomicUsize::new(0),
+    };
+    let submitter = Submitter {
+        calls: AtomicUsize::new(0),
+    };
+    let result = execute_one_head_preflight(
+        &HeaderProvider::new(vec![head]),
+        &NonceProvider(0),
+        &Simulator,
+        &submitter,
+        &source,
+        &service.handle(),
+        &signer,
+        &ExecutionReservationManager::default(),
+        &config,
+        &vault,
+        request(),
+    )
+    .await;
+    assert!(matches!(result, Err(PreflightError::MovementBudget)));
+    assert_eq!(signer.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
     service.shutdown().await?;
     Ok(())
 }

@@ -1,6 +1,6 @@
 //! Role-scoped HTTP JSON-RPC providers with no generic public request surface.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -11,10 +11,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::RwLock;
 use url::Url;
 
-use crate::config::{RpcRole, ValidatedRpcConfig};
+use crate::config::{BlockOpportunityPolicy, RpcRole, ValidatedRpcConfig};
 use crate::domain::BlockRef;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -155,6 +154,17 @@ pub enum RpcErrorCategory {
     Unknown,
 }
 
+impl RpcErrorCategory {
+    /// Returns whether repeated failures in this category prove provider unavailability.
+    #[must_use]
+    pub const fn is_transient_outage(self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited | Self::ServerUnavailable | Self::TransportUnavailable
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RpcHeader {
@@ -215,8 +225,8 @@ pub struct ProviderCapabilities {
     pub transaction_lookup: bool,
     /// Receipt lookup method succeeded.
     pub receipt_lookup: bool,
-    /// HyperEVM signer is confirmed not to use big blocks.
-    pub signer_uses_big_blocks: bool,
+    /// HyperEVM signer lane result when that optional policy was requested.
+    pub signer_uses_big_blocks: Option<bool>,
 }
 
 /// Provider or JSON-RPC failure. Endpoint URLs and credentials are never included.
@@ -304,6 +314,12 @@ impl ProviderError {
             } => RpcErrorCategory::ServerUnavailable,
             _ => RpcErrorCategory::Unknown,
         }
+    }
+
+    /// Returns whether this error may increment the bounded provider-outage breaker.
+    #[must_use]
+    pub const fn is_transient_outage(&self) -> bool {
+        self.rpc_category().is_transient_outage()
     }
 }
 
@@ -397,6 +413,17 @@ pub trait AccountNonceProvider: Send + Sync {
     ) -> Result<u64, ProviderError>;
 }
 
+/// Typed native-balance surface used only for allocator gas-funding checks.
+#[async_trait]
+pub trait AccountFundingProvider: Send + Sync {
+    /// Returns the signer native-token balance at one exact canonical block hash.
+    async fn account_balance_at(
+        &self,
+        signer: Address,
+        block: BlockRef,
+    ) -> Result<U256, ProviderError>;
+}
+
 /// Role-scoped HTTP provider.
 pub struct HttpProvider {
     name: String,
@@ -405,7 +432,6 @@ pub struct HttpProvider {
     client: Client,
     next_id: AtomicU64,
     block_receipts_capability: AtomicU8,
-    code_cache: RwLock<BTreeMap<Address, Bytes>>,
 }
 
 impl std::fmt::Debug for HttpProvider {
@@ -438,7 +464,6 @@ impl HttpProvider {
             client: build_client()?,
             next_id: AtomicU64::new(1),
             block_receipts_capability: AtomicU8::new(CAPABILITY_UNKNOWN),
-            code_cache: RwLock::new(BTreeMap::new()),
         })
     }
 
@@ -458,7 +483,6 @@ impl HttpProvider {
             client: build_client()?,
             next_id: AtomicU64::new(1),
             block_receipts_capability: AtomicU8::new(CAPABILITY_UNKNOWN),
-            code_cache: RwLock::new(BTreeMap::new()),
         })
     }
 
@@ -467,6 +491,7 @@ impl HttpProvider {
         &self,
         expected_chain_id: u64,
         probe: &CapabilityProbe,
+        block_policy: BlockOpportunityPolicy,
     ) -> Result<ProviderCapabilities, ProviderError> {
         let chain_id_quantity: String = self.request_unscoped("eth_chainId", json!([])).await?;
         let chain_id = parse_quantity("eth_chainId", &chain_id_quantity)?;
@@ -535,10 +560,15 @@ impl HttpProvider {
                 json!([probe.known_transaction_hash]),
             )
             .await?;
-        let signer_uses_big_blocks: bool = self
-            .request_unscoped("eth_usingBigBlocks", json!([probe.signer]))
-            .await?;
-        if signer_uses_big_blocks {
+        let signer_uses_big_blocks = if block_policy.requires_hyper_evm_signer_lane_check() {
+            Some(
+                self.request_unscoped("eth_usingBigBlocks", json!([probe.signer]))
+                    .await?,
+            )
+        } else {
+            None
+        };
+        if signer_uses_big_blocks == Some(true) {
             return Err(ProviderError::SignerUsesBigBlocks);
         }
         Ok(ProviderCapabilities {
@@ -607,14 +637,8 @@ impl HttpProvider {
 
     /// Reads complete runtime bytecode at latest state.
     pub async fn code_at(&self, target: Address) -> Result<Bytes, ProviderError> {
-        if let Some(code) = self.code_cache.read().await.get(&target).cloned() {
-            return Ok(code);
-        }
-        let code: Bytes = self
-            .request(ProviderRole::Read, "eth_getCode", json!([target, "latest"]))
-            .await?;
-        self.code_cache.write().await.insert(target, code.clone());
-        Ok(code)
+        self.request(ProviderRole::Read, "eth_getCode", json!([target, "latest"]))
+            .await
     }
 
     /// Reads runtime bytecode at one canonical EIP-1898 block hash.
@@ -623,21 +647,15 @@ impl HttpProvider {
         target: Address,
         block: BlockRef,
     ) -> Result<Bytes, ProviderError> {
-        if let Some(code) = self.code_cache.read().await.get(&target).cloned() {
-            return Ok(code);
-        }
-        let code: Bytes = self
-            .request(
-                ProviderRole::Read,
-                "eth_getCode",
-                json!([target, {
-                    "blockHash": block.hash,
-                    "requireCanonical": true,
-                }]),
-            )
-            .await?;
-        self.code_cache.write().await.insert(target, code.clone());
-        Ok(code)
+        self.request(
+            ProviderRole::Read,
+            "eth_getCode",
+            json!([target, {
+                "blockHash": block.hash,
+                "requireCanonical": true,
+            }]),
+        )
+        .await
     }
 
     /// Reads one storage slot at latest state.
@@ -990,6 +1008,27 @@ impl AccountNonceProvider for HttpProvider {
     }
 }
 
+#[async_trait]
+impl AccountFundingProvider for HttpProvider {
+    async fn account_balance_at(
+        &self,
+        signer: Address,
+        block: BlockRef,
+    ) -> Result<U256, ProviderError> {
+        let quantity: String = self
+            .request(
+                ProviderRole::Read,
+                "eth_getBalance",
+                json!([signer, {
+                    "blockHash": block.hash,
+                    "requireCanonical": true,
+                }]),
+            )
+            .await?;
+        parse_u256_quantity("eth_getBalance", &quantity)
+    }
+}
+
 #[derive(Serialize)]
 struct RpcRequest {
     jsonrpc: &'static str,
@@ -1015,10 +1054,32 @@ struct RpcError {
 }
 
 fn classify_rpc_error(method: &'static str, code: i64, message: &str) -> RpcErrorCategory {
+    let normalized = message.to_ascii_lowercase();
+    if code == 429
+        || code == -32_005
+        || normalized.contains("rate limit")
+        || normalized.contains("too many requests")
+        || normalized.contains("request limit")
+    {
+        return RpcErrorCategory::RateLimited;
+    }
+    if normalized.contains("service unavailable")
+        || normalized.contains("server unavailable")
+        || normalized.contains("temporarily unavailable")
+        || normalized.contains("upstream unavailable")
+        || normalized.contains("gateway timeout")
+    {
+        return RpcErrorCategory::ServerUnavailable;
+    }
+    if normalized.contains("transport unavailable")
+        || normalized.contains("connection timeout")
+        || normalized.contains("request timeout")
+    {
+        return RpcErrorCategory::TransportUnavailable;
+    }
     if method != "eth_sendRawTransaction" {
         return RpcErrorCategory::Unknown;
     }
-    let normalized = message.to_ascii_lowercase();
     if normalized.contains("already known")
         || normalized.contains("known transaction")
         || normalized.contains("already imported")
@@ -1042,8 +1103,6 @@ fn classify_rpc_error(method: &'static str, code: i64, message: &str) -> RpcErro
         || normalized.contains("rlp")
     {
         RpcErrorCategory::InvalidSenderOrEncoding
-    } else if code == 429 || normalized.contains("rate limit") {
-        RpcErrorCategory::RateLimited
     } else {
         RpcErrorCategory::Unknown
     }
@@ -1068,6 +1127,15 @@ pub fn parse_quantity(field: &'static str, quantity: &str) -> Result<u64, Provid
     u64::from_str_radix(digits, 16).map_err(|_| ProviderError::Quantity { field })
 }
 
+/// Parses one canonical EVM hex quantity into the full uint256 domain.
+pub fn parse_u256_quantity(field: &'static str, quantity: &str) -> Result<U256, ProviderError> {
+    let digits = quantity
+        .strip_prefix("0x")
+        .filter(|digits| !digits.is_empty())
+        .ok_or(ProviderError::Quantity { field })?;
+    U256::from_str_radix(digits, 16).map_err(|_| ProviderError::Quantity { field })
+}
+
 /// Formats an EVM hex quantity without leading zeroes.
 #[must_use]
 pub fn format_quantity(value: u64) -> String {
@@ -1086,5 +1154,29 @@ mod tests {
         assert!(parse_quantity("test", "ff").is_err());
         assert!(parse_quantity("test", "0x").is_err());
         assert!(parse_quantity("test", "0x10000000000000000").is_err());
+        assert_eq!(
+            parse_u256_quantity(
+                "balance",
+                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
+            Ok(U256::MAX)
+        );
+        assert!(parse_u256_quantity("balance", "0x").is_err());
+    }
+
+    #[test]
+    fn read_rpc_outages_are_distinct_from_deterministic_call_reverts() {
+        assert_eq!(
+            classify_rpc_error("eth_call", 429, "too many requests"),
+            RpcErrorCategory::RateLimited
+        );
+        assert_eq!(
+            classify_rpc_error("eth_getBalance", -32_000, "upstream service unavailable"),
+            RpcErrorCategory::ServerUnavailable
+        );
+        assert_eq!(
+            classify_rpc_error("eth_call", 3, "execution reverted"),
+            RpcErrorCategory::Unknown
+        );
     }
 }

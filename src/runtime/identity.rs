@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 
 use alloy::primitives::{Address, B256};
+use futures::{StreamExt, stream};
 use thiserror::Error;
 
 use crate::{
-    chain::multicall::AtomicSnapshotProvider,
+    chain::{multicall::AtomicSnapshotProvider, provider::RpcErrorCategory},
     config::{ValidatedConfig, ValidatedVaultConfig},
     contracts::code_identity::{CodeIdentityError, verify_runtime_code},
     domain::ExactVaultSnapshot,
@@ -27,7 +28,7 @@ pub enum RuntimeIdentityError {
     Runtime(#[from] CodeIdentityError),
     /// A typed runtime-code RPC read failed.
     #[error("runtime code read failed")]
-    Provider,
+    Provider(RpcErrorCategory),
 }
 
 /// Checked lock identities indexed by exact deployed address.
@@ -84,12 +85,39 @@ impl RuntimeIdentities {
         &self,
         provider: &P,
     ) -> Result<(), RuntimeIdentityError> {
+        // All identities belong to the same immutable block-independent gate. Fetch them
+        // concurrently so a fast-block chain does not make final preflight impossible merely
+        // because independent `eth_getCode` calls were serialized.
+        let checks = stream::iter(self.contracts.values().cloned())
+            .map(|identity| verify_deployed_identity(provider, identity))
+            .buffer_unordered(8);
+        futures::pin_mut!(checks);
+        while let Some(result) = checks.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Revalidates mutable proxy implementation links during final preflight.
+    ///
+    /// Runtime bytecode for every locked address is already checked at the exact snapshot
+    /// block. Only proxy storage links require this additional dynamic gate.
+    pub async fn verify_proxy_links<P: AtomicSnapshotProvider>(
+        &self,
+        provider: &P,
+    ) -> Result<(), RuntimeIdentityError> {
+        let mut proxy_identities = Vec::new();
         for identity in self.contracts.values() {
-            let code = provider
-                .code_at(identity.address)
-                .await
-                .map_err(|_| RuntimeIdentityError::Provider)?;
-            verify_runtime_code(identity, &code)?;
+            if identity.proxy_implementation.is_some() {
+                proxy_identities.push(identity.clone());
+            }
+        }
+        let checks = stream::iter(proxy_identities)
+            .map(|identity| verify_proxy_identity(provider, identity))
+            .buffer_unordered(8);
+        futures::pin_mut!(checks);
+        while let Some(result) = checks.next().await {
+            result?;
         }
         Ok(())
     }
@@ -99,13 +127,15 @@ impl RuntimeIdentities {
         &self,
         snapshot: &ExactVaultSnapshot,
     ) -> Result<(), RuntimeIdentityError> {
-        require_identity(
-            &self.contracts,
-            snapshot.parent.adapter_registry,
-            IdentityKind::AdapterRegistry,
-            None,
-            "adapter registry",
-        )?;
+        if !snapshot.parent.adapter_registry.is_zero() {
+            require_identity(
+                &self.contracts,
+                snapshot.parent.adapter_registry,
+                IdentityKind::AdapterRegistry,
+                None,
+                "adapter registry",
+            )?;
+        }
         for gate in [
             snapshot.parent.receive_shares_gate,
             snapshot.parent.send_shares_gate,
@@ -130,6 +160,47 @@ impl RuntimeIdentities {
     pub const fn code_hashes(&self) -> &BTreeMap<Address, B256> {
         &self.code_hashes
     }
+}
+
+async fn verify_deployed_identity<P: AtomicSnapshotProvider>(
+    provider: &P,
+    identity: ValidatedContractIdentity,
+) -> Result<(), RuntimeIdentityError> {
+    let code = provider
+        .code_at(identity.address)
+        .await
+        .map_err(|error| RuntimeIdentityError::Provider(error.rpc_category()))?;
+    verify_runtime_code(&identity, &code)?;
+    verify_proxy_identity(provider, identity).await
+}
+
+async fn verify_proxy_identity<P: AtomicSnapshotProvider>(
+    provider: &P,
+    identity: ValidatedContractIdentity,
+) -> Result<(), RuntimeIdentityError> {
+    if let Some(proxy) = &identity.proxy_implementation {
+        let stored = provider
+            .storage_at(identity.address, proxy.storage_slot)
+            .await
+            .map_err(|error| RuntimeIdentityError::Provider(error.rpc_category()))?;
+        if stored.as_slice()[..12].iter().any(|byte| *byte != 0)
+            || Address::from_slice(&stored.as_slice()[12..]) != proxy.address
+        {
+            return Err(RuntimeIdentityError::Configuration(
+                "proxy implementation slot",
+            ));
+        }
+        let implementation_code = provider
+            .code_at(proxy.address)
+            .await
+            .map_err(|error| RuntimeIdentityError::Provider(error.rpc_category()))?;
+        if alloy::primitives::keccak256(&implementation_code) != proxy.runtime_code_hash {
+            return Err(RuntimeIdentityError::Configuration(
+                "proxy implementation runtime",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_vault_identities(

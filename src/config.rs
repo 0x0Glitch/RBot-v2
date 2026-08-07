@@ -17,27 +17,178 @@ use crate::domain::{
 };
 
 /// Configuration schema supported by this binary.
-pub const CONFIG_SCHEMA_VERSION: u32 = 4;
+pub const CONFIG_SCHEMA_VERSION: u32 = 6;
 /// Exact simple-APR time basis in seconds.
 pub const SECONDS_PER_YEAR: u64 = 31_536_000;
 /// Exact fixed-point scale.
 pub const WAD: u64 = 1_000_000_000_000_000_000;
 
-const fn default_identical_rebroadcast_after_fast_blocks() -> u64 {
+const fn default_identical_rebroadcast_after_opportunities() -> u64 {
     1
 }
 
 const fn default_target_tolerance_apr_bps() -> u32 {
+    0
+}
+
+const fn default_utilization_entry_spread_bps() -> u32 {
+    25
+}
+
+const fn default_utilization_target_spread_bps() -> u32 {
+    10
+}
+
+const fn default_utilization_minimum_improvement_bps() -> u32 {
     1
 }
 
-/// Returns whether a chain is explicitly allowed to use the test-only local signer.
-#[must_use]
-pub const fn is_test_chain_id(chain_id: u64) -> bool {
-    matches!(chain_id, 998 | 1_337 | 31_337)
+const fn default_utilization_minimum_event_impact_bps() -> u32 {
+    1
 }
 
-/// Raw application configuration loaded from strict JSON.
+/// Strict on-disk configuration envelope separating operator inputs from policy tuning.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigDocument {
+    /// Configuration schema version.
+    schema_version: u32,
+    /// Values normally supplied for each deployment by the process operator.
+    normal: NormalConfig,
+    /// Safety, timing, and strategy policy normally maintained by the allocator.
+    advanced: AdvancedConfig,
+}
+
+/// Deployment and secret-reference inputs required for an ordinary installation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NormalConfig {
+    /// Process identity and local durable-state location.
+    node: NormalNodeConfig,
+    /// Chain identity, contracts, replay origin, and provider references.
+    chain: NormalChainConfig,
+    /// Restricted signer reference.
+    signing: SigningConfig,
+    /// Alert destinations and secret references.
+    alerts: AlertConfig,
+    /// Exact vault deployments and allocator-approved market policy.
+    #[serde(rename = "vaults")]
+    vault: Vec<VaultConfig>,
+}
+
+/// Process values routinely set by the deployment operator.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NormalNodeConfig {
+    /// Stable instance identity.
+    instance_id: String,
+    /// Runtime capability mode.
+    mode: RuntimeMode,
+    /// Durable state directory, unique per process and chain.
+    data_dir: String,
+}
+
+/// Chain values routinely set by the deployment operator.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NormalChainConfig {
+    /// Human-readable chain name.
+    name: String,
+    /// EVM chain ID.
+    chain_id: u64,
+    /// Morpho singleton address.
+    morpho_blue: String,
+    /// Multicall3 address.
+    multicall3: String,
+    /// Expected Multicall3 runtime code hash.
+    expected_multicall3_code_hash: String,
+    /// First block included in topology replay.
+    event_start_block: u64,
+    /// Role-scoped RPC references.
+    #[serde(rename = "providers")]
+    rpc: Vec<RpcConfig>,
+}
+
+/// Allocator-maintained safety, performance, and strategy policy.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvancedConfig {
+    /// Reconciliation timing.
+    node: AdvancedNodeConfig,
+    /// Chain/provider operational bounds.
+    chain: AdvancedChainConfig,
+    /// Exact snapshot policy.
+    snapshot: SnapshotConfig,
+    /// Transaction lifecycle and gas policy.
+    execution: ExecutionConfig,
+    /// Bounded solver limits.
+    solver: SolverConfig,
+    /// Rebalancing objective and activation thresholds.
+    strategy: StrategyConfig,
+}
+
+/// Allocator-maintained reconciliation timing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvancedNodeConfig {
+    /// Full exact reconciliation cadence.
+    #[serde(with = "humantime_serde")]
+    full_reconciliation_interval: Duration,
+    /// Full topology reconciliation cadence.
+    #[serde(with = "humantime_serde")]
+    topology_reconciliation_interval: Duration,
+}
+
+/// Allocator-maintained chain operational bounds.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvancedChainConfig {
+    /// Maximum range per log query, chosen for the configured providers.
+    maximum_log_range: u64,
+    /// Maximum canonical rewind search.
+    reorg_rescan_blocks: u64,
+    /// Transaction-inclusion opportunity policy.
+    block_opportunity_policy: BlockOpportunityPolicy,
+}
+
+impl ConfigDocument {
+    fn into_app_config(self) -> AppConfig {
+        AppConfig {
+            schema_version: self.schema_version,
+            node: NodeConfig {
+                instance_id: self.normal.node.instance_id,
+                mode: self.normal.node.mode,
+                data_dir: self.normal.node.data_dir,
+                full_reconciliation_interval: self.advanced.node.full_reconciliation_interval,
+                topology_reconciliation_interval: self
+                    .advanced
+                    .node
+                    .topology_reconciliation_interval,
+            },
+            chain: ChainConfig {
+                name: self.normal.chain.name,
+                chain_id: self.normal.chain.chain_id,
+                morpho_blue: self.normal.chain.morpho_blue,
+                multicall3: self.normal.chain.multicall3,
+                expected_multicall3_code_hash: self.normal.chain.expected_multicall3_code_hash,
+                event_start_block: self.normal.chain.event_start_block,
+                maximum_log_range: self.advanced.chain.maximum_log_range,
+                reorg_rescan_blocks: self.advanced.chain.reorg_rescan_blocks,
+                block_opportunity_policy: self.advanced.chain.block_opportunity_policy,
+                rpc: self.normal.chain.rpc,
+            },
+            snapshot: self.advanced.snapshot,
+            execution: self.advanced.execution,
+            solver: self.advanced.solver,
+            strategy: self.advanced.strategy,
+            signing: self.normal.signing,
+            alerts: self.normal.alerts,
+            vault: self.normal.vault,
+        }
+    }
+}
+
+/// Raw application configuration after merging the strict normal/advanced envelope.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -74,6 +225,36 @@ pub enum RuntimeMode {
     Shadow,
     /// Sign only after all readiness gates pass.
     Execute,
+}
+
+/// Chain-specific policy for measuring transaction-inclusion opportunities.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BlockOpportunityPolicy {
+    /// Every canonical EVM block is an eligible inclusion opportunity.
+    EveryCanonicalBlock,
+    /// Only HyperEVM fast blocks are eligible; the signer must be opted out of big blocks.
+    HyperEvmFastBlocks {
+        /// Exact gas limit identifying a fast block.
+        gas_limit: u64,
+    },
+}
+
+impl BlockOpportunityPolicy {
+    /// Optional block gas limit used to count eligible canonical opportunities.
+    #[must_use]
+    pub const fn required_gas_limit(self) -> Option<u64> {
+        match self {
+            Self::EveryCanonicalBlock => None,
+            Self::HyperEvmFastBlocks { gas_limit } => Some(gas_limit),
+        }
+    }
+
+    /// Whether final preflight must query HyperEVM's signer lane state.
+    #[must_use]
+    pub const fn requires_hyper_evm_signer_lane_check(self) -> bool {
+        matches!(self, Self::HyperEvmFastBlocks { .. })
+    }
 }
 
 /// Raw process settings.
@@ -114,10 +295,8 @@ pub struct ChainConfig {
     pub maximum_log_range: u64,
     /// Maximum canonical rewind search.
     pub reorg_rescan_blocks: u64,
-    /// Fast-block transaction gas limit.
-    pub fast_block_gas_limit: u64,
-    /// Slow-block gas limit.
-    pub slow_block_gas_limit: u64,
+    /// Configured transaction-inclusion opportunity policy.
+    pub block_opportunity_policy: BlockOpportunityPolicy,
     /// Role-scoped RPC references.
     #[serde(rename = "providers")]
     pub rpc: Vec<RpcConfig>,
@@ -188,6 +367,9 @@ pub struct SnapshotConfig {
     pub maximum_signing_snapshot_age_blocks: u64,
     /// Bounded snapshot retries.
     pub maximum_snapshot_retries: u32,
+    /// Maximum allowed lag of the Solidity-visible timestamp behind the canonical RPC header.
+    #[serde(default)]
+    pub maximum_evm_timestamp_lag_seconds: u64,
     /// Maximum snapshot-to-sign delay.
     #[serde(with = "humantime_serde")]
     pub maximum_snapshot_to_sign_latency: Duration,
@@ -200,23 +382,23 @@ pub struct SnapshotConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
-    /// Expected inclusion in fast blocks.
-    pub expected_inclusion_fast_blocks: u64,
-    /// Maximum inclusion in fast blocks.
-    pub maximum_inclusion_fast_blocks: u64,
+    /// Expected inclusion in configured opportunities.
+    pub expected_inclusion_opportunities: u64,
+    /// Maximum inclusion in configured opportunities.
+    pub maximum_inclusion_opportunities: u64,
     /// Rate-plan pending horizon.
-    pub maximum_rate_rebalance_pending_fast_blocks: u64,
+    pub maximum_rate_rebalance_pending_opportunities: u64,
     /// Capital-plan pending horizon.
-    pub maximum_capital_deployment_pending_fast_blocks: u64,
+    pub maximum_capital_deployment_pending_opportunities: u64,
     /// Liquidity-plan pending horizon.
-    pub maximum_liquidity_maintenance_pending_fast_blocks: u64,
+    pub maximum_liquidity_maintenance_pending_opportunities: u64,
     /// Delay before rebroadcasting byte-identical durable signed bytes.
-    #[serde(default = "default_identical_rebroadcast_after_fast_blocks")]
-    pub identical_rebroadcast_after_fast_blocks: u64,
-    /// Replacement delay in fast blocks.
-    pub replacement_after_fast_blocks: u64,
-    /// Cancellation threshold in remaining fast blocks.
-    pub cancel_when_fast_blocks_remaining: u64,
+    #[serde(default = "default_identical_rebroadcast_after_opportunities")]
+    pub identical_rebroadcast_after_opportunities: u64,
+    /// Replacement delay in configured opportunities.
+    pub replacement_after_opportunities: u64,
+    /// Cancellation threshold in remaining configured opportunities.
+    pub cancel_when_opportunities_remaining: u64,
     /// Receipt confirmation depth in EVM blocks.
     pub receipt_confirmation_evm_blocks: u64,
     /// Maximum Vault V2 actions per transaction.
@@ -235,7 +417,7 @@ pub struct ExecutionConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SolverConfig {
-    /// Maximum evaluated nodes.
+    /// Maximum evaluated nodes per optimization pass.
     pub maximum_nodes: u64,
     /// Maximum amount candidates per position.
     pub maximum_amount_candidates_per_position: usize,
@@ -247,12 +429,14 @@ pub struct SolverConfig {
     pub allow_incomplete_rate_solver: bool,
 }
 
-/// Supported rate objective.
+/// Supported spread-equalization objective.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum StrategyObjective {
     /// Minimize configured spot borrow-rate spread.
     SpotBorrowRateSpread,
+    /// Minimize configured Morpho market utilization spread.
+    UtilizationSpread,
 }
 
 /// Raw strategy thresholds.
@@ -268,26 +452,44 @@ pub struct StrategyConfig {
     /// Integer-rounding tolerance above the target spread.
     #[serde(default = "default_target_tolerance_apr_bps")]
     pub target_tolerance_apr_bps: u32,
+    /// Utilization-strategy entry spread in utilization basis points.
+    #[serde(default = "default_utilization_entry_spread_bps")]
+    pub utilization_entry_spread_bps: u32,
+    /// Utilization-strategy target spread in utilization basis points.
+    #[serde(default = "default_utilization_target_spread_bps")]
+    pub utilization_target_spread_bps: u32,
+    /// Integer tolerance above the utilization target, in basis points.
+    #[serde(default)]
+    pub utilization_target_tolerance_bps: u32,
+    /// Minimum improvement required from a utilization plan, in basis points.
+    #[serde(default = "default_utilization_minimum_improvement_bps")]
+    pub utilization_minimum_improvement_bps: u32,
+    /// Allowed portfolio utilization-spread worsening, in basis points.
+    #[serde(default)]
+    pub utilization_portfolio_spread_tolerance_bps: u32,
     /// Required portfolio improvement.
     pub minimum_portfolio_improvement_apr_bps: u32,
     /// Required controllable-set improvement.
     pub minimum_controllable_improvement_apr_bps: u32,
     /// Portfolio comparison tolerance.
     pub portfolio_spread_tolerance_apr_bps: u32,
-    /// Short confirmation in fast blocks.
-    pub confirmation_fast_blocks: u64,
-    /// Immediate rate-episode movement budget in basis points.
+    /// Short confirmation in configured opportunities.
+    pub confirmation_opportunities: u64,
+    /// Per-plan share of the solver's full optimal movement, in basis points.
     pub immediate_tranche_bps: u32,
     /// Persistent confirmation duration.
     #[serde(with = "humantime_serde")]
     pub persistent_confirmation_duration: Duration,
-    /// Required independent rate events.
+    /// Required independent borrower-side events.
     pub minimum_independent_rate_events: u32,
     /// Minimum span between independent events.
     #[serde(with = "humantime_serde")]
     pub minimum_independent_event_span: Duration,
-    /// Minimum independent event rate impact.
+    /// Minimum independent event borrow-rate impact.
     pub minimum_independent_event_rate_impact_apr_bps: u32,
+    /// Minimum independent event utilization impact, in basis points.
+    #[serde(default = "default_utilization_minimum_event_impact_bps")]
+    pub minimum_independent_event_utilization_impact_bps: u32,
     /// Maximum rate episode lifetime.
     #[serde(with = "humantime_serde")]
     pub maximum_rate_episode_duration: Duration,
@@ -313,6 +515,9 @@ pub enum SigningConfig {
     LocalDevelopment {
         /// Environment variable containing the test key.
         private_key_env: String,
+        /// Exact chain ID explicitly authorized for test Execute mode.
+        #[serde(default)]
+        execute_chain_id: Option<u64>,
     },
 }
 
@@ -610,10 +815,8 @@ pub struct ValidatedChainConfig {
     pub maximum_log_range: u64,
     /// Reorg rescan bound.
     pub reorg_rescan_blocks: u64,
-    /// Fast gas limit.
-    pub fast_block_gas_limit: u64,
-    /// Slow gas limit.
-    pub slow_block_gas_limit: u64,
+    /// Transaction-inclusion opportunity policy.
+    pub block_opportunity_policy: BlockOpportunityPolicy,
     /// Sorted provider references.
     pub rpc: Vec<ValidatedRpcConfig>,
 }
@@ -650,6 +853,8 @@ pub struct ValidatedSnapshotConfig {
     pub maximum_signing_snapshot_age_blocks: u64,
     /// Retry bound.
     pub maximum_snapshot_retries: u32,
+    /// Maximum allowed Solidity-visible timestamp lag behind the canonical RPC header.
+    pub maximum_evm_timestamp_lag_seconds: u64,
     /// Snapshot-to-sign latency in milliseconds.
     pub maximum_snapshot_to_sign_latency_millis: u128,
     /// Sign-to-broadcast latency in milliseconds.
@@ -660,21 +865,21 @@ pub struct ValidatedSnapshotConfig {
 #[derive(Clone, Debug, Serialize)]
 pub struct ValidatedExecutionConfig {
     /// Expected inclusion.
-    pub expected_inclusion_fast_blocks: u64,
+    pub expected_inclusion_opportunities: u64,
     /// Maximum inclusion.
-    pub maximum_inclusion_fast_blocks: u64,
+    pub maximum_inclusion_opportunities: u64,
     /// Rate pending horizon.
-    pub maximum_rate_rebalance_pending_fast_blocks: u64,
+    pub maximum_rate_rebalance_pending_opportunities: u64,
     /// Capital pending horizon.
-    pub maximum_capital_deployment_pending_fast_blocks: u64,
+    pub maximum_capital_deployment_pending_opportunities: u64,
     /// Liquidity pending horizon.
-    pub maximum_liquidity_maintenance_pending_fast_blocks: u64,
+    pub maximum_liquidity_maintenance_pending_opportunities: u64,
     /// Byte-identical rebroadcast delay.
-    pub identical_rebroadcast_after_fast_blocks: u64,
+    pub identical_rebroadcast_after_opportunities: u64,
     /// Replacement delay.
-    pub replacement_after_fast_blocks: u64,
+    pub replacement_after_opportunities: u64,
     /// Cancellation threshold.
-    pub cancel_when_fast_blocks_remaining: u64,
+    pub cancel_when_opportunities_remaining: u64,
     /// Receipt depth.
     pub receipt_confirmation_evm_blocks: u64,
     /// Action bound.
@@ -692,7 +897,7 @@ pub struct ValidatedExecutionConfig {
 /// Canonical bounded solver policy.
 #[derive(Clone, Debug, Serialize)]
 pub struct SolverConfigCanonical {
-    /// Maximum nodes.
+    /// Maximum nodes per optimization pass.
     pub maximum_nodes: u64,
     /// Amount candidates per position.
     pub maximum_amount_candidates_per_position: usize,
@@ -704,7 +909,7 @@ pub struct SolverConfigCanonical {
     pub allow_incomplete_rate_solver: bool,
 }
 
-/// Canonical strategy policy with exact per-second WAD rates.
+/// Canonical strategy policy with separate exact rate and utilization WAD domains.
 #[derive(Clone, Debug, Serialize)]
 pub struct ValidatedStrategyConfig {
     /// Objective.
@@ -715,6 +920,16 @@ pub struct ValidatedStrategyConfig {
     pub target_spread_rate_per_second: RatePerSecond,
     /// Convergence tolerance rounded down.
     pub target_tolerance_rate_per_second: RatePerSecond,
+    /// Utilization-strategy entry spread in WAD units.
+    pub utilization_entry_spread_wad: U256,
+    /// Utilization-strategy target spread in WAD units.
+    pub utilization_target_spread_wad: U256,
+    /// Utilization-strategy target tolerance in WAD units.
+    pub utilization_target_tolerance_wad: U256,
+    /// Utilization-strategy minimum improvement in WAD units.
+    pub utilization_minimum_improvement_wad: U256,
+    /// Utilization-strategy portfolio tolerance in WAD units.
+    pub utilization_portfolio_spread_tolerance_wad: U256,
     /// Minimum portfolio improvement rounded up.
     pub minimum_portfolio_improvement_rate_per_second: RatePerSecond,
     /// Minimum controllable improvement rounded up.
@@ -722,8 +937,8 @@ pub struct ValidatedStrategyConfig {
     /// Portfolio tolerance rounded down.
     pub portfolio_spread_tolerance_rate_per_second: RatePerSecond,
     /// Fast-block confirmation count.
-    pub confirmation_fast_blocks: u64,
-    /// Immediate tranche basis points.
+    pub confirmation_opportunities: u64,
+    /// Per-plan share of the full optimal movement, in basis points.
     pub immediate_tranche_bps: u32,
     /// Persistent confirmation milliseconds.
     pub persistent_confirmation_duration_millis: u128,
@@ -733,6 +948,8 @@ pub struct ValidatedStrategyConfig {
     pub minimum_independent_event_span_millis: u128,
     /// Minimum event impact rounded up.
     pub minimum_independent_event_rate_impact: RatePerSecond,
+    /// Minimum independent event utilization impact in WAD units.
+    pub minimum_independent_event_utilization_impact_wad: U256,
     /// Episode duration milliseconds.
     pub maximum_rate_episode_duration_millis: u128,
     /// Extreme bypass policy.
@@ -741,6 +958,79 @@ pub struct ValidatedStrategyConfig {
     pub benefit_horizon_seconds: u64,
     /// Daily transaction bound.
     pub maximum_daily_transactions: u32,
+}
+
+impl ValidatedStrategyConfig {
+    /// Entry threshold in the selected objective's native WAD domain.
+    #[must_use]
+    pub fn entry_spread(&self) -> U256 {
+        match self.objective {
+            StrategyObjective::SpotBorrowRateSpread => self.entry_spread_rate_per_second.0,
+            StrategyObjective::UtilizationSpread => self.utilization_entry_spread_wad,
+        }
+    }
+
+    /// Target threshold in the selected objective's native WAD domain.
+    #[must_use]
+    pub fn target_spread(&self) -> U256 {
+        match self.objective {
+            StrategyObjective::SpotBorrowRateSpread => self.target_spread_rate_per_second.0,
+            StrategyObjective::UtilizationSpread => self.utilization_target_spread_wad,
+        }
+    }
+
+    /// Target tolerance in the selected objective's native WAD domain.
+    #[must_use]
+    pub fn target_tolerance(&self) -> U256 {
+        match self.objective {
+            StrategyObjective::SpotBorrowRateSpread => self.target_tolerance_rate_per_second.0,
+            StrategyObjective::UtilizationSpread => self.utilization_target_tolerance_wad,
+        }
+    }
+
+    /// Minimum accepted improvement for either frozen objective branch.
+    #[must_use]
+    pub fn minimum_improvement(&self, portfolio: bool) -> U256 {
+        match self.objective {
+            StrategyObjective::SpotBorrowRateSpread if portfolio => {
+                self.minimum_portfolio_improvement_rate_per_second.0
+            }
+            StrategyObjective::SpotBorrowRateSpread => {
+                self.minimum_controllable_improvement_rate_per_second.0
+            }
+            StrategyObjective::UtilizationSpread => self.utilization_minimum_improvement_wad,
+        }
+    }
+
+    /// Allowed portfolio spread worsening in the selected objective domain.
+    #[must_use]
+    pub fn portfolio_spread_tolerance(&self) -> U256 {
+        match self.objective {
+            StrategyObjective::SpotBorrowRateSpread => {
+                self.portfolio_spread_tolerance_rate_per_second.0
+            }
+            StrategyObjective::UtilizationSpread => self.utilization_portfolio_spread_tolerance_wad,
+        }
+    }
+
+    /// Minimum independent-event impact in the selected objective domain.
+    #[must_use]
+    pub fn minimum_independent_event_impact(&self) -> U256 {
+        match self.objective {
+            StrategyObjective::SpotBorrowRateSpread => self.minimum_independent_event_rate_impact.0,
+            StrategyObjective::UtilizationSpread => {
+                self.minimum_independent_event_utilization_impact_wad
+            }
+        }
+    }
+
+    /// Inclusive convergence threshold in the selected objective domain.
+    #[must_use]
+    pub fn convergence_spread(&self) -> U256 {
+        self.target_spread()
+            .checked_add(self.target_tolerance())
+            .unwrap_or(U256::MAX)
+    }
 }
 
 /// Canonical alert references.
@@ -926,6 +1216,12 @@ pub enum ConfigError {
     /// JSON parsing failed, including unknown fields and enum variants.
     #[error("invalid configuration JSON: {0}")]
     Parse(#[from] serde_json::Error),
+    /// YAML parsing failed, including unknown fields and enum variants.
+    #[error("invalid configuration YAML: {0}")]
+    Yaml(#[from] serde_saphyr::Error),
+    /// Configuration extension is not one of the supported strict formats.
+    #[error("configuration must use a .json, .yaml, or .yml extension")]
+    UnsupportedFormat,
     /// A named field violates a fail-closed invariant.
     #[error("invalid configuration field `{field}`: {reason}")]
     Validation {
@@ -943,10 +1239,20 @@ pub enum ConfigError {
 }
 
 impl AppConfig {
-    /// Loads raw JSON from `path`. Unknown fields and enum variants are rejected.
+    /// Loads strict JSON or YAML from `path`. Unknown fields and enum variants are rejected.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&text)?)
+        let document = match path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("json") => serde_json::from_str::<ConfigDocument>(&text)?,
+            Some("yaml" | "yml") => serde_saphyr::from_str::<ConfigDocument>(&text)?,
+            _ => return Err(ConfigError::UnsupportedFormat),
+        };
+        Ok(document.into_app_config())
     }
 
     /// Parses every address/amount, validates frozen invariants, sorts unordered inputs,
@@ -987,28 +1293,27 @@ impl AppConfig {
             event_start_block: self.chain.event_start_block,
             maximum_log_range: self.chain.maximum_log_range,
             reorg_rescan_blocks: self.chain.reorg_rescan_blocks,
-            fast_block_gas_limit: self.chain.fast_block_gas_limit,
-            slow_block_gas_limit: self.chain.slow_block_gas_limit,
+            block_opportunity_policy: self.chain.block_opportunity_policy,
             rpc,
         };
 
         let validated_execution = ValidatedExecutionConfig {
-            expected_inclusion_fast_blocks: self.execution.expected_inclusion_fast_blocks,
-            maximum_inclusion_fast_blocks: self.execution.maximum_inclusion_fast_blocks,
-            maximum_rate_rebalance_pending_fast_blocks: self
+            expected_inclusion_opportunities: self.execution.expected_inclusion_opportunities,
+            maximum_inclusion_opportunities: self.execution.maximum_inclusion_opportunities,
+            maximum_rate_rebalance_pending_opportunities: self
                 .execution
-                .maximum_rate_rebalance_pending_fast_blocks,
-            maximum_capital_deployment_pending_fast_blocks: self
+                .maximum_rate_rebalance_pending_opportunities,
+            maximum_capital_deployment_pending_opportunities: self
                 .execution
-                .maximum_capital_deployment_pending_fast_blocks,
-            maximum_liquidity_maintenance_pending_fast_blocks: self
+                .maximum_capital_deployment_pending_opportunities,
+            maximum_liquidity_maintenance_pending_opportunities: self
                 .execution
-                .maximum_liquidity_maintenance_pending_fast_blocks,
-            identical_rebroadcast_after_fast_blocks: self
+                .maximum_liquidity_maintenance_pending_opportunities,
+            identical_rebroadcast_after_opportunities: self
                 .execution
-                .identical_rebroadcast_after_fast_blocks,
-            replacement_after_fast_blocks: self.execution.replacement_after_fast_blocks,
-            cancel_when_fast_blocks_remaining: self.execution.cancel_when_fast_blocks_remaining,
+                .identical_rebroadcast_after_opportunities,
+            replacement_after_opportunities: self.execution.replacement_after_opportunities,
+            cancel_when_opportunities_remaining: self.execution.cancel_when_opportunities_remaining,
             receipt_confirmation_evm_blocks: self.execution.receipt_confirmation_evm_blocks,
             maximum_actions: self.execution.maximum_actions,
             maximum_signed_transaction_gas: self.execution.maximum_signed_transaction_gas,
@@ -1034,6 +1339,21 @@ impl AppConfig {
             target_tolerance_rate_per_second: apr_bps_to_rate_per_second_down(AprBps(
                 self.strategy.target_tolerance_apr_bps,
             ))?,
+            utilization_entry_spread_wad: utilization_bps_to_wad(
+                self.strategy.utilization_entry_spread_bps,
+            )?,
+            utilization_target_spread_wad: utilization_bps_to_wad(
+                self.strategy.utilization_target_spread_bps,
+            )?,
+            utilization_target_tolerance_wad: utilization_bps_to_wad(
+                self.strategy.utilization_target_tolerance_bps,
+            )?,
+            utilization_minimum_improvement_wad: utilization_bps_to_wad(
+                self.strategy.utilization_minimum_improvement_bps,
+            )?,
+            utilization_portfolio_spread_tolerance_wad: utilization_bps_to_wad(
+                self.strategy.utilization_portfolio_spread_tolerance_bps,
+            )?,
             minimum_portfolio_improvement_rate_per_second: apr_bps_to_rate_per_second_up(AprBps(
                 self.strategy.minimum_portfolio_improvement_apr_bps,
             ))?,
@@ -1043,7 +1363,7 @@ impl AppConfig {
             portfolio_spread_tolerance_rate_per_second: apr_bps_to_rate_per_second_down(AprBps(
                 self.strategy.portfolio_spread_tolerance_apr_bps,
             ))?,
-            confirmation_fast_blocks: self.strategy.confirmation_fast_blocks,
+            confirmation_opportunities: self.strategy.confirmation_opportunities,
             immediate_tranche_bps: self.strategy.immediate_tranche_bps,
             persistent_confirmation_duration_millis: self
                 .strategy
@@ -1057,6 +1377,10 @@ impl AppConfig {
             minimum_independent_event_rate_impact: apr_bps_to_rate_per_second_up(AprBps(
                 self.strategy.minimum_independent_event_rate_impact_apr_bps,
             ))?,
+            minimum_independent_event_utilization_impact_wad: utilization_bps_to_wad(
+                self.strategy
+                    .minimum_independent_event_utilization_impact_bps,
+            )?,
             maximum_rate_episode_duration_millis: self
                 .strategy
                 .maximum_rate_episode_duration
@@ -1069,9 +1393,6 @@ impl AppConfig {
         let now = current_unix_timestamp()?;
         let required_reward_validity = now
             .checked_add(self.strategy.benefit_horizon.as_secs())
-            .and_then(|timestamp| {
-                timestamp.checked_add(self.execution.maximum_inclusion_fast_blocks)
-            })
             .ok_or(ArithmeticError::Overflow)?;
 
         let mut vault_addresses = BTreeSet::new();
@@ -1121,6 +1442,7 @@ impl AppConfig {
                     .snapshot
                     .maximum_signing_snapshot_age_blocks,
                 maximum_snapshot_retries: self.snapshot.maximum_snapshot_retries,
+                maximum_evm_timestamp_lag_seconds: self.snapshot.maximum_evm_timestamp_lag_seconds,
                 maximum_snapshot_to_sign_latency_millis: self
                     .snapshot
                     .maximum_snapshot_to_sign_latency
@@ -1186,7 +1508,9 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
     }
     let signing_environment = match &config.signing {
         SigningConfig::RemoteSigner { endpoint_env } => endpoint_env,
-        SigningConfig::LocalDevelopment { private_key_env } => private_key_env,
+        SigningConfig::LocalDevelopment {
+            private_key_env, ..
+        } => private_key_env,
     };
     if signing_environment.trim().is_empty() {
         return Err(validation(
@@ -1194,22 +1518,61 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "signer environment-variable name must be non-empty",
         ));
     }
-    if config.node.mode == RuntimeMode::Execute
-        && matches!(config.signing, SigningConfig::LocalDevelopment { .. })
-        && !is_test_chain_id(config.chain.chain_id)
+    if config.alerts.telegram.enabled
+        && (config.alerts.telegram.bot_token_env.trim().is_empty()
+            || config.alerts.telegram.chat_id.trim().is_empty())
     {
         return Err(validation(
-            "signing",
-            "local-development Execute is forbidden outside the explicit test-chain allowlist",
+            "alerts.telegram",
+            "enabled Telegram requires non-empty token environment and chat ID",
         ));
     }
-    if config.chain.maximum_log_range == 0
-        || config.chain.maximum_log_range > 50
-        || config.chain.reorg_rescan_blocks == 0
+    if config.alerts.pagerduty.enabled
+        && config
+            .alerts
+            .pagerduty
+            .integration_key_env
+            .trim()
+            .is_empty()
     {
         return Err(validation(
+            "alerts.pagerduty",
+            "enabled PagerDuty requires a non-empty integration-key environment",
+        ));
+    }
+    if let SigningConfig::LocalDevelopment {
+        execute_chain_id, ..
+    } = &config.signing
+        && config.node.mode == RuntimeMode::Execute
+        && *execute_chain_id != Some(config.chain.chain_id)
+    {
+        return Err(validation(
+            "signing.execute_chain_id",
+            "local-development Execute requires an explicit exact chain-ID authorization",
+        ));
+    }
+    if config.chain.maximum_log_range == 0 || config.chain.reorg_rescan_blocks == 0 {
+        return Err(validation(
             "chain",
-            "log range must be in 1..=50 and reorg rescan must be positive",
+            "log range and reorg rescan must be positive",
+        ));
+    }
+    if config.snapshot.maximum_snapshot_retries == 0
+        || config.snapshot.maximum_evm_timestamp_lag_seconds > 60
+    {
+        return Err(validation(
+            "snapshot",
+            "snapshot retries must be positive and EVM timestamp lag may not exceed 60 seconds",
+        ));
+    }
+    if config.solver.maximum_nodes == 0
+        || config.solver.maximum_amount_candidates_per_position == 0
+        || config.solver.maximum_source_sets == 0
+        || config.solver.maximum_destination_sets == 0
+    {
+        return Err(validation(
+            "solver",
+            "all bounded-search limits must be positive",
         ));
     }
     let primary_roles = BTreeSet::from([
@@ -1220,16 +1583,21 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
         RpcRole::Submit,
         RpcRole::Receipt,
     ]);
-    let primary = config.chain.rpc.iter().find(|provider| {
-        provider.production_grade
-            && primary_roles
-                .iter()
-                .all(|role| provider.roles.contains(role))
-    });
-    let Some(primary) = primary else {
+    let primaries = config
+        .chain
+        .rpc
+        .iter()
+        .filter(|provider| {
+            provider.production_grade
+                && primary_roles
+                    .iter()
+                    .all(|role| provider.roles.contains(role))
+        })
+        .collect::<Vec<_>>();
+    let [primary] = primaries.as_slice() else {
         return Err(validation(
             "chain.rpc",
-            "a production-grade primary must own head/log/read/simulate/submit/receipt roles",
+            "exactly one production-grade primary must own every live runtime role",
         ));
     };
     let checkpoint_roles = BTreeSet::from([RpcRole::Checkpoint, RpcRole::Read, RpcRole::Receipt]);
@@ -1245,10 +1613,19 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "an independent checkpoint/read/receipt provider is required",
         ));
     }
-    if config.execution.maximum_signed_transaction_gas >= config.chain.fast_block_gas_limit {
+    if config.execution.maximum_signed_transaction_gas == 0 {
         return Err(validation(
             "execution.maximum_signed_transaction_gas",
-            "must be below the fast-block gas limit",
+            "must be positive",
+        ));
+    }
+    if let BlockOpportunityPolicy::HyperEvmFastBlocks { gas_limit } =
+        config.chain.block_opportunity_policy
+        && (gas_limit == 0 || config.execution.maximum_signed_transaction_gas >= gas_limit)
+    {
+        return Err(validation(
+            "chain.block_opportunity_policy.gas_limit",
+            "must exceed the maximum signed transaction gas",
         ));
     }
     let maximum_fee_per_gas = parse_u256(
@@ -1272,20 +1649,22 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "must be positive",
         ));
     }
-    if config.execution.maximum_rate_rebalance_pending_fast_blocks
-        > config.execution.maximum_inclusion_fast_blocks
+    if config
+        .execution
+        .maximum_rate_rebalance_pending_opportunities
+        > config.execution.maximum_inclusion_opportunities
     {
         return Err(validation(
-            "execution.maximum_rate_rebalance_pending_fast_blocks",
+            "execution.maximum_rate_rebalance_pending_opportunities",
             "rate pending horizon exceeds normal inclusion horizon",
         ));
     }
-    if config.execution.identical_rebroadcast_after_fast_blocks == 0
-        || config.execution.identical_rebroadcast_after_fast_blocks
-            > config.execution.replacement_after_fast_blocks
+    if config.execution.identical_rebroadcast_after_opportunities == 0
+        || config.execution.identical_rebroadcast_after_opportunities
+            > config.execution.replacement_after_opportunities
     {
         return Err(validation(
-            "execution.identical_rebroadcast_after_fast_blocks",
+            "execution.identical_rebroadcast_after_opportunities",
             "must be positive and no later than fee replacement",
         ));
     }
@@ -1300,6 +1679,22 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "entry spread must exceed target plus convergence tolerance",
         ));
     }
+    let utilization_convergence = config
+        .strategy
+        .utilization_target_spread_bps
+        .checked_add(config.strategy.utilization_target_tolerance_bps);
+    if config.strategy.utilization_entry_spread_bps > 10_000
+        || config.strategy.utilization_target_spread_bps > 10_000
+        || config.strategy.utilization_target_tolerance_bps > 10_000
+        || utilization_convergence.is_none_or(|convergence| {
+            config.strategy.utilization_entry_spread_bps <= convergence || convergence > 10_000
+        })
+    {
+        return Err(validation(
+            "strategy.utilization_entry_spread_bps",
+            "entry must be at most 10000 and exceed target plus tolerance",
+        ));
+    }
     if config.strategy.minimum_portfolio_improvement_apr_bps == 0
         || config.strategy.minimum_controllable_improvement_apr_bps == 0
     {
@@ -1308,18 +1703,31 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "portfolio and controllable improvements must be positive",
         ));
     }
+    if config.strategy.utilization_minimum_improvement_bps == 0
+        || config.strategy.utilization_minimum_improvement_bps > 10_000
+        || config.strategy.utilization_portfolio_spread_tolerance_bps > 10_000
+    {
+        return Err(validation(
+            "strategy.utilization_minimum_improvement_bps",
+            "minimum improvement must be in 1..=10000 and tolerance at most 10000",
+        ));
+    }
     if !(1..=10_000).contains(&config.strategy.immediate_tranche_bps) {
         return Err(validation(
             "strategy.immediate_tranche_bps",
             "must be in 1..=10000",
         ));
     }
-    if config.strategy.persistent_confirmation_duration.as_secs()
-        <= config.strategy.confirmation_fast_blocks
-    {
+    if config.strategy.confirmation_opportunities == 0 {
+        return Err(validation(
+            "strategy.confirmation_opportunities",
+            "must be positive",
+        ));
+    }
+    if config.strategy.persistent_confirmation_duration.is_zero() {
         return Err(validation(
             "strategy.persistent_confirmation_duration",
-            "must exceed short fast-block confirmation",
+            "must be positive",
         ));
     }
     if config.strategy.minimum_independent_rate_events < 2 {
@@ -1333,6 +1741,14 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             .strategy
             .minimum_independent_event_rate_impact_apr_bps
             == 0
+        || config
+            .strategy
+            .minimum_independent_event_utilization_impact_bps
+            == 0
+        || config
+            .strategy
+            .minimum_independent_event_utilization_impact_bps
+            > 10_000
     {
         return Err(validation(
             "strategy.independent_event",
@@ -1345,6 +1761,12 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
         return Err(validation(
             "strategy.maximum_rate_episode_duration",
             "must exceed persistent confirmation duration",
+        ));
+    }
+    if config.strategy.maximum_daily_transactions == 0 {
+        return Err(validation(
+            "strategy.maximum_daily_transactions",
+            "must be positive",
         ));
     }
     if config.node.mode == RuntimeMode::Execute
@@ -1381,6 +1803,28 @@ fn validate_vault(
 
     let minimum_action_assets =
         parse_u256("vault.minimum_action_assets", &vault.minimum_action_assets)?;
+    let maximum_movement_per_hour_assets = parse_u256(
+        "vault.maximum_movement_per_hour_assets",
+        &vault.maximum_movement_per_hour_assets,
+    )?;
+    let maximum_movement_per_day_assets = parse_u256(
+        "vault.maximum_movement_per_day_assets",
+        &vault.maximum_movement_per_day_assets,
+    )?;
+    let minimum_independent_event_assets = parse_u256(
+        "vault.minimum_independent_event_assets",
+        &vault.minimum_independent_event_assets,
+    )?;
+    if minimum_action_assets.is_zero()
+        || maximum_movement_per_hour_assets < minimum_action_assets
+        || maximum_movement_per_day_assets < maximum_movement_per_hour_assets
+        || minimum_independent_event_assets.is_zero()
+    {
+        return Err(validation(
+            "vault.movement_limits",
+            "minimum action and event amount must be positive, with hourly >= action and daily >= hourly",
+        ));
+    }
     let minimum_deposit_headroom_assets = parse_u256(
         "vault.minimum_deposit_headroom_assets",
         &vault.minimum_deposit_headroom_assets,
@@ -1430,6 +1874,12 @@ fn validate_vault(
         return Err(validation(
             "vault.rate_group",
             "group assets must satisfy minimum <= target <= maximum",
+        ));
+    }
+    if group.allow_cross_group_movement {
+        return Err(validation(
+            "vault.rate_group.allow_cross_group_movement",
+            "release one does not support cross-group movement",
         ));
     }
 
@@ -1618,6 +2068,16 @@ fn validate_vault(
         });
     }
     positions.sort_by_key(|position| position.position_key);
+    let active_positions = positions
+        .iter()
+        .filter(|position| position.mode == MarketMode::Active)
+        .count();
+    if vault.minimum_active_positions_after_economic_exit > active_positions {
+        return Err(validation(
+            "vault.minimum_active_positions_after_economic_exit",
+            "cannot exceed the configured Active position count",
+        ));
+    }
 
     Ok(ValidatedVaultConfig {
         name: vault.name,
@@ -1646,18 +2106,9 @@ fn validate_vault(
         )?,
         minimum_active_positions_after_economic_exit: vault
             .minimum_active_positions_after_economic_exit,
-        maximum_movement_per_hour_assets: parse_u256(
-            "vault.maximum_movement_per_hour_assets",
-            &vault.maximum_movement_per_hour_assets,
-        )?,
-        maximum_movement_per_day_assets: parse_u256(
-            "vault.maximum_movement_per_day_assets",
-            &vault.maximum_movement_per_day_assets,
-        )?,
-        minimum_independent_event_assets: parse_u256(
-            "vault.minimum_independent_event_assets",
-            &vault.minimum_independent_event_assets,
-        )?,
+        maximum_movement_per_hour_assets,
+        maximum_movement_per_day_assets,
+        minimum_independent_event_assets,
         minimum_atomic_exit_coverage_assets: parse_u256(
             "vault.minimum_atomic_exit_coverage_assets",
             &vault.minimum_atomic_exit_coverage_assets,
@@ -1745,7 +2196,7 @@ fn validate_reward_policy(
     if validity.is_some_and(|timestamp| timestamp < required_validity) {
         return Err(validation(
             "vault.position.reward_policy.valid_until_timestamp",
-            "reward evidence does not cover inclusion plus benefit horizon",
+            "reward evidence does not cover the configured benefit horizon",
         ));
     }
     Ok(())
@@ -1783,6 +2234,16 @@ pub fn apr_bps_to_rate_per_second_down(value: AprBps) -> Result<RatePerSecond, A
         .checked_mul(U256::from(SECONDS_PER_YEAR))
         .ok_or(ArithmeticError::Overflow)?;
     Ok(RatePerSecond(numerator / denominator))
+}
+
+/// Converts utilization basis points to exact WAD utilization units.
+///
+/// One basis point is one ten-thousandth of full utilization. `WAD` is exactly
+/// divisible by 10,000, so this conversion has no rounding.
+pub fn utilization_bps_to_wad(value: u32) -> Result<U256, ArithmeticError> {
+    U256::from(value)
+        .checked_mul(U256::from(WAD / 10_000_u64))
+        .ok_or(ArithmeticError::Overflow)
 }
 
 /// Returns Keccak-256 of canonical sorted validated JSON, excluding secret values and URLs.
@@ -1864,6 +2325,19 @@ mod tests {
         assert_eq!(
             apr_bps_to_rate_per_second_down(AprBps(0))?,
             RatePerSecond(U256::ZERO)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn utilization_basis_points_convert_exactly_to_wad() -> Result<(), ArithmeticError> {
+        assert_eq!(
+            utilization_bps_to_wad(10)?,
+            U256::from(1_000_000_000_000_000_u64)
+        );
+        assert_eq!(
+            utilization_bps_to_wad(25)?,
+            U256::from(2_500_000_000_000_000_u64)
         );
         Ok(())
     }

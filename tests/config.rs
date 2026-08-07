@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use alloy::primitives::B256;
 use morpho_v2_reallocator::config::{
-    AppConfig, ConfigError, RpcRole, RuntimeMode, SigningConfig, config_revision,
+    AppConfig, BlockOpportunityPolicy, ConfigError, RpcRole, RuntimeMode, SigningConfig,
+    StrategyObjective, config_revision,
 };
 
 fn example_path() -> PathBuf {
@@ -49,7 +50,39 @@ fn checked_in_hyperevm_vault_configuration_is_exact_and_complete() {
     };
     let vault = &validated.app.vaults[0];
     assert_eq!(validated.app.chain.chain_id, 999);
-    assert_eq!(validated.app.strategy.immediate_tranche_bps, 5_000);
+    assert_eq!(
+        validated.app.strategy.objective,
+        StrategyObjective::UtilizationSpread
+    );
+    assert_eq!(
+        validated.app.strategy.entry_spread(),
+        alloy::primitives::U256::from(2_500_000_000_000_000_u64)
+    );
+    assert_eq!(
+        validated.app.strategy.convergence_spread(),
+        alloy::primitives::U256::from(1_000_000_000_000_000_u64)
+    );
+    assert_eq!(
+        validated.app.strategy.entry_spread_rate_per_second.0,
+        morpho_v2_reallocator::config::apr_bps_to_rate_per_second_up(
+            morpho_v2_reallocator::domain::AprBps(10),
+        )
+        .unwrap_or_else(|error| panic!("10 bps conversion failed: {error}"))
+        .0,
+    );
+    assert_eq!(
+        validated.app.strategy.target_spread_rate_per_second.0,
+        morpho_v2_reallocator::config::apr_bps_to_rate_per_second_down(
+            morpho_v2_reallocator::domain::AprBps(5),
+        )
+        .unwrap_or_else(|error| panic!("5 bps conversion failed: {error}"))
+        .0,
+    );
+    assert_eq!(
+        validated.app.strategy.target_tolerance_rate_per_second.0,
+        alloy::primitives::U256::ZERO
+    );
+    assert_eq!(validated.app.strategy.immediate_tranche_bps, 9_000);
     assert_eq!(vault.positions.len(), 8);
     assert!(vault.liquidity_adapter.is_some());
 }
@@ -79,11 +112,32 @@ fn unknown_field_is_rejected() {
         Err(error) => panic!("cannot read fixture: {error}"),
     };
     let modified = text.replacen(
-        "\"schema_version\": 4,",
-        "\"schema_version\": 4,\n  \"unknown\": true,",
+        "\"schema_version\": 6,",
+        "\"schema_version\": 6,\n  \"unknown\": true,",
         1,
     );
-    assert!(serde_json::from_str::<AppConfig>(&modified).is_err());
+    let file = match tempfile::Builder::new().suffix(".json").tempfile() {
+        Ok(file) => file,
+        Err(error) => panic!("temporary configuration must open: {error}"),
+    };
+    if let Err(error) = std::fs::write(file.path(), modified) {
+        panic!("temporary configuration must write: {error}");
+    }
+    assert!(AppConfig::load(file.path()).is_err());
+}
+
+#[test]
+fn commented_yaml_and_json_produce_the_same_canonical_configuration() {
+    let json = match AppConfig::load(&example_path()).and_then(AppConfig::validate) {
+        Ok(config) => config,
+        Err(error) => panic!("JSON example must validate: {error}"),
+    };
+    let yaml_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.yaml");
+    let yaml = match AppConfig::load(&yaml_path).and_then(AppConfig::validate) {
+        Ok(config) => config,
+        Err(error) => panic!("commented YAML example must validate: {error}"),
+    };
+    assert_eq!(json.revision, yaml.revision);
 }
 
 #[test]
@@ -122,6 +176,47 @@ fn invalid_strategy_bounds_are_rejected() {
     );
 
     let mut config = raw_example();
+    config.strategy.utilization_entry_spread_bps = 10;
+    config.strategy.utilization_target_spread_bps = 10;
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("utilization entry at target must fail"),
+            Err(error) => error,
+        },
+        "strategy.utilization_entry_spread_bps",
+    );
+
+    let mut config = raw_example();
+    config.strategy.confirmation_opportunities = 0;
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("zero confirmation opportunities must fail"),
+            Err(error) => error,
+        },
+        "strategy.confirmation_opportunities",
+    );
+
+    let mut config = raw_example();
+    config.strategy.persistent_confirmation_duration = std::time::Duration::ZERO;
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("zero persistent confirmation duration must fail"),
+            Err(error) => error,
+        },
+        "strategy.persistent_confirmation_duration",
+    );
+
+    let mut config = raw_example();
+    config.strategy.maximum_daily_transactions = 0;
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("zero daily transaction limit must fail"),
+            Err(error) => error,
+        },
+        "strategy.maximum_daily_transactions",
+    );
+
+    let mut config = raw_example();
     config.node.mode = RuntimeMode::Execute;
     config.strategy.extreme_spread_bypass_enabled = true;
     assert_field(
@@ -136,29 +231,54 @@ fn invalid_strategy_bounds_are_rejected() {
 #[test]
 fn gas_and_pending_horizons_are_rejected() {
     let mut config = raw_example();
-    config.execution.maximum_signed_transaction_gas = config.chain.fast_block_gas_limit;
+    config.chain.block_opportunity_policy = BlockOpportunityPolicy::HyperEvmFastBlocks {
+        gas_limit: config.execution.maximum_signed_transaction_gas,
+    };
     assert_field(
         match config.validate() {
             Ok(_) => panic!("gas at fast limit must fail"),
             Err(error) => error,
         },
-        "execution.maximum_signed_transaction_gas",
+        "chain.block_opportunity_policy.gas_limit",
     );
 
     let mut config = raw_example();
-    config.execution.maximum_inclusion_fast_blocks = 2;
-    config.execution.maximum_rate_rebalance_pending_fast_blocks = 3;
+    config.execution.maximum_inclusion_opportunities = 2;
+    config
+        .execution
+        .maximum_rate_rebalance_pending_opportunities = 3;
     assert_field(
         match config.validate() {
             Ok(_) => panic!("long rate horizon must fail"),
             Err(error) => error,
         },
-        "execution.maximum_rate_rebalance_pending_fast_blocks",
+        "execution.maximum_rate_rebalance_pending_opportunities",
     );
 }
 
 #[test]
-fn provider_roles_and_hyperevm_log_bound_are_rejected() {
+fn zero_solver_bounds_are_rejected() {
+    let clearers: [fn(&mut AppConfig); 4] = [
+        |config: &mut AppConfig| config.solver.maximum_nodes = 0,
+        |config: &mut AppConfig| config.solver.maximum_amount_candidates_per_position = 0,
+        |config: &mut AppConfig| config.solver.maximum_source_sets = 0,
+        |config: &mut AppConfig| config.solver.maximum_destination_sets = 0,
+    ];
+    for clear in clearers {
+        let mut config = raw_example();
+        clear(&mut config);
+        assert_field(
+            match config.validate() {
+                Ok(_) => panic!("zero solver bound must fail"),
+                Err(error) => error,
+            },
+            "solver",
+        );
+    }
+}
+
+#[test]
+fn provider_roles_and_zero_log_bound_are_rejected() {
     let mut config = raw_example();
     config.chain.rpc[0]
         .roles
@@ -184,10 +304,10 @@ fn provider_roles_and_hyperevm_log_bound_are_rejected() {
     );
 
     let mut config = raw_example();
-    config.chain.maximum_log_range = 51;
+    config.chain.maximum_log_range = 0;
     assert_field(
         match config.validate() {
-            Ok(_) => panic!("official log range above 50 must fail"),
+            Ok(_) => panic!("zero log range must fail"),
             Err(error) => error,
         },
         "chain",
@@ -222,6 +342,7 @@ fn signer_and_rate_group_invariants_are_rejected() {
     let mut config = raw_example();
     config.signing = SigningConfig::LocalDevelopment {
         private_key_env: " ".to_owned(),
+        execute_chain_id: None,
     };
     assert_field(
         match config.validate() {
@@ -251,21 +372,79 @@ fn signer_and_rate_group_invariants_are_rejected() {
         },
         "vault.rate_group",
     );
+
+    let mut config = raw_example();
+    config.vault[0].rate_group[0].allow_cross_group_movement = true;
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("cross-group release-one policy must fail"),
+            Err(error) => error,
+        },
+        "vault.rate_group.allow_cross_group_movement",
+    );
+
+    let mut config = raw_example();
+    config.vault[0].minimum_active_positions_after_economic_exit = usize::MAX;
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("impossible active-position floor must fail"),
+            Err(error) => error,
+        },
+        "vault.minimum_active_positions_after_economic_exit",
+    );
+
+    let mut config = raw_example();
+    config.vault[0].maximum_movement_per_hour_assets = "0".to_owned();
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("hourly movement below minimum action must fail"),
+            Err(error) => error,
+        },
+        "vault.movement_limits",
+    );
 }
 
 #[test]
-fn local_development_execute_is_rejected_on_hyperevm_mainnet() {
+fn local_development_execute_requires_exact_configured_chain_authorization() {
     let mut config = raw_example();
     config.node.mode = RuntimeMode::Execute;
     config.signing = SigningConfig::LocalDevelopment {
         private_key_env: "TEST_PRIVATE_KEY".to_owned(),
+        execute_chain_id: None,
     };
     assert_field(
         match config.validate() {
-            Ok(_) => panic!("mainnet local signer must fail"),
+            Ok(_) => panic!("local Execute without an exact chain authorization must fail"),
             Err(error) => error,
         },
-        "signing",
+        "signing.execute_chain_id",
+    );
+
+    let mut config = raw_example();
+    config.node.mode = RuntimeMode::Execute;
+    config.signing = SigningConfig::LocalDevelopment {
+        private_key_env: "TEST_PRIVATE_KEY".to_owned(),
+        execute_chain_id: Some(config.chain.chain_id),
+    };
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn execute_allows_disabled_alert_transports_but_enabled_telegram_requires_a_destination() {
+    let mut config = raw_example();
+    config.node.mode = RuntimeMode::Execute;
+    config.alerts.telegram.enabled = false;
+    config.alerts.pagerduty.enabled = false;
+    assert!(config.validate().is_ok());
+
+    let mut config = raw_example();
+    config.alerts.telegram.chat_id.clear();
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("enabled Telegram without a destination must fail"),
+            Err(error) => error,
+        },
+        "alerts.telegram",
     );
 }
 

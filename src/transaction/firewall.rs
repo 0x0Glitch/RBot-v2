@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::{
     config::{ValidatedConfig, ValidatedExecutionConfig, ValidatedVaultConfig},
-    domain::{PlanReason, PositionKey, V2Action, V2Plan, VaultAddress},
+    domain::{PlanId, PlanReason, PositionKey, V2Action, V2Plan, VaultAddress},
     transaction::{decoder::decode_routine_calldata, encoder::encode_validated_plan},
 };
 
@@ -131,6 +131,18 @@ pub fn canonical_plan_hash(plan: &V2Plan) -> Result<alloy::primitives::B256, Fir
         .map_err(|_| FirewallError::Serialization)
 }
 
+/// Computes the deterministic semantic plan identifier with both identity
+/// fields cleared, independently of planner-local construction.
+pub fn canonical_plan_id(plan: &V2Plan) -> Result<PlanId, FirewallError> {
+    let mut canonical = plan.clone();
+    canonical.plan_id = PlanId(alloy::primitives::B256::ZERO);
+    canonical.plan_hash = alloy::primitives::B256::ZERO;
+    serde_json::to_vec(&canonical)
+        .map(keccak256)
+        .map(PlanId)
+        .map_err(|_| FirewallError::Serialization)
+}
+
 /// Validates the semantic plan before any transaction bytes may be created.
 pub fn validate_plan(
     plan: V2Plan,
@@ -144,6 +156,7 @@ pub fn validate_plan(
         .ok_or(FirewallError::Context)?;
     if plan.config_revision != config.revision
         || plan.snapshot.static_config_revision != config.revision
+        || plan.snapshot.chain_id != config.app.chain.chain_id
     {
         return Err(FirewallError::PlanHash);
     }
@@ -177,17 +190,29 @@ fn validate_plan_integrity(
     maximum_actions: usize,
 ) -> Result<ValidatedPlan, FirewallError> {
     if plan.topology_revision != plan.snapshot.dynamic_topology_revision
+        || plan.plan_id != canonical_plan_id(&plan)?
         || plan.plan_hash != canonical_plan_hash(&plan)?
     {
         return Err(FirewallError::PlanHash);
     }
     if !plan.solver_certificate.search_complete_for_lattice
         || plan.solver_certificate.nodes_evaluated > plan.solver_certificate.node_limit
-        || (plan.reason == PlanReason::RateRebalance
-            && (plan.episode_id.is_none()
-                || plan.solver_certificate.rate_episode_id
-                    != plan.episode_id.map(|episode| episode.0)))
-        || (plan.reason != PlanReason::RateRebalance && plan.episode_id.is_some())
+        || match plan.reason {
+            PlanReason::RateRebalance => {
+                plan.episode_id.is_none()
+                    || plan.solver_certificate.rate_episode_id
+                        != plan.episode_id.map(|episode| episode.0)
+                    || plan.solver_certificate.objective_branch.is_none()
+            }
+            PlanReason::CapitalDeployment | PlanReason::LiquidityMaintenance => {
+                plan.episode_id.is_some()
+                    || plan.solver_certificate.rate_episode_id.is_some()
+                    || plan.solver_certificate.objective_branch.is_some()
+                    || plan.solver_certificate.target_reachable
+                    || plan.solver_certificate.target_reached
+            }
+            PlanReason::PositionSyncRequired => true,
+        }
     {
         return Err(FirewallError::Solver);
     }
@@ -250,7 +275,9 @@ fn validate_actions(
                 || (!is_allocation
                     && !matches!(
                         configured.mode,
-                        crate::domain::MarketMode::Active | crate::domain::MarketMode::SourceOnly
+                        crate::domain::MarketMode::Active
+                            | crate::domain::MarketMode::SourceOnly
+                            | crate::domain::MarketMode::Disabled
                     ))
             {
                 return Err(FirewallError::Action);
@@ -268,6 +295,40 @@ fn validate_actions(
         || plan.projection.immediate_loss_assets > vault.maximum_immediate_rebalance_loss_assets
     {
         return Err(FirewallError::Action);
+    }
+    match plan.reason {
+        PlanReason::RateRebalance => {
+            if deallocated.is_zero()
+                || allocated.is_zero()
+                || deallocated != allocated
+                || plan.projection.after_spread >= plan.projection.before_spread
+            {
+                return Err(FirewallError::Action);
+            }
+        }
+        PlanReason::CapitalDeployment => {
+            if allocated.is_zero()
+                || allocated < deallocated
+                || plan.actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        V2Action::Deallocate { position, .. }
+                            if vault
+                                .liquidity_adapter
+                                .as_ref()
+                                .is_none_or(|liquidity| liquidity.position_key != *position)
+                    )
+                })
+            {
+                return Err(FirewallError::Action);
+            }
+        }
+        PlanReason::LiquidityMaintenance => {
+            if allocated.is_zero() || (!deallocated.is_zero() && deallocated != allocated) {
+                return Err(FirewallError::Action);
+            }
+        }
+        PlanReason::PositionSyncRequired => return Err(FirewallError::Action),
     }
     Ok(())
 }

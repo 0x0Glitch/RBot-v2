@@ -55,9 +55,12 @@ struct PositionSimulation {
 /// Mutable exact state for one sequential candidate simulation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimulationState {
+    /// Canonical timestamp represented by every projected value in this state.
+    projection_timestamp: u64,
     /// Current projected market states.
     pub markets: BTreeMap<MarketId, ProjectedMarketState>,
     positions: BTreeMap<PositionKey, PositionSimulation>,
+    initial_position_assets: BTreeMap<PositionKey, U256>,
     liquidity_adapter: Option<VaultV1LiquidityAdapterState>,
     /// Current recorded allocation for every cap.
     pub cap_ledger: BTreeMap<CapRef, U256>,
@@ -171,8 +174,10 @@ impl SimulationState {
             )?;
         }
         Ok(Self {
+            projection_timestamp: projection.head.timestamp,
             markets: projection.markets.clone(),
             positions,
+            initial_position_assets: projection.vault.position_expected_assets.clone(),
             liquidity_adapter: snapshot.liquidity_adapter.clone(),
             cap_ledger: snapshot
                 .caps
@@ -220,12 +225,59 @@ impl SimulationState {
             .liquidity_adapter
             .as_ref()
             .map_or(U256::ZERO, |adapter| adapter.real_assets);
+        let retained_active_positions = config
+            .positions
+            .iter()
+            .filter(|configured| configured.mode == MarketMode::Active)
+            .filter(|configured| {
+                self.positions
+                    .get(&configured.position_key)
+                    .is_some_and(|position| !position.internal_shares.is_zero())
+            })
+            .count();
+        let mut group_assets = U256::ZERO;
         for configured in &config.positions {
             let position = self
                 .positions
                 .get(&configured.position_key)
                 .ok_or(SimulationError::IncompleteState)?;
-            if position.expected_assets < configured.minimum_position_assets
+            group_assets = group_assets
+                .checked_add(position.expected_assets)
+                .ok_or(SimulationError::Arithmetic)?;
+            let previous = snapshot
+                .positions
+                .get(&configured.position_key)
+                .ok_or(SimulationError::IncompleteState)?;
+            let complete_exit =
+                !previous.internal_supply_shares.is_zero() && position.internal_shares.is_zero();
+            if complete_exit {
+                let is_liquidity_path = configured.adapter.0 == snapshot.parent.liquidity_adapter
+                    && crate::domain::encode_adapter_data(&configured.market_params)
+                        == snapshot.parent.liquidity_data;
+                let policy_exit = matches!(
+                    configured.mode,
+                    MarketMode::SourceOnly | MarketMode::Disabled
+                );
+                let dust_exit = !is_liquidity_path
+                    && self
+                        .initial_position_assets
+                        .get(&configured.position_key)
+                        .is_some_and(|assets| {
+                            *assets <= configured.complete_exit_dust_threshold_assets
+                        });
+                let economic_exit = configured.mode == MarketMode::Active
+                    && configured.allow_active_complete_exit
+                    && retained_active_positions
+                        >= config.minimum_active_positions_after_economic_exit;
+                if !position.expected_assets.is_zero()
+                    || !position.recorded_market_allocation.is_zero()
+                    || !(policy_exit || dust_exit || economic_exit)
+                {
+                    return Err(SimulationError::ServiceConstraint);
+                }
+            }
+            if (!position.expected_assets.is_zero()
+                && position.expected_assets < configured.minimum_position_assets)
                 || position.expected_assets > configured.maximum_position_assets
             {
                 return Err(SimulationError::ServiceConstraint);
@@ -241,9 +293,12 @@ impl SimulationState {
             let shared = self
                 .shared_liquidity
                 .remaining(TokenAddress(stored.params.loan_token))?;
-            if market.accounting_liquidity < configured.minimum_source_liquidity_assets
-                || market.utilization > configured.maximum_source_utilization_wad
-                || shared < config.minimum_source_token_liquidity_assets
+            let source_eligible = !position.internal_shares.is_zero()
+                && matches!(configured.mode, MarketMode::Active | MarketMode::SourceOnly);
+            if source_eligible
+                && (market.accounting_liquidity < configured.minimum_source_liquidity_assets
+                    || market.utilization > configured.maximum_source_utilization_wad
+                    || shared < config.minimum_source_token_liquidity_assets)
             {
                 return Err(SimulationError::ServiceConstraint);
             }
@@ -253,10 +308,194 @@ impl SimulationState {
                     .ok_or(SimulationError::Arithmetic)?;
             }
         }
+        if group_assets < config.rate_group.minimum_assets
+            || group_assets > config.rate_group.maximum_assets
+        {
+            return Err(SimulationError::ServiceConstraint);
+        }
         if liquidity_adapter_assets < config.minimum_liquidity_adapter_assets {
             return Err(SimulationError::ServiceConstraint);
         }
+        let parent_total_assets = self.parent_total_assets(snapshot)?;
+        if self.maximum_executable_deposit(snapshot, config, parent_total_assets)?
+            < config.minimum_deposit_headroom_assets
+            || self.atomic_exit_coverage(snapshot, config)?
+                < config.minimum_atomic_exit_coverage_assets
+        {
+            return Err(SimulationError::ServiceConstraint);
+        }
         Ok(())
+    }
+
+    fn parent_total_assets(&self, snapshot: &ExactVaultSnapshot) -> Result<U256, SimulationError> {
+        let mut parent = snapshot.parent.clone();
+        parent.idle_assets = self.vault_idle;
+        Ok(accrue_parent_view(
+            &parent,
+            &adapter_real_assets(self, snapshot)?,
+            self.projection_timestamp,
+        )?
+        .total_assets)
+    }
+
+    fn maximum_executable_deposit(
+        &self,
+        snapshot: &ExactVaultSnapshot,
+        config: &ValidatedVaultConfig,
+        parent_total_assets: U256,
+    ) -> Result<U256, SimulationError> {
+        let upper = config.deposit_headroom_search_upper_bound_assets;
+        if upper.is_zero()
+            || !snapshot.parent.receive_shares_gate.is_zero()
+            || !snapshot.parent.send_assets_gate.is_zero()
+        {
+            return Ok(U256::ZERO);
+        }
+        if snapshot.parent.liquidity_adapter.is_zero() {
+            return Ok(upper.min(U256::from(u128::MAX).saturating_sub(parent_total_assets)));
+        }
+        if let Some(liquidity) = &self.liquidity_adapter {
+            let reference = CapRef {
+                vault: config.address,
+                id: liquidity.adapter_id,
+            };
+            let recorded = self
+                .cap_ledger
+                .get(&reference)
+                .copied()
+                .ok_or(SimulationError::IncompleteState)?;
+            let cap = snapshot
+                .caps
+                .get(&reference)
+                .ok_or(SimulationError::IncompleteState)?;
+            return monotone_maximum(upper.min(liquidity.max_deposit), |assets| {
+                let Some(total_assets_after_deposit) = parent_total_assets.checked_add(assets)
+                else {
+                    return Ok(false);
+                };
+                if total_assets_after_deposit > U256::from(u128::MAX) {
+                    return Ok(false);
+                }
+                let Ok(transition) = crate::morpho::vault_v1_adapter::allocate(liquidity, assets)
+                else {
+                    return Ok(false);
+                };
+                let allocation = apply_delta(recorded, transition.allocation_change)?;
+                Ok(validate_allocation_cap(cap, total_assets_after_deposit, allocation).is_ok())
+            });
+        }
+        let configured = config
+            .positions
+            .iter()
+            .find(|position| {
+                position.adapter.0 == snapshot.parent.liquidity_adapter
+                    && crate::domain::encode_adapter_data(&position.market_params)
+                        == snapshot.parent.liquidity_data
+            })
+            .ok_or(SimulationError::IncompleteState)?;
+        let position = self
+            .positions
+            .get(&configured.position_key)
+            .ok_or(SimulationError::IncompleteState)?;
+        let stored = snapshot
+            .markets
+            .get(&position.market)
+            .ok_or(SimulationError::IncompleteState)?;
+        let market = self
+            .markets
+            .get(&position.market)
+            .ok_or(SimulationError::IncompleteState)?;
+        monotone_maximum(upper, |assets| {
+            let Some(total_assets_after_deposit) = parent_total_assets.checked_add(assets) else {
+                return Ok(false);
+            };
+            if total_assets_after_deposit > U256::from(u128::MAX) {
+                return Ok(false);
+            }
+            let Ok(transition) = allocate(
+                market,
+                position.internal_shares,
+                assets,
+                position.recorded_market_allocation,
+                stored.fee,
+                position.affected_caps,
+            ) else {
+                return Ok(false);
+            };
+            for reference in position.affected_caps {
+                let recorded = self
+                    .cap_ledger
+                    .get(&reference)
+                    .copied()
+                    .ok_or(SimulationError::IncompleteState)?;
+                let cap = snapshot
+                    .caps
+                    .get(&reference)
+                    .ok_or(SimulationError::IncompleteState)?;
+                let allocation = apply_delta(recorded, transition.allocation_change)?;
+                if validate_allocation_cap(cap, total_assets_after_deposit, allocation).is_err() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+    }
+
+    fn atomic_exit_coverage(
+        &self,
+        snapshot: &ExactVaultSnapshot,
+        config: &ValidatedVaultConfig,
+    ) -> Result<U256, SimulationError> {
+        let executable = if let Some(liquidity) = &self.liquidity_adapter {
+            liquidity.max_withdraw.min(liquidity.real_assets)
+        } else if snapshot.parent.liquidity_adapter.is_zero() {
+            U256::ZERO
+        } else {
+            let configured = config
+                .positions
+                .iter()
+                .find(|position| {
+                    position.adapter.0 == snapshot.parent.liquidity_adapter
+                        && crate::domain::encode_adapter_data(&position.market_params)
+                            == snapshot.parent.liquidity_data
+                })
+                .ok_or(SimulationError::IncompleteState)?;
+            let position = self
+                .positions
+                .get(&configured.position_key)
+                .ok_or(SimulationError::IncompleteState)?;
+            let market = self
+                .markets
+                .get(&position.market)
+                .ok_or(SimulationError::IncompleteState)?;
+            let stored = snapshot
+                .markets
+                .get(&position.market)
+                .ok_or(SimulationError::IncompleteState)?;
+            let upper = position
+                .expected_assets
+                .min(market.accounting_liquidity)
+                .min(
+                    self.shared_liquidity
+                        .remaining(TokenAddress(stored.params.loan_token))?,
+                );
+            monotone_maximum(upper, |assets| {
+                Ok(deallocate(
+                    market,
+                    position.internal_shares,
+                    assets,
+                    position.recorded_market_allocation,
+                    self.shared_liquidity
+                        .remaining(TokenAddress(stored.params.loan_token))?,
+                    stored.fee,
+                    position.affected_caps,
+                )
+                .is_ok())
+            })?
+        };
+        self.vault_idle
+            .checked_add(executable)
+            .ok_or(SimulationError::Arithmetic)
     }
 
     /// Projects the asset value of the pre-execution parent shares to a benefit horizon.
@@ -347,6 +586,32 @@ impl SimulationState {
         )
         .map_err(MathError::from)?)
     }
+}
+
+fn monotone_maximum(
+    upper: U256,
+    mut predicate: impl FnMut(U256) -> Result<bool, SimulationError>,
+) -> Result<U256, SimulationError> {
+    let mut low = U256::ZERO;
+    let mut high = upper;
+    while low < high {
+        let midpoint = low
+            .checked_add(
+                high.checked_sub(low)
+                    .and_then(|distance| distance.checked_add(U256::ONE))
+                    .ok_or(SimulationError::Arithmetic)?
+                    / U256::from(2_u8),
+            )
+            .ok_or(SimulationError::Arithmetic)?;
+        if predicate(midpoint)? {
+            low = midpoint;
+        } else {
+            high = midpoint
+                .checked_sub(U256::ONE)
+                .ok_or(SimulationError::Arithmetic)?;
+        }
+    }
+    Ok(low)
 }
 
 /// Projects the no-plan value of pre-execution shares to the same benefit horizon.
@@ -509,7 +774,10 @@ pub fn simulate_deallocation(
         .get(&key)
         .cloned()
         .ok_or(SimulationError::IncompleteState)?;
-    if !matches!(position.mode, MarketMode::Active | MarketMode::SourceOnly) {
+    if !matches!(
+        position.mode,
+        MarketMode::Active | MarketMode::SourceOnly | MarketMode::Disabled
+    ) {
         return Err(SimulationError::PositionMode);
     }
     if !snapshot.adapters.contains_key(&adapter) {

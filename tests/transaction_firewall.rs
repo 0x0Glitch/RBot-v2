@@ -28,7 +28,8 @@ use morpho_v2_reallocator::{
         fees::{signed_gas_limit, validate_replacement_fees},
         firewall::{
             FirewallError, RoutineTransactionFields, ValidatedPlan, canonical_plan_hash,
-            validate_historical_plan, validate_plan, validate_routine_transaction,
+            canonical_plan_id, validate_historical_plan, validate_plan,
+            validate_routine_transaction,
         },
         lifecycle::{
             RecoveryClassification, RecoveryFacts, classify_recovery, persist_unsigned_rebalance,
@@ -72,7 +73,7 @@ fn raw_plan(config: &ValidatedConfig) -> V2Plan {
     let position = &vault.positions[0];
     let amount = U256::from(1_000_000_u64);
     let mut plan = V2Plan {
-        plan_id: PlanId(B256::repeat_byte(0x71)),
+        plan_id: PlanId(B256::ZERO),
         reason: PlanReason::CapitalDeployment,
         vault: vault.address,
         snapshot: StateContext {
@@ -84,6 +85,7 @@ fn raw_plan(config: &ValidatedConfig) -> V2Plan {
                 timestamp: 1_800_000_000,
                 gas_limit: 10_000_000,
             },
+            evm_timestamp: 1_800_000_000,
             block_hash_binding: BlockHashBinding::Proven,
             static_config_revision: config.revision,
             dynamic_topology_revision: B256::repeat_byte(0x41),
@@ -116,6 +118,10 @@ fn raw_plan(config: &ValidatedConfig) -> V2Plan {
         episode_id: None,
         plan_hash: B256::ZERO,
     };
+    plan.plan_id = match canonical_plan_id(&plan) {
+        Ok(id) => id,
+        Err(error) => panic!("fixture plan ID must hash: {error}"),
+    };
     plan.plan_hash = match canonical_plan_hash(&plan) {
         Ok(hash) => hash,
         Err(error) => panic!("fixture plan must hash: {error}"),
@@ -131,6 +137,10 @@ fn validated_plan(config: &ValidatedConfig) -> ValidatedPlan {
 }
 
 fn rehash(plan: &mut V2Plan) {
+    plan.plan_id = match canonical_plan_id(plan) {
+        Ok(id) => id,
+        Err(error) => panic!("mutated fixture plan ID must hash: {error}"),
+    };
     plan.plan_hash = match canonical_plan_hash(plan) {
         Ok(hash) => hash,
         Err(error) => panic!("mutated fixture plan must hash: {error}"),
@@ -186,6 +196,7 @@ fn durable_snapshot(plan: &ValidatedPlan, config: &ValidatedConfig) -> ExactVaul
             required_dead_shares: U256::ONE,
         },
         adapters: BTreeMap::new(),
+        enabled_adapters: BTreeSet::new(),
         liquidity_adapter: None,
         positions: BTreeMap::new(),
         markets: BTreeMap::new(),
@@ -263,7 +274,7 @@ fn liquidity_adapter_uses_only_the_configured_address_and_empty_data() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.hyperevm.json");
     let config = match AppConfig::load(&path).and_then(AppConfig::validate) {
         Ok(config) => config,
-        Err(error) => panic!("HyperEVM config must validate: {error}"),
+        Err(error) => panic!("configured deployment must validate: {error}"),
     };
     let vault = &config.app.vaults[0];
     let liquidity = match &vault.liquidity_adapter {
@@ -527,6 +538,7 @@ async fn plan_nonce_and_signed_bytes_are_durable_before_envelope_is_returned() {
         Ok(transaction) => transaction,
         Err(error) => panic!("fixture transaction must validate: {error}"),
     };
+    let original = transaction.clone();
     let directory = match TempDir::new() {
         Ok(directory) => directory,
         Err(error) => panic!("temporary directory must open: {error}"),
@@ -578,6 +590,36 @@ async fn plan_nonce_and_signed_bytes_are_durable_before_envelope_is_returned() {
         Ok(None) => panic!("signed transaction must be durably unresolved"),
         Err(error) => panic!("recovery query must pass: {error}"),
     }
+    let cancellation = execute_pending_attempt(
+        &service.handle(),
+        &signer,
+        &HashingSubmitter,
+        &config.app.execution,
+        PendingAttemptRequest {
+            pending: ValidatedPendingTransaction::from_submitted(transaction_id, original),
+            expected_state: morpho_v2_reallocator::storage::models::TransactionState::Signed,
+            decision: PendingDecision::Cancel(CancellationReason::ProviderAmbiguity),
+            signer_request_id: B256::repeat_byte(0xb2),
+            max_fee_per_gas: 4_000_000_000,
+            max_priority_fee_per_gas: 2_000_000_000,
+            cancellation_gas_limit: 21_000,
+            created_at: 1_800_000_002,
+            signed_block: 12,
+        },
+    )
+    .await;
+    assert!(
+        cancellation.is_ok(),
+        "never-broadcast signed bytes must be cancellable: {cancellation:?}"
+    );
+    let unresolved = service.handle().load_unresolved(signer.0.address()).await;
+    assert!(matches!(
+        unresolved,
+        Ok(Some(row))
+            if row.state
+                == morpho_v2_reallocator::storage::models::TransactionState::CancellationSubmitted
+                && row.known_transaction_hashes.len() == 2
+    ));
     if let Err(error) = service.shutdown().await {
         panic!("storage must shut down: {error}");
     }
@@ -688,7 +730,7 @@ async fn replacement_and_cancellation_are_durable_before_each_broadcast() {
     };
     assert_eq!(
         unresolved_after_rejection.state,
-        morpho_v2_reallocator::storage::models::TransactionState::Submitted
+        morpho_v2_reallocator::storage::models::TransactionState::Replaced
     );
     assert_eq!(unresolved_after_rejection.known_transaction_hashes.len(), 2);
 
@@ -704,11 +746,11 @@ async fn replacement_and_cancellation_are_durable_before_each_broadcast() {
     let cancellation = execute_pending_attempt(
         &service.handle(),
         &signer,
-        &HashingSubmitter,
+        &IndeterminateSubmitter,
         &config.app.execution,
         PendingAttemptRequest {
             pending: replaced_pending,
-            expected_state: morpho_v2_reallocator::storage::models::TransactionState::Submitted,
+            expected_state: morpho_v2_reallocator::storage::models::TransactionState::Replaced,
             decision: PendingDecision::Cancel(CancellationReason::PendingHorizon),
             signer_request_id: B256::repeat_byte(0xc3),
             max_fee_per_gas: 4_000_000_000,
@@ -719,10 +761,10 @@ async fn replacement_and_cancellation_are_durable_before_each_broadcast() {
         },
     )
     .await;
-    assert!(
-        cancellation.is_ok(),
-        "cancellation failed: {cancellation:?}"
-    );
+    assert!(matches!(
+        cancellation,
+        Ok(PendingAttemptOutcome::SubmissionIndeterminate { .. })
+    ));
     let unresolved = service.handle().load_unresolved(signer.0.address()).await;
     let unresolved = match unresolved {
         Ok(Some(unresolved)) => unresolved,
