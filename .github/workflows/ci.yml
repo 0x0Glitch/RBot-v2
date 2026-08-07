@@ -46,7 +46,7 @@ jobs:
             sha256sum morpho-v2-reallocator release-manifest.json > SHA256SUMS
           )
       - name: Upload immutable Linux release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: morpho-v2-reallocator-linux-x86_64
           path: release-artifact/

@@ -984,6 +984,10 @@ async fn run_systemd_watchdog(
         .max(Duration::from_secs(1));
     let mut interval = tokio::time::interval(interval_duration);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Tokio intervals yield their first tick immediately. Consume it before
+    // sampling progress so healthy workers are not reported as stalled while
+    // completing their first startup cycle.
+    interval.tick().await;
     let mut previous = health.watchdog_heartbeats();
     let mut ready_notified = false;
     let mut storage_high_water_alerted = false;
