@@ -248,6 +248,47 @@ async fn forbidden_optional_block_receipts_are_treated_as_unsupported()
 }
 
 #[tokio::test]
+async fn transport_rate_limit_and_server_failures_are_retryable_and_secret_safe()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (status, expected) in [
+        (429_u16, RpcErrorCategory::RateLimited),
+        (503_u16, RpcErrorCategory::ServerUnavailable),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let provider = HttpProvider::new(
+            "outage".to_owned(),
+            Url::parse(&server.uri())?,
+            BTreeSet::from([ProviderRole::Head]),
+        )?;
+        let error = match provider.latest_header().await {
+            Ok(_) => panic!("HTTP outage must reject the read"),
+            Err(error) => error,
+        };
+        assert_eq!(error.rpc_category(), expected);
+        assert!(error.is_transient_outage());
+        assert!(!error.to_string().contains(&server.uri()));
+    }
+
+    let provider = HttpProvider::new(
+        "transport".to_owned(),
+        Url::parse("http://127.0.0.1:1")?,
+        BTreeSet::from([ProviderRole::Head]),
+    )?;
+    let error = match provider.latest_header().await {
+        Ok(_) => panic!("unreachable transport must reject the read"),
+        Err(error) => error,
+    };
+    assert_eq!(error.rpc_category(), RpcErrorCategory::TransportUnavailable);
+    assert!(error.is_transient_outage());
+    assert!(!error.to_string().contains("127.0.0.1"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn submission_errors_are_sanitized_into_recovery_categories()
 -> Result<(), Box<dyn std::error::Error>> {
     for (message, expected) in [

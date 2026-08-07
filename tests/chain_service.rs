@@ -35,6 +35,8 @@ struct FakeProvider {
     roles: BTreeSet<ProviderRole>,
     state: RwLock<FakeState>,
     header_reads: AtomicUsize,
+    log_reads: AtomicUsize,
+    log_failures_remaining: AtomicUsize,
 }
 
 impl FakeProvider {
@@ -55,6 +57,8 @@ impl FakeProvider {
                 block_receipts_supported: true,
             }),
             header_reads: AtomicUsize::new(0),
+            log_reads: AtomicUsize::new(0),
+            log_failures_remaining: AtomicUsize::new(0),
         }
     }
 
@@ -71,6 +75,8 @@ impl FakeProvider {
                 block_receipts_supported: true,
             }),
             header_reads: AtomicUsize::new(0),
+            log_reads: AtomicUsize::new(0),
+            log_failures_remaining: AtomicUsize::new(0),
         }
     }
 
@@ -89,6 +95,15 @@ impl FakeProvider {
 
     fn header_reads(&self) -> usize {
         self.header_reads.load(Ordering::Relaxed)
+    }
+
+    fn fail_next_log_queries(&self, attempts: usize) {
+        self.log_failures_remaining
+            .store(attempts, Ordering::Relaxed);
+    }
+
+    fn log_reads(&self) -> usize {
+        self.log_reads.load(Ordering::Relaxed)
     }
 }
 
@@ -143,6 +158,19 @@ impl ChainDataProvider for FakeProvider {
         to: u64,
         addresses: &[Address],
     ) -> Result<Vec<RpcLog>, ProviderError> {
+        self.log_reads.fetch_add(1, Ordering::Relaxed);
+        if self
+            .log_failures_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ProviderError::HttpStatus {
+                method: "eth_getLogs",
+                status: 429,
+            });
+        }
         let state = self.state.read().await;
         let address_set = addresses.iter().copied().collect::<BTreeSet<_>>();
         Ok(state
@@ -364,6 +392,79 @@ async fn latest_only_catch_up_retains_all_events_and_recent_reorg_window()
         handle.load_cursor(CHAIN_ID).await?.map(|head| head.number),
         Some(100)
     );
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn latest_only_log_retry_recovers_transiently_and_remains_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let watched = Address::with_last_byte(0x50);
+    let blocks = (10_u64..=100)
+        .map(|number| block(number, number as u8, number.saturating_sub(1) as u8))
+        .collect::<Vec<_>>();
+    let head = blocks.last().copied().ok_or("missing head fixture")?;
+
+    let baseline = Arc::new(FakeProvider::primary(blocks.clone(), vec![]));
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("baseline.json"), 32, 1)?;
+    let (send, _receive) = mpsc::channel(8);
+    let mut latest_config = config(watched, 4);
+    latest_config.latest_only = true;
+    latest_config.maximum_log_range = 1_000;
+    let chain = ChainService::new(
+        Arc::clone(&baseline),
+        None,
+        service.handle(),
+        send,
+        latest_config,
+    )?;
+    assert_eq!(chain.poll_once().await?.number, head.number);
+    let baseline_reads = baseline.log_reads();
+    service.shutdown().await?;
+
+    let recovering = Arc::new(FakeProvider::primary(blocks.clone(), vec![]));
+    recovering.fail_next_log_queries(2);
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("retry.json"), 32, 1)?;
+    let (send, _receive) = mpsc::channel(8);
+    let mut latest_config = config(watched, 4);
+    latest_config.latest_only = true;
+    latest_config.maximum_log_range = 1_000;
+    let chain = ChainService::new(
+        Arc::clone(&recovering),
+        None,
+        service.handle(),
+        send,
+        latest_config,
+    )?;
+    assert_eq!(chain.poll_once().await?.number, head.number);
+    assert_eq!(recovering.log_reads(), baseline_reads.saturating_add(2));
+    service.shutdown().await?;
+
+    let unavailable = Arc::new(FakeProvider::primary(blocks, vec![]));
+    unavailable.fail_next_log_queries(10);
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("bounded.json"), 32, 1)?;
+    let (send, _receive) = mpsc::channel(8);
+    let mut latest_config = config(watched, 4);
+    latest_config.latest_only = true;
+    latest_config.maximum_log_range = 1_000;
+    let chain = ChainService::new(
+        Arc::clone(&unavailable),
+        None,
+        service.handle(),
+        send,
+        latest_config,
+    )?;
+    assert!(matches!(
+        chain.poll_once().await,
+        Err(ChainError::Provider(ProviderError::HttpStatus {
+            method: "eth_getLogs",
+            status: 429,
+        }))
+    ));
+    assert_eq!(unavailable.log_reads(), 3);
     service.shutdown().await?;
     Ok(())
 }
