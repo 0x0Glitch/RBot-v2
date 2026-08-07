@@ -700,6 +700,15 @@ After a controlled systemd restart, the durable cursor advanced from block
 42,577,317 to 42,577,328, the unresolved transaction count remained zero, and
 the same Top-K plan was reconstructed from fresh state.
 
+The exact unsigned four-action allocator multicall was also simulated from the
+configured allocator address against both providers. The 1,604-byte calldata
+had runtime Keccak-256
+`0fa8ca542cef3f6fa4f9f6ed5fd4226b3fd84307b184727b2464bd2ca25c1766`;
+`eth_call` succeeded independently at blocks 42,578,676 and 42,578,677 with
+identical empty return data. This proves the live contracts and allocator role
+accept the current typed plan, while deliberately avoiding a state-changing
+transaction that fails the economic policy.
+
 ## 20. Problems encountered and how they were resolved
 
 ### 20.1 RPC endpoints initially pointed to the wrong chain
@@ -993,9 +1002,12 @@ Top-K therefore has a clear 40/40/20 target. The exact four-action estimate was
 931,662 gas and the signed limit with 15% headroom was 1,071,412 gas. With the
 0.1 gwei live quote, the signed initial fee is 0.2 gwei. The configured 3x gas
 multiplier and 100-USDC/HYPE ceiling require roughly 0.065 USDC of 24-hour gain,
-while the 39-USDC plan projects only about 0.0057 USDC. At unchanged rates, the
-same test requires roughly 455 USDC of direct capital to clear that conservative
-gate; use a larger risk-approved buffer because rates and gas can move.
+while the 39.001213-USDC direct portfolio projects only 0.005652 USDC. A live
+estimate at block 42,578,738 was 931,662 gas, producing the exact 1,071,412
+signed limit and a 65,290-unit required gain versus 5,652 units available. At
+unchanged rates, linear scaling requires about 450.528875 USDC of direct capital
+to clear that conservative gate; use at least 500 USDC as a risk-approved buffer
+because rates and gas can move.
 
 The local historical sample contained 85 exact snapshots over two short windows
 separated by about 23 hours. The same three markets remained selected; only the
