@@ -656,10 +656,12 @@ and protocol lock, installs a versioned directory, and atomically switches
 `/opt/morpho/current`. `deploy/morpho-v2-reallocator.service` provides restart,
 watchdog, filesystem, privilege, and writable-path boundaries.
 
-The previously running AWS Cargo/tmux instance is not evidence that this new
-runtime has been deployed. Production cutover requires a tagged CI artifact,
-verified manifest, backup, systemd installation, readiness check, and rollback
-exercise. No routine production deployment compiles on the host.
+The previous Cargo/tmux process has now been replaced by a CI-built, checksummed
+binary running directly under systemd. The live Shadow canary uses a versioned
+release directory, an atomic `/opt/morpho/current` symlink, a protected
+environment file, and durable state owned by the dedicated `morpho` user. A
+tagged `main` release and a complete rollback exercise remain release-governance
+requirements. No routine production deployment compiles on the host.
 
 ## 19. Live execution evidence
 
@@ -681,6 +683,22 @@ state.
 Because 25 USDC is tiny compared with existing market liquidity, utilization
 spread improved only from about 2,348.78 bps to 2,347.70 bps. This proves the
 end-to-end mechanism, not meaningful market-level equalization.
+
+The Top-K Shadow canary subsequently proved the event-driven path without
+submitting an allocator transaction:
+
+| Action | Block | Transaction | Result |
+| --- | ---: | --- | --- |
+| Approve 1 USDC | 42,576,630 | `0xf5afb70ffebd255062474d63df0b68cfb04e3482762c679c42a5426f53c75df9` | success on primary and independent RPC |
+| Deposit 1 USDC | 42,576,634 | `0x81b5bbdafe5002fb3963e9ba3d11f84547648775f07fbc2311014d2e3e35d2ae` | detected and replanned at block 42,576,635 |
+| Withdraw 1 USDC | 42,576,830 | `0x78630e4ad400c33a481b4828828a7480891ca5b1189292d7223083c80563bc0b` | detected and replanned at block 42,576,831 |
+
+The wallet and vault returned exactly to their starting state: 1 USDC in the
+wallet, 39 vault shares representing 39 USDC, and 40 USDC total vault assets.
+The five-minute canonical strategy tick also advanced independently of events.
+After a controlled systemd restart, the durable cursor advanced from block
+42,577,317 to 42,577,328, the unresolved transaction count remained zero, and
+the same Top-K plan was reconstructed from fresh state.
 
 ## 20. Problems encountered and how they were resolved
 
@@ -917,16 +935,14 @@ delta and positive recoverable-asset gain without conflating them.
 
 These are ordered by potential production impact, not implementation effort.
 
-### 21.1 Production artifact identity is still reported as `unknown`
+### 21.1 Release identity is verified, but promotion is not yet tagged
 
-The AWS source bundle has no local Git metadata, so build identity reports
-`unknown` even though the reviewed source commit is known. This does not change
-contract behavior, but weakens forensic traceability.
-
-**Recommended change:** set `MORPHO_V2_BUILD_REVISION` to the exact 40-character
-reviewed commit in the release wrapper, persist a release manifest containing
-source commit/config revision/protocol-lock digest/binary hash, and expose all
-four through health/metrics.
+CI now publishes an immutable Linux binary, release manifest, and checksums.
+The installed deployment manifest records the source revision, Cargo.lock hash,
+config revision, protocol-lock digest, binary SHA-256, build environment, release
+version, and deployment timestamp. Build metrics expose the same source
+revision. The remaining governance gap is that the canary comes from the
+reviewed PR merge result rather than a signed/tagged `main` release.
 
 ### 21.2 The reviewed branch is not merged to `main`
 
@@ -1062,12 +1078,13 @@ and does not construct arbitrary adapter data.
 general withdrawal-liquidity preparation flow into a separate tool with explicit
 adapter profiles and penalty ceilings?
 
-### 21.13 Atomic release tooling is implemented; live cutover is pending
+### 21.13 Live atomic cutover is complete; rollback drill remains
 
 CI release and systemd/install assets implement versioned directories, manifest
 verification, atomic `current` switching, direct binary execution, and readiness
-probing. A live cutover and rollback drill still must be performed before
-treating the AWS host as migrated.
+probing. The live cutover, graceful old-signer shutdown, and controlled systemd
+restart have passed. A deliberate rollback to a previous known-good immutable
+artifact still needs an operator drill before full production sign-off.
 
 ### 21.14 Disk and build-cache operations need a runbook
 
@@ -1137,19 +1154,20 @@ The current reviewed working tree passed:
 - HyperEVM protocol-lock validation
 - operator shell syntax checks
 
-Before the systemd migration changes, the previous live AWS runtime reported:
+The current systemd-managed AWS Shadow canary reports:
 
 ```json
 {
   "ready": true,
   "ready_for_observation": true,
   "ready_for_shadow": true,
-  "ready_for_execute": true,
-  "reasons": []
+  "ready_for_execute": false,
+  "reasons": ["non_execute_mode"]
 }
 ```
 
-That historical readiness proved its configured runtime gates were satisfied.
-It does not prove the current branch has been deployed and does not by itself
-close the remaining economic, infrastructure-independence, deployment,
-or external-review issues listed above.
+This proves live and Shadow readiness for the deployed artifact. Execute remains
+deliberately disabled because the current 40 USDC plan does not clear the
+conservative gas-versus-recoverable-gain gate. It does not close the remaining
+economic-scale, infrastructure-independence, rollback, or external-review issues
+listed above.
