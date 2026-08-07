@@ -1,10 +1,11 @@
 # Morpho Vault V2 Reallocator
 
 Production-oriented Rust service that rebalances configured Morpho Vault V2
-vaults. It reads exact canonical state, minimizes configured Morpho market rate
-spread, validates the resulting Vault V2 calls through an independent firewall,
-submits them through the allocator signer, and reconciles the canonical receipt
-and exact post-state. Durable runtime state is atomic JSON on disk.
+vaults. It reads exact canonical state, applies the configured per-vault
+allocation strategy, validates the resulting Vault V2 calls through an
+independent firewall, submits them through the allocator signer, and reconciles
+the canonical receipt and exact post-state. Durable runtime state is atomic JSON
+on disk.
 
 The binary contains no deployment addresses or chain-ID behavior switches. The
 same build works on EVM-compatible chains through strict YAML or JSON
@@ -50,17 +51,36 @@ The YAML template comments every non-obvious field, amount domain, and safety
 switch. YAML and JSON pass through the same strict schema, unknown keys are
 rejected, and both produce the same canonical configuration revision.
 
-`advanced.strategy.objective` selects one of two strategies:
+Each vault selects its routine policy with `strategy`:
+
+- `spread_equalization` uses `advanced.strategy.objective` to select one of the
+  existing equalization objectives.
+- `top_k_apy_diversified` uses exact native supply yield to maintain a
+  diversified three- or four-market allocation.
+
+The spread objectives are:
 
 - `spot_borrow_rate_spread` starts above 10 APR bps and targets 5 APR bps.
 - `utilization_spread` starts above a 25 bps utilization gap and targets a gap
   of 10 bps or less. Here 10 bps means 0.10 percentage points of utilization,
   not APR.
 
-Both strategies find the best valid movement in their own integer domain,
-execute at most 90% of that movement, wait on the five-second execution cadence,
-read exact canonical state again, and repeat only if needed. Block counts are
-never treated as seconds; interest, rate, and utilization calculations use the
+The Top-K policy ranks the minimum of current supply yield, exact post-deposit
+yield, and a downside-fast/upside-slow smoothed yield. It targets 40/40/20 across
+three markets or 35/35/15/15 across four. Membership changes require 30 minutes
+of canonical-time confirmation; invalid markets are removed immediately. The
+included policy requires at least 200 APY bps of conservative target improvement,
+at least 250 APY bps of exact current-position underperformance before exit, and
+at least 100 APY bps of post-probe replacement improvement. APY comparisons use
+the exact compounded annual yield derived from native per-second rates. The
+separate fourth-market diversification gaps are 50 bps to enter and 100 bps to
+remain selected. Strategy memory is durable across restarts and reorg-aware.
+
+Every policy is evaluated after relevant canonical events and on a mandatory
+five-minute canonical-time tick. The tick refreshes exact rates even when there
+was no deposit, withdrawal, borrow, or repayment. Each transaction executes at
+most 90% of the calculated movement, reads exact state again, and repeats only
+if needed. Block counts are never treated as seconds; calculations use the
 timestamp and state of the exact canonical block being read.
 
 At minimum, configure:
@@ -101,12 +121,18 @@ configuration. For local test execution, `local_development.execute_chain_id`
 must explicitly equal the configured chain ID. Production release evidence can
 authorize only the restricted remote signer.
 
+Initial EIP-1559 fees come from the provider's live `eth_gasPrice` and
+`eth_maxPriorityFeePerGas` responses. The bot signs with twice the live total
+quote for base-fee headroom; `maximum_fee_per_gas_wei` is only a hard ceiling and
+replacement/cancellation bound, not the routine starting fee.
+
 ### Included HyperEVM deployment
 
 `config.hyperevm.json` and `protocol-lock.hyperevm.toml` are wired to the
 configured HyperEVM Vault V2 deployment and pinned official Morpho contracts.
-The included HyperEVM configuration selects `utilization_spread`; change only
-the objective selector to return to borrow-rate equalization.
+The included HyperEVM vault selects `top_k_apy_diversified`. The older rate and
+utilization equalization paths remain available by changing the vault strategy
+back to `spread_equalization` and choosing the desired objective.
 The checked-in mode is `shadow`, so it cannot submit transactions until the
 operator deliberately changes it to `execute` after validation.
 
@@ -199,12 +225,14 @@ journalctl -u morpho-v2-reallocator -f
 
 The service uses `Type=notify`. Its watchdog is acknowledged only after the
 supervisor, canonical chain loop, state loop, and storage owner all demonstrate
-progress. Terminal output is intentionally compact: startup and actionable
-failures are logged once, and each successfully refreshed canonical block prints
-one `block processed` line.
+progress. Terminal output is intentionally compact: startup, five-minute ticks,
+published plans, transaction transitions, and actionable failures are visible;
+per-block refresh details remain at debug level.
 
-The first start replays canonical history from `event_start_block`. Keep the bot
-in Shadow mode until exact snapshots and plans are stable. Execute mode fails
+The first start replays canonical history from `event_start_block`. Historical
+asset transfers are queried with indexed account topics, so unrelated chain-wide
+token traffic is not downloaded into the replay pipeline. Keep the bot in
+Shadow mode until exact snapshots and plans are stable. Execute mode fails
 closed on chain, bytecode, role, capability, signer, or release-evidence
 mismatches. The signer accepts only validated Vault V2 reallocation actions,
 identical-calldata fee replacements, and same-nonce cancellations.

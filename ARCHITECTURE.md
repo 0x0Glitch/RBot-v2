@@ -2,14 +2,14 @@
 
 ## Document status
 
-- Review target: commit `6bc8e586c7c7ea04dd25adff64bb8db2ab30551e`
+- Review target: `agent/production-runtime` (exact commit recorded in the release manifest)
 - Review branch: `agent/production-runtime`
 - Live chain: HyperEVM, chain ID `999`
 - Live Vault V2: `0x51254785367d73A10a2Ea7d44B8e97b749BfbE8b`
-- Current operating mode: Execute
+- Checked-in operating mode: Shadow
 - Storage: durable JSON checkpoint plus checksummed segmented journal
-- Primary strategy in the live configuration: utilization-spread minimization
-- Last updated: 2026-08-07
+- Primary strategy in the checked-in HyperEVM configuration: Top-K APY diversification
+- Last updated: 2026-08-08
 
 This document describes what the current code actually does, the reasoning behind
 the major boundaries, problems encountered during development and deployment,
@@ -53,8 +53,8 @@ The system has three planning priorities:
 
 1. Restore required withdrawal liquidity and service constraints.
 2. Deploy verified excess idle capital while retaining the configured reserve.
-3. Reduce the configured rate or utilization spread when a persistent signal is
-   active and movement is feasible.
+3. Apply the vault-selected allocation policy: rate/utilization equalization or
+   Top-K APY diversification.
 
 This order is intentional. A rate improvement must never take priority over the
 vault's ability to serve users or correctly account for idle assets.
@@ -63,9 +63,10 @@ vault's ability to serve users or correctly account for idle assets.
 
 ### 2.1 Goals
 
-- Keep configured markets closer in either spot borrow APR or utilization.
-- React to deposits, withdrawals, borrows, repays, configuration events, and new
-  canonical blocks by refreshing exact state.
+- Keep configured markets closer in spot borrow APR/utilization, or maintain a
+  diversified conservative native-supply-yield allocation.
+- React to deposits, withdrawals, borrows, repays, and configuration events,
+  plus a mandatory five-minute canonical-time tick that refreshes every strategy.
 - Execute normal reallocations autonomously without per-transaction approval.
 - Keep assets inside the configured Vault V2 and approved adapters.
 - Ensure only typed, validated allocation and deallocation calls reach signing.
@@ -343,27 +344,43 @@ deployment, and resource reservations.
 
 1. **Liquidity maintenance**: restore the liquidity adapter/reserve and required
    withdrawal coverage.
-2. **Capital deployment**: deploy verified excess idle assets into an eligible
-   market.
-3. **Rate/utilization reallocation**: move existing supply from a source market
-   to a destination market to reduce the selected spread.
+2. **Capital deployment**: deploy verified excess idle assets through the
+   vault-selected policy. Top-K uses its shared diversified target here, so a
+   fresh deposit cannot be captured by a one-market legacy planner.
+3. **Ongoing strategy**: either reduce the selected rate/utilization spread or
+   move existing supply toward the confirmed Top-K target.
 
 At most one plan is published for a snapshot.
 
 ### 9.2 Strategy choices
 
-The operator selects one strategy:
+The operator selects one vault strategy:
 
-- `spot_borrow_rate_spread`: compares exact spot borrow APR values.
-- `utilization_spread`: compares utilization WAD values.
+- `spread_equalization`, with `spot_borrow_rate_spread` or
+  `utilization_spread` as its exact integer objective.
+- `top_k_apy_diversified`, which ranks the minimum of current, exact post-probe,
+  and downside-fast/upside-slow smoothed native supply yield.
 
 The live utilization policy enters above the configured 25 bps gap and targets
 10 bps or less. The acceptable operator range discussed was 10–25 bps. The rate
 policy supports its separately configured entry and target thresholds.
 
-An episode freezes direction long enough to avoid reacting to single-block
-noise. It terminates on target restoration, incompatible topology/config
-revision, expiry, or a higher-priority service plan.
+Spread equalization uses an episode that freezes direction long enough to avoid
+single-block noise. Top-K instead persists selected markets, smoothed rates, a
+pending membership set, its canonical confirmation timestamp, and generation.
+Its confirmed weights are 40/40/20 for three markets or 35/35/15/15 for four.
+For a yield-driven target transition, the checked-in policy requires at least
+200 APY bps of conservative ranking improvement, at least 250 APY bps of exact
+current-position underperformance before exit, and at least 100 APY bps of
+post-probe improvement. These are exact compounded-APY comparisons, not simple
+APR aliases. The separate fourth-market diversification gaps are 50 bps to enter
+and 100 bps to remain selected. Yield-driven membership changes require 1,800
+canonical seconds; an invalid market is removed immediately.
+
+Relevant events trigger exact refreshes. Independently, every 300 canonical
+seconds `DirtyReason::StrategyTick` marks all deployed vaults dirty and runs the
+same priority planner even when no event occurred. Raw events remain durable;
+only replaceable planning triggers are coalesced.
 
 ### 9.3 Ninety-percent tranche
 
@@ -817,6 +834,85 @@ local deterministic test fixtures. A dependency audit found no safely removable
 runtime dependency; `humantime-serde` is used through Serde attributes and was a
 static-scanner false positive.
 
+### 20.15 Fresh deposits were captured by the one-market capital planner
+
+**Symptom:** a deposit was allocated into one market before a diversification
+strategy could act.
+
+**Root cause:** the generic capital planner had higher priority than an ongoing
+market-to-market strategy and did not share its target policy.
+
+**Resolution:** `top_k_apy_diversified` owns one pure target policy used by both
+capital deployment and ongoing rebalancing. Liquidity maintenance remains first;
+fresh capital then fills confirmed 40/40/20 or 35/35/15/15 target deficits.
+
+### 20.16 Latest nonce could outrun canonical receipt ingestion
+
+**Symptom:** on a one-second chain, the confirmed nonce could advance before the
+canonical cursor ingested the known transaction's block, falsely resembling an
+unknown nonce consumer.
+
+**Resolution:** before foreign-nonce classification, recovery queries every
+durably known hash across recovery providers and binds a found receipt to the
+canonical block header. A known inclusion keeps the lane owned until canonical
+ingestion catches up; no second nonce is reserved.
+
+### 20.17 Fresh replay downloaded unrelated USDC transfers
+
+**Symptom:** historical `eth_getLogs` calls were large, intermittently malformed,
+and made fresh startup unreasonably slow.
+
+**Root cause:** the asset token address filter downloaded every USDC transfer and
+discarded unrelated transfers only after receipt decoding.
+
+**Resolution:** the latest-only bootstrap uses indexed `Transfer` topic queries
+for configured vault/adapter accounts, while protocol addresses retain their
+normal address query. All returned logs still pass the same deployment-aware
+decoder, exact header/receipt attribution, durable replay, and reorg rules.
+Transient range failures have bounded retries with secret-safe range context.
+
+### 20.18 Unconfirmed Top-K membership could block liquidity maintenance
+
+**Symptom:** final preflight attempted to build a Top-K target even for a
+higher-priority liquidity plan; the normal 30-minute membership window could
+therefore defer withdrawal-liquidity repair.
+
+**Resolution:** Top-K membership is required only for Top-K capital or rebalance
+plans. Liquidity maintenance remains independent and always retains priority.
+
+### 20.19 Initial gas price incorrectly came from the configured ceiling
+
+**Symptom:** Execute could stop at the wallet-funding gate, or reject an otherwise
+economic plan, even while live HyperEVM gas was inexpensive.
+
+**Root cause:** the initial EIP-1559 maximum fee was half of the configured hard
+ceiling rather than a live fee quote. With a 100 gwei ceiling this produced a
+50 gwei initial fee while the reviewed chain returned a 0.1 gwei base fee.
+
+**Resolution:** startup now capability-tests `eth_gasPrice` and
+`eth_maxPriorityFeePerGas`. Execute uses twice the live total quote for initial
+base-fee headroom, retains the provider priority quote, and rejects zero or
+above-ceiling quotes. The configured value remains only a hard ceiling for the
+initial transaction, replacements, cancellations, gas budgeting, and the final
+economic gate.
+
+### 20.20 Parent `maxRate = 0` hid the Top-K economic gain
+
+**Symptom:** the exact Shadow plan improved the direct-market portfolio, but its
+shareholder terminal-value delta was zero and the final economic gate would
+reject every Top-K transaction.
+
+**Root cause:** the reviewed vault currently has parent `maxRate = 0`, which
+freezes distributed parent `totalAssets` growth. The economic gate incorrectly
+reused that parent-distribution value as the strategy's recoverable-asset gain.
+
+**Resolution:** the simulator now separately projects total recoverable adapter
+and idle assets before the parent distribution ceiling. `expected_gain_assets`
+is stored in the signed plan projection and rebuilt immediately before signing.
+The shareholder projection remains an independent no-sacrifice safety check.
+A regression test proves that zero parent max rate can yield zero shareholder
+delta and positive recoverable-asset gain without conflating them.
+
 ## 21. Remaining issues and review risks
 
 These are ordered by potential production impact, not implementation effort.
@@ -874,10 +970,23 @@ state aggregates?
 
 ### 21.6 Economic effectiveness is not yet proven at meaningful scale
 
-The live vault currently has about 40 USDC total and only one current direct
-market allocation. Moving 25 USDC proved execution but reduced the system-wide
-utilization spread by only about 1.08 bps. It did not prove convergence to a
-10–25 bps band across multiple controllable markets.
+The live vault currently has about 40 USDC total and about 39 USDC in one direct
+market. At the latest reviewed state that market supplied roughly 0.93% APY,
+while the three selected markets supplied roughly 7.11%, 7.06%, and 6.68% APY.
+Top-K therefore has a clear 40/40/20 target. The exact four-action estimate was
+931,662 gas and the signed limit with 15% headroom was 1,071,412 gas. With the
+0.1 gwei live quote, the signed initial fee is 0.2 gwei. The configured 3x gas
+multiplier and 100-USDC/HYPE ceiling require roughly 0.065 USDC of 24-hour gain,
+while the 39-USDC plan projects only about 0.0057 USDC. At unchanged rates, the
+same test requires roughly 455 USDC of direct capital to clear that conservative
+gate; use a larger risk-approved buffer because rates and gas can move.
+
+The local historical sample contained 85 exact snapshots over two short windows
+separated by about 23 hours. The same three markets remained selected; only the
+ordering of the first three changed on differences far smaller than the 200/250/
+100 APY-bps transition gates. This supports the checked-in 5% entry, 1% target,
+and 1% minimum score improvement as anti-churn defaults for this observed state,
+but it is not long-duration production evidence.
 
 **Recommended test:** fund the vault at a meaningful but risk-approved amount,
 enable at least two genuinely controllable active markets, create repeatable
@@ -989,12 +1098,12 @@ every state transition, plus fork tests against the exact production deployment.
 
 ## 22. Questions for senior review
 
-1. Is utilization the correct primary objective for this curator, or should the
-   bot optimize rate, utilization, or a weighted economic value after rewards?
-2. Should the target be global market spread or only the spread the vault can
-   economically influence?
-3. Are the 25 bps entry, 10 bps target, 90% tranche, five-second cadence, and
-   1 USDC reserve correct for realistic vault size?
+1. Are native-yield-only ranking and the exact 200/250/100 APY-bps transition
+   gates appropriate for the curator's equal-risk market set?
+2. Should Top-K strategy settings remain process-wide while selection is
+   vault-scoped, or must every vault own a separate complete settings profile?
+3. Are the 5% entry score, 1% target, 1% minimum improvement, 90% tranche,
+   five-minute canonical tick, and 1 USDC reserve correct at realistic TVL?
 4. Is the latest-only canonical evidence sufficient, and what independent RPC
    assumptions are acceptable?
 5. Should ordinary reverts always reconcile and retry, or are there revert

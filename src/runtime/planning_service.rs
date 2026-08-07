@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     api::ApiDataStore,
-    config::{ValidatedConfig, ValidatedStrategyConfig, ValidatedVaultConfig},
+    config::{ValidatedConfig, ValidatedStrategyConfig, ValidatedVaultConfig, VaultStrategy},
     domain::{
         Assets, ExactVaultSnapshot, MarketId, MarketMode, PlanId, PlanProjection, PlanReason,
         RateObjectiveBranch, SolverCertificate, V2Plan,
@@ -20,6 +20,11 @@ use crate::{
         rate::solve_rate_rebalance,
         simulator::{
             ActionProjection, SimulationState, no_plan_terminal_existing_shareholder_assets,
+            no_plan_terminal_real_assets,
+        },
+        top_k_apy::{
+            TopKApyError, TopKApyTarget, TopKSolveLimits, observe_top_k_target,
+            solve_top_k_capital_deployment, solve_top_k_rebalance, verified_deployable_capital,
         },
     },
     runtime::{
@@ -57,6 +62,9 @@ pub enum PlanningServiceError {
     /// A non-rate plan projection could not be represented exactly.
     #[error("non-rate plan projection could not be represented exactly")]
     PlanConstruction,
+    /// Pure top-K target or candidate construction failed.
+    #[error(transparent)]
+    TopKApy(#[from] TopKApyError),
 }
 
 struct RateSignal {
@@ -109,6 +117,13 @@ pub async fn refresh_priority_plan(
         terminate_rate_episode(vault, projection, storage, api).await?;
         return publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await;
     }
+    if vault.strategy == VaultStrategy::TopKApyDiversified {
+        terminate_rate_episode(vault, projection, storage, api).await?;
+        return refresh_top_k_plan(
+            config, vault, snapshot, projection, storage, api, runtime, revision,
+        )
+        .await;
+    }
     if let Some(prepared) =
         build_validated_capital_plan(config, vault, snapshot, projection, revision)?
     {
@@ -119,6 +134,214 @@ pub async fn refresh_priority_plan(
         config, vault, snapshot, projection, storage, api, runtime, revision,
     )
     .await
+}
+
+/// Observes, persists, and plans the shared top-K target for deposits and later rebalances.
+#[allow(clippy::too_many_arguments)]
+pub async fn refresh_top_k_plan(
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    storage: &StorageHandle,
+    api: &ApiDataStore,
+    runtime: &RuntimeRegistry,
+    revision: Option<&PlanningRevision>,
+) -> Result<Option<V2Plan>, PlanningServiceError> {
+    let previous = storage.load_top_k_apy_memory(vault.address).await?;
+    let funding = verified_deployable_capital(snapshot, vault)?;
+    let observation = observe_top_k_target(
+        snapshot,
+        projection,
+        vault,
+        &config.app.strategy.top_k_apy,
+        previous.as_ref(),
+        funding.total_assets,
+    )?;
+    storage
+        .persist_top_k_apy_memory(
+            vault.address,
+            observation.next_memory.clone(),
+            projection.head.timestamp,
+        )
+        .await?;
+    tracing::debug!(
+        vault = %vault.address.0,
+        block = projection.head.number,
+        generation = observation.next_memory.generation,
+        selected_markets = observation.next_memory.selected_markets.len(),
+        pending_markets = observation.next_memory.pending_selected_markets.len(),
+        no_action = ?observation.no_action_reason,
+        "top-K target refreshed"
+    );
+    let Some(target) = observation.target else {
+        clear_plan(vault, api, runtime, None).await?;
+        return Ok(None);
+    };
+    if !funding.total_assets.is_zero()
+        && let Some(prepared) = build_validated_top_k_capital_plan(
+            config, vault, snapshot, projection, &target, funding, revision,
+        )?
+    {
+        return publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await;
+    }
+    let Some(prepared) = build_validated_top_k_rebalance_plan(
+        config, vault, snapshot, projection, &target, revision,
+    )?
+    else {
+        clear_plan(vault, api, runtime, None).await?;
+        return Ok(None);
+    };
+    publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await
+}
+
+/// Rebuilds a top-K capital deployment against one frozen confirmed target.
+pub fn build_validated_top_k_capital_plan(
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    target: &TopKApyTarget,
+    funding: crate::planner::top_k_apy::TopKDeployableCapital,
+    revision: Option<&PlanningRevision>,
+) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
+    let solved = solve_top_k_capital_deployment(
+        snapshot,
+        projection,
+        vault,
+        target,
+        funding,
+        TopKSolveLimits {
+            immediate_tranche_bps: config.app.strategy.immediate_tranche_bps,
+            maximum_actions: config.app.execution.maximum_actions,
+            maximum_nodes: config.app.solver.maximum_nodes,
+        },
+    )?;
+    let Some(state) = solved.state else {
+        return Ok(None);
+    };
+    if solved.actions.is_empty() || !solved.certificate.executable_rate_search() {
+        return Ok(None);
+    }
+    build_validated_non_rate_plan(
+        config,
+        vault,
+        snapshot,
+        projection,
+        PlanReason::CapitalDeployment,
+        solved.actions,
+        state,
+        solved.certificate.candidate_lattice_hash,
+        solved.certificate.nodes_evaluated,
+        revision,
+    )
+    .map(Some)
+}
+
+/// Rebuilds one exact top-K market-to-market plan from a frozen confirmed target.
+pub fn build_validated_top_k_rebalance_plan(
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    target: &TopKApyTarget,
+    revision: Option<&PlanningRevision>,
+) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
+    let solved = solve_top_k_rebalance(
+        snapshot,
+        projection,
+        vault,
+        &config.app.strategy.top_k_apy,
+        target,
+        TopKSolveLimits {
+            immediate_tranche_bps: config.app.strategy.immediate_tranche_bps,
+            maximum_actions: config.app.execution.maximum_actions,
+            maximum_nodes: config.app.solver.maximum_nodes,
+        },
+    )?;
+    if !solved.certificate.executable_rate_search() {
+        return Ok(None);
+    }
+    let Some(best) = solved.best else {
+        return Ok(None);
+    };
+    let horizon_timestamp = projection
+        .head
+        .timestamp
+        .checked_add(config.app.strategy.benefit_horizon_seconds)
+        .ok_or(PlanningServiceError::PlanConstruction)?;
+    let no_plan_terminal = no_plan_terminal_existing_shareholder_assets(
+        snapshot,
+        vault,
+        projection,
+        horizon_timestamp,
+    )
+    .map_err(|_| PlanningServiceError::PlanConstruction)?;
+    let plan_terminal = best
+        .state
+        .terminal_existing_shareholder_assets(snapshot, projection, horizon_timestamp)
+        .map_err(|_| PlanningServiceError::PlanConstruction)?;
+    if plan_terminal
+        .checked_add(vault.maximum_terminal_value_sacrifice_assets)
+        .is_none_or(|allowed| allowed < no_plan_terminal)
+    {
+        return Ok(None);
+    }
+    let terminal_value_delta_assets = I256::try_from(plan_terminal)
+        .ok()
+        .zip(I256::try_from(no_plan_terminal).ok())
+        .and_then(|(planned, baseline)| planned.checked_sub(baseline))
+        .ok_or(PlanningServiceError::PlanConstruction)?;
+    let no_plan_real_assets =
+        no_plan_terminal_real_assets(snapshot, vault, projection, horizon_timestamp)
+            .map_err(|_| PlanningServiceError::PlanConstruction)?;
+    let plan_real_assets = best
+        .state
+        .terminal_real_assets(snapshot, projection, horizon_timestamp)
+        .map_err(|_| PlanningServiceError::PlanConstruction)?;
+    let expected_gain_assets = plan_real_assets.saturating_sub(no_plan_real_assets);
+    let action_projections = best.state.actions.clone();
+    let mut plan = V2Plan {
+        plan_id: PlanId(B256::ZERO),
+        reason: PlanReason::TopKApyRebalance,
+        vault: vault.address,
+        snapshot: snapshot.context.clone(),
+        config_revision: config.revision,
+        topology_revision: snapshot.context.dynamic_topology_revision,
+        read_set_revision: revision.map_or(0, |item| item.read_set_revision),
+        latest_relevant_event_block: revision.map_or(snapshot.context.block.number, |item| {
+            item.latest_relevant_event_block
+        }),
+        planner_generation: revision.map_or(0, |item| item.planner_generation),
+        actions: best.actions,
+        projection: PlanProjection {
+            movement_assets: best.movement_assets,
+            before_spread: best.before_score_wad,
+            after_spread: best.after_score_wad,
+            immediate_loss_assets: best.state.immediate_loss_assets,
+            terminal_value_delta_assets,
+            expected_gain_assets,
+        },
+        solver_certificate: SolverCertificate {
+            candidate_lattice_hash: solved.certificate.candidate_lattice_hash,
+            nodes_evaluated: solved.certificate.nodes_evaluated,
+            node_limit: solved.certificate.node_limit,
+            search_complete_for_lattice: solved.certificate.search_complete,
+            rate_episode_id: None,
+            objective_branch: None,
+            target_reachable: true,
+            target_reached: best.after_score_wad <= config.app.strategy.top_k_apy.target_score_wad,
+        },
+        episode_id: None,
+        plan_hash: B256::ZERO,
+    };
+    plan.plan_id = canonical_plan_id(&plan)?;
+    plan.plan_hash = canonical_plan_hash(&plan)?;
+    let plan = validate_plan(plan, config)?;
+    Ok(Some(PreparedRatePlan {
+        plan,
+        action_projections,
+    }))
 }
 
 /// Updates the durable episode state and publishes one fully firewalled Shadow rate plan.
@@ -372,6 +595,7 @@ pub fn build_validated_rate_plan(
             after_spread: best.objective.applicable_spread,
             immediate_loss_assets: best.state.immediate_loss_assets,
             terminal_value_delta_assets: best.objective.terminal_value_delta,
+            expected_gain_assets: positive_i256(best.objective.terminal_value_delta),
         },
         solver_certificate: SolverCertificate {
             candidate_lattice_hash: solved.certificate.candidate_lattice_hash,
@@ -515,6 +739,13 @@ fn build_validated_non_rate_plan(
         .zip(I256::try_from(no_plan_terminal).ok())
         .and_then(|(planned, baseline)| planned.checked_sub(baseline))
         .ok_or(PlanningServiceError::PlanConstruction)?;
+    let no_plan_real_assets =
+        no_plan_terminal_real_assets(snapshot, vault, projection, horizon_timestamp)
+            .map_err(|_| PlanningServiceError::PlanConstruction)?;
+    let plan_real_assets = state
+        .terminal_real_assets(snapshot, projection, horizon_timestamp)
+        .map_err(|_| PlanningServiceError::PlanConstruction)?;
+    let expected_gain_assets = plan_real_assets.saturating_sub(no_plan_real_assets);
     let action_projections = state.actions.clone();
     let mut plan = V2Plan {
         plan_id: PlanId(B256::ZERO),
@@ -535,6 +766,7 @@ fn build_validated_non_rate_plan(
             after_spread,
             immediate_loss_assets: state.immediate_loss_assets,
             terminal_value_delta_assets,
+            expected_gain_assets,
         },
         solver_certificate: SolverCertificate {
             candidate_lattice_hash,
@@ -582,6 +814,14 @@ fn action_movement(actions: &[crate::domain::V2Action]) -> Result<U256, Planning
     Ok(allocated.max(deallocated))
 }
 
+fn positive_i256(value: I256) -> U256 {
+    if value.is_positive() {
+        U256::try_from(value).unwrap_or_default()
+    } else {
+        U256::ZERO
+    }
+}
+
 async fn terminate_rate_episode(
     vault: &ValidatedVaultConfig,
     projection: &ProjectedVaultView,
@@ -619,6 +859,16 @@ async fn publish_plan(
             status.record_planning(Some(plan.plan_id), episode_id)
         })
         .await?;
+    tracing::info!(
+        vault = %plan.vault.0,
+        block = plan.snapshot.block.number,
+        reason = ?plan.reason,
+        actions = plan.actions.len(),
+        movement_assets = %plan.projection.movement_assets,
+        before_score = %plan.projection.before_spread,
+        after_score = %plan.projection.after_spread,
+        "plan ready"
+    );
     Ok(Some(plan))
 }
 

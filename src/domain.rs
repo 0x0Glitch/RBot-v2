@@ -839,6 +839,8 @@ pub enum PlanReason {
     CapitalDeployment,
     /// Equalize configured direct-market spot borrow rates.
     RateRebalance,
+    /// Move direct assets toward the confirmed conservative top-K APY target.
+    TopKApyRebalance,
     /// Report a required reviewed zero-asset synchronization.
     PositionSyncRequired,
 }
@@ -916,6 +918,9 @@ pub struct PlanProjection {
     pub immediate_loss_assets: U256,
     /// Terminal existing-shareholder value delta in vault-asset units.
     pub terminal_value_delta_assets: I256,
+    /// Positive recoverable-vault-asset gain used by the final economic execution gate.
+    #[serde(default)]
+    pub expected_gain_assets: U256,
 }
 
 /// Unvalidated semantic plan. Transaction code accepts only a later validated wrapper.

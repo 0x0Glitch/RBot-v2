@@ -1,15 +1,17 @@
 //! Durable canonical head polling, catch-up, checkpointing, and replay.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
 use alloy::primitives::{Address, B256};
+use alloy::sol_types::SolEvent;
 use futures::{StreamExt, stream};
 use tokio::sync::{mpsc, watch};
 
+use crate::contracts::bindings::IERC20;
 use crate::domain::BlockRef;
 use crate::runtime::messages::{ChainUpdate, ProviderStatus, ReceiptRecord};
 use crate::storage::actor::StorageHandle;
@@ -23,6 +25,7 @@ use super::reorg::find_common_ancestor;
 const ADDRESS_GROUP_SIZE: usize = 64;
 const MAX_CATCH_UP_CONCURRENCY: usize = 8;
 const MAX_PUBLISHED_CATCH_UP_BLOCKS: u64 = 8;
+const MAX_LOG_QUERY_ATTEMPTS: u32 = 3;
 
 /// Fail-closed predicate for retaining only execution-relevant canonical logs.
 pub trait CanonicalLogFilter: Send + Sync {
@@ -76,6 +79,7 @@ pub struct ChainService<P> {
     head_hints: Option<watch::Sender<Option<BlockRef>>>,
     config: ChainServiceConfig,
     log_filter: Option<Arc<dyn CanonicalLogFilter>>,
+    indexed_token_accounts: BTreeMap<Address, BTreeSet<Address>>,
     provider_ready: Option<Arc<AtomicBool>>,
 }
 
@@ -119,6 +123,7 @@ impl<P: ChainDataProvider> ChainService<P> {
             head_hints: None,
             config,
             log_filter: None,
+            indexed_token_accounts: BTreeMap::new(),
             provider_ready: None,
         })
     }
@@ -127,6 +132,16 @@ impl<P: ChainDataProvider> ChainService<P> {
     #[must_use]
     pub fn with_log_filter(mut self, filter: Arc<dyn CanonicalLogFilter>) -> Self {
         self.log_filter = Some(filter);
+        self
+    }
+
+    /// Installs token/account pairs used to turn historical ERC-20 scans into indexed queries.
+    #[must_use]
+    pub fn with_indexed_token_accounts(
+        mut self,
+        filters: BTreeMap<Address, BTreeSet<Address>>,
+    ) -> Self {
+        self.indexed_token_accounts = filters;
         self
     }
 
@@ -227,12 +242,13 @@ impl<P: ChainDataProvider> ChainService<P> {
         if start > latest.number {
             return Ok(());
         }
-        let addresses = self
+        let mut addresses = self
             .config
             .watched_addresses
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        addresses.retain(|address| !self.indexed_token_accounts.contains_key(address));
         let mut queries = Vec::new();
         let mut from = start;
         while from <= latest.number {
@@ -240,25 +256,65 @@ impl<P: ChainDataProvider> ChainService<P> {
                 .saturating_add(self.config.maximum_log_range.saturating_sub(1))
                 .min(latest.number);
             for group in addresses.chunks(ADDRESS_GROUP_SIZE) {
-                queries.push((from, to, group.to_vec()));
+                queries.push((from, to, group.to_vec(), Vec::new()));
+            }
+            for (token, accounts) in &self.indexed_token_accounts {
+                let account_topics = accounts
+                    .iter()
+                    .map(|account| B256::left_padding_from(account.as_slice()))
+                    .collect::<Vec<_>>();
+                if !account_topics.is_empty() {
+                    queries.push((
+                        from,
+                        to,
+                        vec![*token],
+                        vec![
+                            Some(vec![IERC20::Transfer::SIGNATURE_HASH]),
+                            Some(account_topics.clone()),
+                        ],
+                    ));
+                    queries.push((
+                        from,
+                        to,
+                        vec![*token],
+                        vec![
+                            Some(vec![IERC20::Transfer::SIGNATURE_HASH]),
+                            None,
+                            Some(account_topics),
+                        ],
+                    ));
+                }
             }
             from = to.saturating_add(1);
         }
 
+        let total_queries = queries.len();
         let results = stream::iter(queries)
-            .map(|(from, to, addresses)| async move {
-                let logs = self.primary.logs(from, to, &addresses).await?;
+            .map(|(from, to, addresses, topics)| async move {
+                let logs = self
+                    .logs_with_bounded_retry(from, to, &addresses, &topics)
+                    .await?;
                 Ok::<_, ChainError>((from, to, logs))
             })
             .buffered(MAX_CATCH_UP_CONCURRENCY);
         futures::pin_mut!(results);
         let mut relevant_blocks = BTreeSet::new();
+        let mut completed_queries = 0_usize;
         while let Some(result) = results.next().await {
             let (from, to, logs) = result?;
+            completed_queries = completed_queries.saturating_add(1);
             for log in logs {
                 if let Some(number) = self.retained_log_hint(from, to, &log)? {
                     relevant_blocks.insert(number);
                 }
+            }
+            if completed_queries == total_queries || completed_queries.is_multiple_of(100) {
+                tracing::info!(
+                    completed_queries,
+                    total_queries,
+                    relevant_blocks = relevant_blocks.len(),
+                    "canonical bootstrap scan progress"
+                );
             }
         }
 
@@ -309,6 +365,40 @@ impl<P: ChainDataProvider> ChainService<P> {
             ));
         }
         Ok(())
+    }
+
+    async fn logs_with_bounded_retry(
+        &self,
+        from: u64,
+        to: u64,
+        addresses: &[Address],
+        topics: &[Option<Vec<B256>>],
+    ) -> Result<Vec<RpcLog>, ChainError> {
+        let mut attempt = 1_u32;
+        loop {
+            match self
+                .primary
+                .logs_with_topics(from, to, addresses, topics)
+                .await
+            {
+                Ok(logs) => return Ok(logs),
+                Err(error)
+                    if attempt < MAX_LOG_QUERY_ATTEMPTS && retryable_log_query_error(&error) =>
+                {
+                    tracing::warn!(
+                        from_block = from,
+                        to_block = to,
+                        attempt,
+                        %error,
+                        "canonical log query will retry"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(u64::from(attempt) * 250))
+                        .await;
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     fn retained_log_hint(
@@ -626,6 +716,18 @@ impl<P: ChainDataProvider> ChainService<P> {
     }
 }
 
+fn retryable_log_query_error(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::Transport { .. }
+            | ProviderError::MalformedResponse { .. }
+            | ProviderError::HttpStatus {
+                status: 408 | 425 | 429 | 500..=599,
+                ..
+            }
+    )
+}
+
 fn reject_duplicate_logs(logs: &[CanonicalLogRecord]) -> Result<(), ChainError> {
     let mut seen = HashSet::<(B256, u64)>::with_capacity(logs.len());
     for log in logs {
@@ -636,4 +738,35 @@ fn reject_duplicate_logs(logs: &[CanonicalLogRecord]) -> Result<(), ChainError> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retryable_log_query_error;
+    use crate::chain::provider::{ProviderError, RpcErrorCategory};
+
+    #[test]
+    fn only_transient_log_failures_are_retried() {
+        assert!(retryable_log_query_error(&ProviderError::Transport {
+            method: "eth_getLogs",
+        }));
+        assert!(retryable_log_query_error(
+            &ProviderError::MalformedResponse {
+                method: "eth_getLogs",
+            }
+        ));
+        assert!(retryable_log_query_error(&ProviderError::HttpStatus {
+            method: "eth_getLogs",
+            status: 429,
+        }));
+        assert!(!retryable_log_query_error(&ProviderError::Rpc {
+            method: "eth_getLogs",
+            code: -32_000,
+            category: RpcErrorCategory::Unknown,
+        }));
+        assert!(!retryable_log_query_error(&ProviderError::HttpStatus {
+            method: "eth_getLogs",
+            status: 400,
+        }));
+    }
 }

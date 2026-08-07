@@ -290,7 +290,9 @@ fn pending_horizon(
     execution: &ValidatedExecutionConfig,
 ) -> Result<u64, PendingPolicyError> {
     match reason {
-        PlanReason::RateRebalance => Ok(execution.maximum_rate_rebalance_pending_opportunities),
+        PlanReason::RateRebalance | PlanReason::TopKApyRebalance => {
+            Ok(execution.maximum_rate_rebalance_pending_opportunities)
+        }
         PlanReason::CapitalDeployment => {
             Ok(execution.maximum_capital_deployment_pending_opportunities)
         }

@@ -70,7 +70,6 @@ wiremock = "0.6"
 codegen-units = 1
 lto = "thin"
 overflow-checks = true
-panic = "abort"
 strip = "symbols"
 
 [lints.rust]

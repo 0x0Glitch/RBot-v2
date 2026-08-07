@@ -13,7 +13,10 @@ use morpho_v2_reallocator::domain::{
     RateGroupId, RateObjectiveBranch, SolverCertificate, StateContext, TransactionId, V2Action,
     V2Plan, VaultAddress, VaultCapabilities,
 };
-use morpho_v2_reallocator::planner::episodes::{IndependentRateEvent, RateSignalEpisode};
+use morpho_v2_reallocator::planner::{
+    episodes::{IndependentRateEvent, RateSignalEpisode},
+    top_k_apy::TopKApyMemory,
+};
 use morpho_v2_reallocator::storage::StorageError;
 use morpho_v2_reallocator::storage::actor::StorageService;
 use morpho_v2_reallocator::storage::models::{
@@ -98,6 +101,52 @@ fn rate_episode(vault: VaultAddress, detection: BlockRef, salt: u8) -> RateSigna
         Ok(episode) => episode,
         Err(error) => panic!("valid rate episode fixture: {error}"),
     }
+}
+
+#[tokio::test]
+async fn top_k_memory_is_durable_and_removed_when_its_observation_is_reorged()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("top-k-memory.json");
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let vault = VaultAddress(Address::with_last_byte(0x45));
+    let ancestor = block(10, 0x10, 0x09);
+    let observed = block(11, 0x11, 0x10);
+    for current in [ancestor, observed] {
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 999,
+                    block: current,
+                },
+                Vec::new(),
+                current.timestamp,
+            )
+            .await?;
+    }
+    let memory = TopKApyMemory {
+        last_observed_block: observed.number,
+        last_observed_timestamp: observed.timestamp,
+        generation: 1,
+        selected_markets: vec![MarketId(B256::repeat_byte(1))],
+        ..TopKApyMemory::default()
+    };
+    handle
+        .persist_top_k_apy_memory(vault, memory.clone(), observed.timestamp)
+        .await?;
+    assert_eq!(handle.load_top_k_apy_memory(vault).await?, Some(memory));
+    service.shutdown().await?;
+
+    let reopened = reopen(&path).await?;
+    let handle = reopened.handle();
+    assert!(handle.load_top_k_apy_memory(vault).await?.is_some());
+    handle
+        .rewind_to_ancestor(999, ancestor, ancestor.timestamp)
+        .await?;
+    assert_eq!(handle.load_top_k_apy_memory(vault).await?, None);
+    reopened.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -210,7 +259,7 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
     service.shutdown().await?;
 
     let state = read_json(&path)?;
-    assert_eq!(state["format_version"], 3);
+    assert_eq!(state["format_version"], 4);
     assert_eq!(state["revision"], 0);
     assert_eq!(state["transactions"].as_array().map(Vec::len), Some(0));
 
@@ -345,7 +394,7 @@ async fn terminal_format_one_state_migrates_atomically_to_current_format()
 
     reopen(&path).await?.shutdown().await?;
     let migrated = read_json(&path)?;
-    assert_eq!(migrated["format_version"], 3);
+    assert_eq!(migrated["format_version"], 4);
     assert_eq!(migrated["canonical_blocks"][0]["block"]["gas_limit"], 0);
     Ok(())
 }
@@ -772,7 +821,7 @@ async fn corrupt_and_unknown_json_formats_fail_reopen() -> Result<(), Box<dyn st
         error,
         StorageError::FormatVersion {
             actual: 999,
-            expected: 3
+            expected: 4
         }
     ));
 
@@ -1550,6 +1599,7 @@ fn sample_plan(snapshot: &ExactVaultSnapshot) -> V2Plan {
             after_spread: U256::from(1_u64),
             immediate_loss_assets: U256::ZERO,
             terminal_value_delta_assets: I256::ZERO,
+            expected_gain_assets: U256::ZERO,
         },
         solver_certificate: SolverCertificate {
             candidate_lattice_hash: B256::repeat_byte(0xcc),

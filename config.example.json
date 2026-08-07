@@ -69,6 +69,7 @@
         "expected_vault_code_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
         "deployment_block": 2345000,
         "signer_address": "0x0000000000000000000000000000000000000002",
+        "strategy": "spread_equalization",
         "strict_zero_routine_idle": true,
         "minimum_action_assets": "1000000",
         "maximum_rounding_dust_assets": "1000",
@@ -215,7 +216,28 @@
       "maximum_rate_episode_duration": "10m",
       "extreme_spread_bypass_enabled": false,
       "benefit_horizon": "6h",
-      "maximum_daily_transactions": 24
+      "maximum_daily_transactions": 24,
+      "top_k_apy": {
+        "enter_apy_bps": 200,
+        "exit_apy_bps": 250,
+        "replacement_apy_bps": 100,
+        "fourth_market_entry_gap_apy_bps": 50,
+        "fourth_market_exit_gap_apy_bps": 100,
+        "upside_ema_alpha_bps": 2000,
+        "probe_allocation_bps": 500,
+        "membership_confirmation": "30m",
+        "tick_interval": "5m",
+        "minimum_direct_assets_for_four_markets": "0",
+        "three_market_weights_bps": [4000, 4000, 2000],
+        "four_market_weights_bps": [3500, 3500, 1500, 1500],
+        "entry_score_wad": "50000000000000000",
+        "target_score_wad": "10000000000000000",
+        "minimum_improvement_score_wad": "10000000000000000",
+        "minimum_net_gain_assets": "0",
+        "gas_cost_multiplier": 3,
+        "native_token_price_ceiling_asset_wad": "0",
+        "maximum_diversification_cost_apy_bps": 25
+      }
     }
   }
 }

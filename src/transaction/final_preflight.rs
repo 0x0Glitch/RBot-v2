@@ -15,8 +15,9 @@ use crate::{
         AccountNonceProvider, ChainDataProvider, ProviderError, SignedTransactionSubmitter,
         TransactionSimulationProvider,
     },
-    config::{SnapshotMode, ValidatedConfig, ValidatedVaultConfig},
-    domain::{BlockRef, RateObjectiveBranch, TransactionId},
+    config::{SnapshotMode, ValidatedConfig, ValidatedVaultConfig, VaultStrategy},
+    domain::{BlockRef, PlanReason, RateObjectiveBranch, TransactionId},
+    morpho::blue_math::{WAD, mul_div_up},
     storage::{
         StorageError,
         actor::StorageHandle,
@@ -285,6 +286,9 @@ pub enum PreflightError {
     /// Rolling hourly or daily semantic movement would exceed vault policy.
     #[error("rolling movement budget would be exceeded")]
     MovementBudget,
+    /// Conservative 24-hour strategy benefit does not cover gas, loss, and policy margin.
+    #[error("top-K economic execution gate rejected the transaction")]
+    EconomicGate,
     /// Independent transaction firewall failed.
     #[error(transparent)]
     Firewall(#[from] FirewallError),
@@ -445,6 +449,7 @@ pub async fn execute_one_head_preflight(
         config.app.execution.gas_headroom_bps,
         config.app.execution.maximum_signed_transaction_gas,
     )?;
+    validate_top_k_economic_gate(&plan, gas_limit, request.max_fee_per_gas, vault, config)?;
     let simulation_after_hash = context_hash(&[
         simulation_before_hash.as_slice(),
         simulation_head.hash.as_slice(),
@@ -671,6 +676,67 @@ async fn validate_rolling_movement(
     }
 }
 
+fn validate_top_k_economic_gate(
+    plan: &ValidatedPlan,
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+    vault: &ValidatedVaultConfig,
+    config: &ValidatedConfig,
+) -> Result<(), PreflightError> {
+    if vault.strategy != VaultStrategy::TopKApyDiversified
+        || !matches!(
+            plan.plan().reason,
+            PlanReason::CapitalDeployment | PlanReason::TopKApyRebalance
+        )
+    {
+        return Ok(());
+    }
+    let settings = &config.app.strategy.top_k_apy;
+    if settings.native_token_price_ceiling_asset_wad.is_zero() {
+        return Err(PreflightError::EconomicGate);
+    }
+    let required = required_top_k_gain_assets(
+        gas_limit,
+        max_fee_per_gas,
+        vault.asset_decimals,
+        settings,
+        plan.plan().projection.immediate_loss_assets,
+    )?;
+    let gain = plan.plan().projection.expected_gain_assets;
+    if gain < required {
+        return Err(PreflightError::EconomicGate);
+    }
+    Ok(())
+}
+
+fn required_top_k_gain_assets(
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+    asset_decimals: u8,
+    settings: &crate::config::ValidatedTopKApyConfig,
+    immediate_loss_assets: U256,
+) -> Result<U256, PreflightError> {
+    let native_cost_wei = U256::from(gas_limit)
+        .checked_mul(U256::from(max_fee_per_gas))
+        .ok_or(PreflightError::EconomicGate)?;
+    let whole_asset_wad = mul_div_up(
+        native_cost_wei,
+        settings.native_token_price_ceiling_asset_wad,
+        WAD,
+    )
+    .map_err(|_| PreflightError::EconomicGate)?;
+    let asset_scale = U256::from(10_u8)
+        .checked_pow(U256::from(asset_decimals))
+        .ok_or(PreflightError::EconomicGate)?;
+    let gas_assets =
+        mul_div_up(whole_asset_wad, asset_scale, WAD).map_err(|_| PreflightError::EconomicGate)?;
+    gas_assets
+        .checked_mul(U256::from(settings.gas_cost_multiplier))
+        .and_then(|cost| cost.checked_add(immediate_loss_assets))
+        .and_then(|cost| cost.checked_add(settings.minimum_net_gain_assets))
+        .ok_or(PreflightError::EconomicGate)
+}
+
 pub(crate) fn expected_action_records(
     plan: &ValidatedPlan,
     projections: &[ActionProjection],
@@ -795,11 +861,11 @@ fn context_hash(parts: &[&[u8]]) -> B256 {
 mod tests {
     use std::path::PathBuf;
 
-    use alloy::primitives::B256;
+    use alloy::primitives::{B256, U256};
 
     use super::{
         ExecutionReservationManager, InclusionScenarioKind, PreflightError, ReservationError,
-        inclusion_assumptions, require_head,
+        inclusion_assumptions, require_head, required_top_k_gain_assets,
     };
     use crate::{config::AppConfig, domain::BlockRef};
 
@@ -881,5 +947,23 @@ mod tests {
         ));
         drop(first);
         assert!(manager.acquire(vault).is_ok());
+    }
+
+    #[test]
+    fn top_k_economic_gate_uses_exact_asset_units_and_inclusive_boundary() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.hyperevm.json");
+        let config = AppConfig::load(&path).and_then(AppConfig::validate);
+        assert!(config.is_ok());
+        let Ok(config) = config else {
+            return;
+        };
+        let required = required_top_k_gain_assets(
+            1_000_000,
+            1_000_000_000,
+            config.app.vaults[0].asset_decimals,
+            &config.app.strategy.top_k_apy,
+            U256::ZERO,
+        );
+        assert_eq!(required.ok(), Some(U256::from(301_000_u64)));
     }
 }

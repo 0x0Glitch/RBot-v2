@@ -64,7 +64,7 @@ pub fn ranks_before(
                 current.action_count,
             )
         }
-        PlanReason::RateRebalance => {
+        PlanReason::RateRebalance | PlanReason::TopKApyRebalance => {
             let candidate_reaches = candidate.applicable_spread <= target_spread;
             let current_reaches = current.applicable_spread <= target_spread;
             if target_reachable && candidate_reaches != current_reaches {

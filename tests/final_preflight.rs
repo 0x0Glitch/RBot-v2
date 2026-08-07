@@ -103,6 +103,7 @@ fn validated_plan(config: &ValidatedConfig, head: BlockRef) -> ValidatedPlan {
             after_spread: U256::ZERO,
             immediate_loss_assets: U256::ZERO,
             terminal_value_delta_assets: I256::ZERO,
+            expected_gain_assets: U256::ZERO,
         },
         solver_certificate: SolverCertificate {
             candidate_lattice_hash: B256::repeat_byte(0x51),

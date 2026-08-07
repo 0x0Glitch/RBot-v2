@@ -28,7 +28,10 @@ use morpho_v2_reallocator::{
         objective::{complete_strategy_spread, rate_spread},
         rate::solve_rate_rebalance,
         scheduler::{ResourceReservations, SchedulablePlan, select_next},
-        simulator::{no_plan_terminal_existing_shareholder_assets, simulate_actions},
+        simulator::{
+            no_plan_terminal_existing_shareholder_assets, no_plan_terminal_real_assets,
+            simulate_actions,
+        },
     },
     state::{
         attribution::{OrderedAssetFlow, OrderedTransactionFlow},
@@ -1159,6 +1162,63 @@ fn first_allocation_into_an_unused_market_remains_in_parent_horizon_value()
     let without_plan =
         no_plan_terminal_existing_shareholder_assets(&snapshot, &vault, &projection, horizon)?;
     assert!(with_plan >= without_plan.saturating_sub(U256::ONE));
+    Ok(())
+}
+
+#[test]
+fn zero_parent_max_rate_does_not_hide_recoverable_asset_gain() -> Result<(), Box<dyn Error>> {
+    let (mut snapshot, vault) = projection_fixture()?;
+    snapshot.parent.max_rate = U256::ZERO;
+    let configured = &vault.positions[0];
+    let adapter = snapshot
+        .adapters
+        .get_mut(&configured.adapter)
+        .ok_or_else(|| std::io::Error::other("adapter missing"))?;
+    adapter.current_market_ids.clear();
+    adapter.real_assets = U256::ZERO;
+    let position = snapshot
+        .positions
+        .get_mut(&configured.position_key)
+        .ok_or_else(|| std::io::Error::other("position missing"))?;
+    position.internal_supply_shares = U256::ZERO;
+    position.actual_morpho_supply_shares = U256::ZERO;
+    position.expected_assets = U256::ZERO;
+    position.parent_recorded_market_allocation = U256::ZERO;
+    for cap in snapshot.caps.values_mut() {
+        cap.recorded_allocation = U256::ZERO;
+    }
+    snapshot.parent.stored_total_assets = snapshot.parent.idle_assets;
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x11),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp + 12,
+        gas_limit: snapshot.context.block.gas_limit,
+    };
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let amount = U256::from(1_000_000_000_u64);
+    let state = simulate_actions(
+        &snapshot,
+        &projection,
+        &vault,
+        &[V2Action::Allocate {
+            position: configured.position_key,
+            adapter: configured.adapter,
+            data: encode_adapter_data(&configured.market_params),
+            requested_assets: RequestedAssets(amount),
+        }],
+    )?;
+    let horizon = head.timestamp + 86_400;
+    let plan_shareholder_assets =
+        state.terminal_existing_shareholder_assets(&snapshot, &projection, horizon)?;
+    let no_plan_shareholder_assets =
+        no_plan_terminal_existing_shareholder_assets(&snapshot, &vault, &projection, horizon)?;
+    assert_eq!(plan_shareholder_assets, no_plan_shareholder_assets);
+
+    let plan_real_assets = state.terminal_real_assets(&snapshot, &projection, horizon)?;
+    let no_plan_real_assets =
+        no_plan_terminal_real_assets(&snapshot, &vault, &projection, horizon)?;
+    assert!(plan_real_assets > no_plan_real_assets);
     Ok(())
 }
 

@@ -27,6 +27,8 @@ pub enum DirtyReason {
     Reorg,
     /// Transaction completion requires one net current-state decision.
     PostTransaction,
+    /// Canonical five-minute strategy evaluation requires fresh exact rates and planning.
+    StrategyTick,
 }
 
 /// Complete immutable key that makes stale plan publication structurally detectable.
@@ -103,6 +105,20 @@ impl DirtyAccumulator {
                 DirtyReason::Startup,
                 true,
             );
+        }
+    }
+
+    /// Marks every deployed vault dirty for one canonical-time strategy tick.
+    pub fn mark_strategy_tick(&mut self, config: &ValidatedConfig, block_number: u64) {
+        for vault in &config.app.vaults {
+            if vault.deployment_block <= block_number {
+                self.mark(
+                    vault.address,
+                    block_number,
+                    DirtyReason::StrategyTick,
+                    false,
+                );
+            }
         }
     }
 
@@ -390,5 +406,23 @@ mod tests {
         assert_ne!(old.read_set_revision, rebuilt.read_set_revision);
         assert_ne!(old, rebuilt);
         assert!(rebuilt.dirty_reasons.contains(&DirtyReason::ReadSet));
+    }
+
+    #[test]
+    fn strategy_tick_creates_a_planning_generation_without_an_event() {
+        let vault = VaultAddress(Address::with_last_byte(1));
+        let mut dirty = DirtyAccumulator::default();
+        dirty.mark(vault, 300, DirtyReason::StrategyTick, false);
+        let revision = dirty
+            .bind_snapshot(
+                vault,
+                B256::repeat_byte(2),
+                B256::repeat_byte(3),
+                block(300),
+                B256::repeat_byte(4),
+            )
+            .expect("strategy tick revision");
+        assert_eq!(revision.latest_relevant_event_block, 300);
+        assert!(revision.dirty_reasons.contains(&DirtyReason::StrategyTick));
     }
 }

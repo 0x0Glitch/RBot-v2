@@ -62,6 +62,7 @@ normal:
       expected_vault_code_hash: "0x2222222222222222222222222222222222222222222222222222222222222222"
       deployment_block: 2345000
       signer_address: "0x0000000000000000000000000000000000000002" # Allocator EOA used for final eth_call and signing.
+      strategy: spread_equalization # Or top_k_apy_diversified for the shared diversified target.
 
       # Vault-level safety policy. Copy an allocator-reviewed profile; do not guess these values.
       strict_zero_routine_idle: true
@@ -202,3 +203,24 @@ advanced:
     extreme_spread_bypass_enabled: false # Forbidden in Execute mode.
     benefit_horizon: 6h
     maximum_daily_transactions: 24
+    # Used only by vaults selecting top_k_apy_diversified. APY thresholds are annualized bps.
+    top_k_apy:
+      enter_apy_bps: 200 # Candidate conservative APY improvement required to enter.
+      exit_apy_bps: 250 # Current selected market underperformance required to exit.
+      replacement_apy_bps: 100 # Post-probe APY improvement required for replacement.
+      fourth_market_entry_gap_apy_bps: 50
+      fourth_market_exit_gap_apy_bps: 100
+      upside_ema_alpha_bps: 2000 # Accept 20% of each upward observation; downside is immediate.
+      probe_allocation_bps: 500 # Test the rate after adding 5% of direct capital.
+      membership_confirmation: 30m # Canonical time, including initial membership.
+      tick_interval: 5m # Mandatory exact canonical refresh without requiring an event.
+      minimum_direct_assets_for_four_markets: "0" # Asset base units; set a meaningful TVL floor.
+      three_market_weights_bps: [4000, 4000, 2000]
+      four_market_weights_bps: [3500, 3500, 1500, 1500]
+      entry_score_wad: "50000000000000000" # Rebalance when >5% of direct capital must move.
+      target_score_wad: "10000000000000000" # Stop at or below 1% target distance.
+      minimum_improvement_score_wad: "10000000000000000" # Require at least 1% improvement.
+      minimum_net_gain_assets: "0" # Asset units remaining after gas, loss, and safety multiplier.
+      gas_cost_multiplier: 3
+      native_token_price_ceiling_asset_wad: "0" # Must be set for Execute; vault asset per native token.
+      maximum_diversification_cost_apy_bps: 25

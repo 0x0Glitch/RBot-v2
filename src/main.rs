@@ -378,6 +378,7 @@ async fn run_supervised(
         )
         .map_err(|error| error.to_string())?
         .with_log_filter(Arc::new(sources.clone()))
+        .with_indexed_token_accounts(sources.indexed_token_accounts())
         .with_head_hints(head_hints_tx)
         .with_provider_readiness(Arc::clone(&provider_ready)),
     );
@@ -691,7 +692,11 @@ async fn poll_canonical_chain(
     consecutive_failures: &AtomicU32,
     health: &HealthState,
 ) -> Result<(), ServiceFailure> {
-    let result = match chain.poll_once().await {
+    let polled = tokio::select! {
+        () = shutdown.cancelled() => return Ok(()),
+        result = chain.poll_once() => result,
+    };
+    let result = match polled {
         Ok(_) => {
             consecutive_failures.store(0, Ordering::Release);
             Ok(())
@@ -739,6 +744,7 @@ fn retryable_chain_error(error: &ChainError) -> bool {
     match error {
         ChainError::Provider(
             ProviderError::Transport { .. }
+            | ProviderError::MalformedResponse { .. }
             | ProviderError::MissingBlock
             | ProviderError::HttpStatus { status: 429, .. }
             | ProviderError::HttpStatus {
@@ -767,11 +773,14 @@ async fn run_state_service(
 ) -> Result<(), ServiceFailure> {
     let mut state =
         state.map_err(|_| ServiceFailure::restart("state worker reconstruction failed"))?;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             // Ordered canonical events must drain before a replaceable head is used for planning.
             biased;
             () = shutdown.cancelled() => return Ok(()),
+            _ = heartbeat.tick() => state.record_worker_heartbeat(),
             update = async {
                 let mut receiver = updates.lock().await;
                 receiver.recv().await
@@ -1323,6 +1332,11 @@ mod chain_retry_tests {
     #[test]
     fn only_temporary_provider_view_mismatch_is_retryable() {
         assert!(retryable_chain_error(&ChainError::ProviderViewInconsistent));
+        assert!(retryable_chain_error(&ChainError::Provider(
+            morpho_v2_reallocator::chain::provider::ProviderError::MalformedResponse {
+                method: "eth_getLogs",
+            },
+        )));
         assert!(!retryable_chain_error(&ChainError::InvalidBundle(
             "receipt block identity mismatch"
         )));

@@ -231,6 +231,7 @@ const COUNTER_NAMES: &[&str] = &[
     "reallocator_idle_ledger_replay_failure",
     "reallocator_snapshot_retries",
     "reallocator_plans_superseded",
+    "reallocator_strategy_ticks",
 ];
 
 #[cfg(test)]
@@ -283,6 +284,7 @@ mod tests {
             utilization_spread_wad: U256::from(13_u8),
             utilization_spread_bps: 14,
             selected_objective: StrategyObjective::UtilizationSpread,
+            vault_strategy: crate::config::VaultStrategy::SpreadEqualization,
             selected_objective_spread_wad: U256::from(13_u8),
             markets: vec![MarketRateView {
                 market_id: MarketId(B256::repeat_byte(13)),

@@ -4,7 +4,7 @@ use alloy::primitives::{B256, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::StrategyObjective,
+    config::{StrategyObjective, VaultStrategy},
     domain::{BlockRef, ExactVaultSnapshot, MarketId, V2Plan, VaultAddress},
     planner::episodes::RateSignalEpisode,
     runtime::controller::VaultRuntimeStatus,
@@ -63,6 +63,8 @@ pub struct RateSnapshotView {
     pub utilization_spread_bps: u64,
     /// Objective selected by configuration for autonomous equalization.
     pub selected_objective: StrategyObjective,
+    /// Vault-scoped allocation strategy that consumes this exact rate view.
+    pub vault_strategy: VaultStrategy,
     /// Spread in the selected objective's native WAD domain.
     pub selected_objective_spread_wad: U256,
     /// Deterministically ordered market rates.

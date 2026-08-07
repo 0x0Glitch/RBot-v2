@@ -20,7 +20,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     domain::{BlockRef, EpisodeId, ExactVaultSnapshot, RateGroupId, V2Plan, VaultAddress},
-    planner::episodes::{RateEpisodeState, RateEpisodeStopReason, RateSignalEpisode},
+    planner::{
+        episodes::{RateEpisodeState, RateEpisodeStopReason, RateSignalEpisode},
+        top_k_apy::TopKApyMemory,
+    },
     state::topology::TopologyIndex,
 };
 
@@ -39,7 +42,7 @@ use super::{
 /// Default bounded storage mailbox capacity.
 pub const DEFAULT_STORAGE_CHANNEL_CAPACITY: usize = 128;
 const STORAGE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const JSON_FORMAT_VERSION: u32 = 3;
+const JSON_FORMAT_VERSION: u32 = 4;
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const JOURNAL_SEGMENT_EVENTS: u64 = 128;
 const HOT_BLOCK_RETENTION: u64 = 512;
@@ -100,6 +103,13 @@ struct TimedEpisode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct TimedTopKApyMemory {
+    vault: VaultAddress,
+    memory: TopKApyMemory,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TransactionRow {
     reservation: NonceReservation,
     state: TransactionState,
@@ -135,6 +145,8 @@ struct JsonState {
     reconciliation_records: Vec<ReconciliationRecord>,
     topology_history: Vec<TopologyRevision>,
     rate_episodes: Vec<TimedEpisode>,
+    #[serde(default)]
+    top_k_apy_memory: Vec<TimedTopKApyMemory>,
 }
 
 impl Default for JsonState {
@@ -156,6 +168,7 @@ impl Default for JsonState {
             reconciliation_records: Vec::new(),
             topology_history: Vec::new(),
             rate_episodes: Vec::new(),
+            top_k_apy_memory: Vec::new(),
         }
     }
 }
@@ -186,6 +199,10 @@ impl JsonStore {
                     movement_migration = true;
                 }
                 2 => movement_migration = true,
+                3 => {
+                    state.format_version = JSON_FORMAT_VERSION;
+                    migrated = true;
+                }
                 actual => {
                     return Err(StorageError::FormatVersion {
                         actual,
@@ -1101,6 +1118,24 @@ pub enum StorageCommand {
         /// Episode result.
         reply: oneshot::Sender<Result<Option<RateSignalEpisode>, StorageError>>,
     },
+    /// Persist one vault's top-K APY memory after an exact canonical observation.
+    PersistTopKApyMemory {
+        /// Parent vault.
+        vault: VaultAddress,
+        /// Complete strategy-owned durable memory.
+        memory: Box<TopKApyMemory>,
+        /// Canonical update timestamp.
+        updated_at: u64,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Load one vault's latest top-K APY memory.
+    LoadTopKApyMemory {
+        /// Parent vault.
+        vault: VaultAddress,
+        /// Durable memory result.
+        reply: oneshot::Sender<Result<Option<TopKApyMemory>, StorageError>>,
+    },
     /// Produce an atomic JSON backup.
     Backup {
         /// Destination.
@@ -1631,6 +1666,31 @@ impl StorageHandle {
             reply,
         })
         .await
+    }
+
+    /// Persists one complete top-K APY memory observation.
+    pub async fn persist_top_k_apy_memory(
+        &self,
+        vault: VaultAddress,
+        memory: TopKApyMemory,
+        updated_at: u64,
+    ) -> Result<(), StorageError> {
+        self.request(|reply| StorageCommand::PersistTopKApyMemory {
+            vault,
+            memory: Box::new(memory),
+            updated_at,
+            reply,
+        })
+        .await
+    }
+
+    /// Loads one vault's durable top-K APY memory.
+    pub async fn load_top_k_apy_memory(
+        &self,
+        vault: VaultAddress,
+    ) -> Result<Option<TopKApyMemory>, StorageError> {
+        self.request(|reply| StorageCommand::LoadTopKApyMemory { vault, reply })
+            .await
     }
 
     /// Produces an atomic JSON backup.
@@ -2259,6 +2319,37 @@ fn run_actor(
                 };
                 let _ = reply.send(result);
             }
+            StorageCommand::PersistTopKApyMemory {
+                vault,
+                memory,
+                updated_at,
+                reply,
+            } => {
+                let _ = reply.send(store.commit(|state| {
+                    if memory.last_observed_timestamp > updated_at {
+                        return Err(StorageError::Invariant(
+                            "top-K memory timestamp exceeds durable update timestamp",
+                        ));
+                    }
+                    state.top_k_apy_memory.retain(|entry| entry.vault != vault);
+                    state.top_k_apy_memory.push(TimedTopKApyMemory {
+                        vault,
+                        memory: *memory,
+                        updated_at,
+                    });
+                    state.top_k_apy_memory.sort_by_key(|entry| entry.vault);
+                    Ok(())
+                }));
+            }
+            StorageCommand::LoadTopKApyMemory { vault, reply } => {
+                let memory = store
+                    .state
+                    .top_k_apy_memory
+                    .iter()
+                    .find(|entry| entry.vault == vault)
+                    .map(|entry| entry.memory.clone());
+                let _ = reply.send(Ok(memory));
+            }
             StorageCommand::Backup {
                 destination,
                 unique_suffix,
@@ -2540,6 +2631,9 @@ fn rewind(
                     .confirmation_block
                     .is_none_or(|block| block.number <= ancestor.number)
     });
+    state
+        .top_k_apy_memory
+        .retain(|entry| entry.memory.last_observed_block <= ancestor.number);
     let mut transactions_orphaned = 0_u64;
     for transaction in &mut state.transactions {
         if transaction

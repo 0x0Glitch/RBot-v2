@@ -170,6 +170,18 @@ impl EventSourceRegistry {
         self.sources.keys().copied().collect()
     }
 
+    /// Returns token/account pairs for indexed historical ERC-20 transfer queries.
+    #[must_use]
+    pub fn indexed_token_accounts(&self) -> BTreeMap<Address, std::collections::BTreeSet<Address>> {
+        self.sources
+            .iter()
+            .filter_map(|(address, source)| {
+                matches!(source, EventSource::Token(_))
+                    .then_some((*address, self.token_accounts.clone()))
+            })
+            .collect()
+    }
+
     pub(crate) fn source(&self, address: Address) -> Option<EventSource> {
         self.sources.get(&address).copied()
     }
@@ -251,6 +263,7 @@ pub struct CanonicalStateService<P> {
     providers_ready: bool,
     signer_ready: bool,
     last_exact_head: Option<BlockRef>,
+    last_strategy_tick_timestamp: Option<u64>,
     pending_latest_snapshots: BTreeMap<VaultAddress, ExactVaultSnapshot>,
     dirty: DirtyAccumulator,
     planning_work: PlanningWorkSet,
@@ -288,6 +301,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             providers_ready: true,
             signer_ready: false,
             last_exact_head: None,
+            last_strategy_tick_timestamp: None,
             pending_latest_snapshots: BTreeMap::new(),
             dirty,
             planning_work: PlanningWorkSet::default(),
@@ -327,6 +341,11 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         self.publish_readiness(false, false).await
     }
 
+    /// Records that the state-owner select loop remains schedulable even without chain updates.
+    pub fn record_worker_heartbeat(&self) {
+        self.health.record_state_heartbeat();
+    }
+
     /// Applies one storage-acknowledged canonical update in strict publication order.
     pub async fn apply_update(&mut self, update: ChainUpdate) -> Result<(), StateServiceError> {
         self.health.record_state_heartbeat();
@@ -345,11 +364,34 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 // leaves every vault in CatchingUp and cannot be bypassed by the executor.
                 self.providers_ready = true;
                 self.ensure_replayed_through(head).await?;
+                if strategy_tick_due(
+                    self.last_strategy_tick_timestamp,
+                    head.timestamp,
+                    self.config.app.strategy.top_k_apy.tick_interval_seconds,
+                ) {
+                    self.dirty.mark_strategy_tick(&self.config, head.number);
+                    for vault in self.dirty.dirty_vaults() {
+                        self.planning_work.vaults.remove(&vault);
+                    }
+                    if let Some(sender) = &self.planning_triggers {
+                        sender.send_replace(self.planning_work.clone());
+                    }
+                    self.last_strategy_tick_timestamp = Some(head.timestamp);
+                    self.metrics
+                        .increment("reallocator_strategy_ticks")
+                        .map_err(|_| StateServiceError::Metric)?;
+                    tracing::info!(
+                        block = head.number,
+                        canonical_timestamp = head.timestamp,
+                        vaults = self.config.app.vaults.len(),
+                        "strategy tick"
+                    );
+                }
                 if self.last_exact_head != Some(head) {
                     match self.refresh_exact_at_head(head).await {
                         Ok(()) => {
                             self.last_exact_head = Some(head);
-                            tracing::info!(block = head.number, "block processed");
+                            tracing::debug!(block = head.number, "block processed");
                         }
                         Err(error) if transient_snapshot_context(&error) => {
                             self.mark_catching_up().await?;
@@ -368,6 +410,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 self.mark_catching_up().await?;
                 self.vaults.clear();
                 self.last_exact_head = None;
+                self.last_strategy_tick_timestamp = None;
                 self.pending_latest_snapshots.clear();
                 self.dirty.mark_reorg(&self.config, common_ancestor.number);
                 self.rebuild_through(common_ancestor).await?;
@@ -751,6 +794,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 utilization_spread_wad: utilization_spread,
                 utilization_spread_bps: utilization_wad_to_bps_down(utilization_spread),
                 selected_objective: self.config.app.strategy.objective,
+                vault_strategy: vault.strategy,
                 selected_objective_spread_wad: selected_objective_spread,
                 markets: projection
                     .markets
@@ -1494,6 +1538,17 @@ fn exact_ready_for_mode(mode: RuntimeMode, snapshot: &crate::domain::ExactVaultS
     }
 }
 
+fn strategy_tick_due(last_tick: Option<u64>, canonical_timestamp: u64, interval: u64) -> bool {
+    if interval == 0 {
+        return false;
+    }
+    last_tick.is_none_or(|last| {
+        canonical_timestamp
+            .checked_sub(last)
+            .is_some_and(|elapsed| elapsed >= interval)
+    })
+}
+
 const fn plan_refresh_allowed(
     mode: RuntimeMode,
     can_project: bool,
@@ -1538,6 +1593,14 @@ mod tests {
 
     use super::*;
     use crate::domain::{Assets, RateGroupId};
+
+    #[test]
+    fn strategy_tick_uses_canonical_five_minute_boundaries() {
+        assert!(strategy_tick_due(None, 1_000, 300));
+        assert!(!strategy_tick_due(Some(1_000), 1_299, 300));
+        assert!(strategy_tick_due(Some(1_000), 1_300, 300));
+        assert!(!strategy_tick_due(Some(1_000), 999, 300));
+    }
 
     fn immediate_episode(source: MarketId, destination: MarketId) -> RateSignalEpisode {
         let detection = BlockRef {

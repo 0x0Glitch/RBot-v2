@@ -16,8 +16,9 @@ use crate::{
         multicall::{AtomicSnapshotProvider, MulticallError},
         provider::TransactionLookupProvider,
     },
-    config::{SnapshotMode, ValidatedConfig},
+    config::{SnapshotMode, ValidatedConfig, VaultStrategy},
     domain::{BlockRef, IdleLockLedgerSnapshot, PlanReason, RateObjectiveBranch, VaultAddress},
+    planner::top_k_apy::{observe_top_k_target, verified_deployable_capital},
     planner::{
         objective::complete_strategy_spread,
         simulator::{no_plan_terminal_existing_shareholder_assets, simulate_actions},
@@ -26,7 +27,9 @@ use crate::{
         identity::{RuntimeIdentities, RuntimeIdentityError},
         idle_ledger_service::{IdleLedgerServiceError, rebuild_idle_ledger},
         planning_service::{
-            build_validated_capital_plan, build_validated_liquidity_plan, build_validated_rate_plan,
+            build_validated_capital_plan, build_validated_liquidity_plan,
+            build_validated_rate_plan, build_validated_top_k_capital_plan,
+            build_validated_top_k_rebalance_plan,
         },
         state_service::{EventSourceRegistry, StateServiceError, replay_topology_through},
     },
@@ -303,9 +306,63 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             .find(|(kind, _)| *kind == InclusionScenarioKind::Expected)
             .map(|(_, projection)| projection)
             .ok_or(PreflightSourceError::Failed)?;
+        let top_k_preflight = if top_k_preflight_required(vault.strategy, published_reason) {
+            let memory = self
+                .storage
+                .load_top_k_apy_memory(vault.address)
+                .await
+                .map_err(|_| PreflightSourceError::FatalAt("top_k_memory_load"))?;
+            let funding = verified_deployable_capital(&snapshot, vault)
+                .map_err(|_| PreflightSourceError::FailedAt("top_k_funding"))?;
+            let additional = if published_reason == PlanReason::CapitalDeployment {
+                funding.total_assets
+            } else {
+                if !funding.total_assets.is_zero() {
+                    return Err(PreflightSourceError::ContextChanged);
+                }
+                U256::ZERO
+            };
+            let observation = observe_top_k_target(
+                &snapshot,
+                expected,
+                vault,
+                &self.config.app.strategy.top_k_apy,
+                memory.as_ref(),
+                additional,
+            )
+            .map_err(|_| PreflightSourceError::FailedAt("top_k_target"))?;
+            self.storage
+                .persist_top_k_apy_memory(vault.address, observation.next_memory, head.timestamp)
+                .await
+                .map_err(|_| PreflightSourceError::FatalAt("top_k_memory_persist"))?;
+            Some((
+                observation
+                    .target
+                    .ok_or(PreflightSourceError::ContextChanged)?,
+                funding,
+            ))
+        } else {
+            None
+        };
         let prepared = match published_reason {
             PlanReason::LiquidityMaintenance => {
                 build_validated_liquidity_plan(&self.config, vault, &snapshot, expected, None)
+            }
+            PlanReason::CapitalDeployment
+                if vault.strategy == VaultStrategy::TopKApyDiversified =>
+            {
+                let (target, funding) = top_k_preflight
+                    .as_ref()
+                    .ok_or(PreflightSourceError::FailedAt("top_k_target"))?;
+                build_validated_top_k_capital_plan(
+                    &self.config,
+                    vault,
+                    &snapshot,
+                    expected,
+                    target,
+                    *funding,
+                    None,
+                )
             }
             PlanReason::CapitalDeployment => {
                 build_validated_capital_plan(&self.config, vault, &snapshot, expected, None)
@@ -318,6 +375,19 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                 episode.as_ref().ok_or(PreflightSourceError::Failed)?,
                 None,
             ),
+            PlanReason::TopKApyRebalance => {
+                let (target, _) = top_k_preflight
+                    .as_ref()
+                    .ok_or(PreflightSourceError::FailedAt("top_k_target"))?;
+                build_validated_top_k_rebalance_plan(
+                    &self.config,
+                    vault,
+                    &snapshot,
+                    expected,
+                    target,
+                    None,
+                )
+            }
             PlanReason::PositionSyncRequired => return Err(PreflightSourceError::Failed),
         }
         .map_err(|_| PreflightSourceError::FailedAt("semantic_plan_build"))?
@@ -344,6 +414,14 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             scenarios,
         })
     }
+}
+
+fn top_k_preflight_required(strategy: VaultStrategy, reason: PlanReason) -> bool {
+    strategy == VaultStrategy::TopKApyDiversified
+        && matches!(
+            reason,
+            PlanReason::CapitalDeployment | PlanReason::TopKApyRebalance
+        )
 }
 
 fn classify_identity_error(error: RuntimeIdentityError) -> PreflightSourceError {
@@ -485,12 +563,14 @@ fn validate_scenario(
 
 #[cfg(test)]
 mod tests {
-    use super::classify_snapshot_error;
+    use super::{classify_snapshot_error, top_k_preflight_required};
     use crate::{
         chain::{
             multicall::MulticallError,
             provider::{ProviderError, RpcErrorCategory},
         },
+        config::VaultStrategy,
+        domain::PlanReason,
         state::snapshot::SnapshotError,
         transaction::final_preflight::PreflightSourceError,
     };
@@ -516,5 +596,21 @@ mod tests {
             deterministic,
             PreflightSourceError::RetryableAt("exact_snapshot_provider")
         );
+    }
+
+    #[test]
+    fn top_k_membership_never_blocks_higher_priority_liquidity_preflight() {
+        assert!(!top_k_preflight_required(
+            VaultStrategy::TopKApyDiversified,
+            PlanReason::LiquidityMaintenance,
+        ));
+        assert!(top_k_preflight_required(
+            VaultStrategy::TopKApyDiversified,
+            PlanReason::CapitalDeployment,
+        ));
+        assert!(top_k_preflight_required(
+            VaultStrategy::TopKApyDiversified,
+            PlanReason::TopKApyRebalance,
+        ));
     }
 }

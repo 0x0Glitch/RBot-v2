@@ -6,7 +6,8 @@ use std::collections::BTreeSet;
 
 use alloy::primitives::{Address, B256, Bytes};
 use morpho_v2_reallocator::chain::provider::{
-    CapabilityProbe, ChainDataProvider, HttpProvider, ProviderError, ProviderRole, RpcErrorCategory,
+    CapabilityProbe, ChainDataProvider, FeeQuoteProvider, HttpProvider, ProviderError,
+    ProviderRole, RpcErrorCategory,
 };
 use morpho_v2_reallocator::config::BlockOpportunityPolicy;
 use serde_json::{Value, json};
@@ -40,6 +41,8 @@ impl Respond for RpcResponder {
                 "eth_getCode" => json!("0x6000"),
                 "eth_getStorageAt" => json!(B256::ZERO),
                 "eth_getTransactionCount" => json!("0x7"),
+                "eth_gasPrice" => json!("0x5f5e100"),
+                "eth_maxPriorityFeePerGas" => json!("0x0"),
                 "eth_getTransactionByHash" | "eth_getTransactionReceipt" => Value::Null,
                 "eth_usingBigBlocks" => json!(false),
                 _ => return ResponseTemplate::new(200).set_body_json(json!({
@@ -126,6 +129,8 @@ async fn capability_probe_covers_required_methods_with_one_latest_header_call()
         "eth_getCode",
         "eth_getStorageAt",
         "eth_getTransactionCount",
+        "eth_gasPrice",
+        "eth_maxPriorityFeePerGas",
         "eth_getTransactionByHash",
         "eth_getTransactionReceipt",
         "eth_usingBigBlocks",
@@ -140,6 +145,15 @@ async fn capability_probe_covers_required_methods_with_one_latest_header_call()
         1
     );
     assert!(!methods.iter().any(|method| method == "eth_blockNumber"));
+    let quote = provider.fee_quote().await?;
+    assert_eq!(
+        quote.gas_price,
+        alloy::primitives::U256::from(100_000_000_u64)
+    );
+    assert_eq!(
+        quote.max_priority_fee_per_gas,
+        alloy::primitives::U256::ZERO
+    );
     Ok(())
 }
 

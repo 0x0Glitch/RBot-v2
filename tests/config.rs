@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use alloy::primitives::B256;
 use morpho_v2_reallocator::config::{
     AppConfig, BlockOpportunityPolicy, ConfigError, RpcRole, RuntimeMode, SigningConfig,
-    StrategyObjective, config_revision,
+    StrategyObjective, VaultStrategy, config_revision,
 };
 
 fn example_path() -> PathBuf {
@@ -84,6 +84,20 @@ fn checked_in_hyperevm_vault_configuration_is_exact_and_complete() {
         alloy::primitives::U256::ZERO
     );
     assert_eq!(validated.app.strategy.immediate_tranche_bps, 9_000);
+    assert_eq!(vault.strategy, VaultStrategy::TopKApyDiversified);
+    assert_eq!(validated.app.strategy.top_k_apy.tick_interval_seconds, 300);
+    assert_eq!(
+        validated.app.strategy.top_k_apy.enter_apy_wad,
+        alloy::primitives::U256::from(20_000_000_000_000_000_u64)
+    );
+    assert_eq!(
+        validated.app.strategy.top_k_apy.exit_apy_wad,
+        alloy::primitives::U256::from(25_000_000_000_000_000_u64)
+    );
+    assert_eq!(
+        validated.app.strategy.top_k_apy.replacement_apy_wad,
+        alloy::primitives::U256::from(10_000_000_000_000_000_u64)
+    );
     assert_eq!(vault.positions.len(), 8);
     assert!(vault.liquidity_adapter.is_some());
 }
@@ -215,6 +229,26 @@ fn invalid_strategy_bounds_are_rejected() {
             Err(error) => error,
         },
         "strategy.maximum_daily_transactions",
+    );
+
+    let mut config = raw_example();
+    config.strategy.top_k_apy.tick_interval = std::time::Duration::from_secs(301);
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("non-five-minute strategy tick must fail"),
+            Err(error) => error,
+        },
+        "strategy.top_k_apy.timing",
+    );
+
+    let mut config = raw_example();
+    config.strategy.top_k_apy.enter_apy_bps = 0;
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("zero top-K entry threshold must fail"),
+            Err(error) => error,
+        },
+        "strategy.top_k_apy.hysteresis",
     );
 
     let mut config = raw_example();

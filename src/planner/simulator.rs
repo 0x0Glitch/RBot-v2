@@ -124,6 +124,83 @@ fn apply_delta(value: U256, delta: I256) -> Result<U256, SimulationError> {
 }
 
 impl SimulationState {
+    fn terminal_adapter_assets(
+        &self,
+        snapshot: &ExactVaultSnapshot,
+        projection: &ProjectedVaultView,
+        horizon_timestamp: u64,
+    ) -> Result<BTreeMap<AdapterAddress, U256>, SimulationError> {
+        if horizon_timestamp < projection.head.timestamp {
+            return Err(SimulationError::Arithmetic);
+        }
+        let mut terminal_markets = BTreeMap::new();
+        for (id, market) in &self.markets {
+            let source = snapshot
+                .markets
+                .get(id)
+                .ok_or(SimulationError::IncompleteState)?;
+            let stored = crate::domain::StoredMarketState {
+                market_id: *id,
+                params: source.params,
+                total_supply_assets: market.total_supply_assets,
+                total_supply_shares: market.total_supply_shares,
+                total_borrow_assets: market.total_borrow_assets,
+                total_borrow_shares: market.total_borrow_shares,
+                last_update: projection.head.timestamp,
+                fee: source.fee,
+                irm: source.irm,
+                stored_rate_at_target: market.ending_rate_at_target,
+                morpho_loan_token_balance: self
+                    .shared_liquidity
+                    .remaining(TokenAddress(source.params.loan_token))?,
+            };
+            terminal_markets.insert(
+                *id,
+                accrue_market(
+                    &stored,
+                    horizon_timestamp,
+                    &AdaptiveCurveState {
+                        stored_rate_at_target: stored.stored_rate_at_target,
+                    },
+                )?
+                .market,
+            );
+        }
+        let mut terminal_adapter_assets = BTreeMap::new();
+        for position in self.positions.values() {
+            if position.current {
+                let market = terminal_markets
+                    .get(&position.market)
+                    .ok_or(SimulationError::IncompleteState)?;
+                let assets = expected_adapter_assets(position.internal_shares, market)?;
+                let total = terminal_adapter_assets
+                    .entry(position.adapter)
+                    .or_insert(U256::ZERO);
+                *total = total
+                    .checked_add(assets)
+                    .ok_or(SimulationError::Arithmetic)?;
+            }
+        }
+        if let Some(liquidity) = &self.liquidity_adapter {
+            terminal_adapter_assets.insert(liquidity.adapter, liquidity.real_assets);
+        }
+        Ok(terminal_adapter_assets)
+    }
+
+    /// Projects total recoverable vault assets before the parent max-rate distribution ceiling.
+    pub fn terminal_real_assets(
+        &self,
+        snapshot: &ExactVaultSnapshot,
+        projection: &ProjectedVaultView,
+        horizon_timestamp: u64,
+    ) -> Result<U256, SimulationError> {
+        self.terminal_adapter_assets(snapshot, projection, horizon_timestamp)?
+            .into_values()
+            .try_fold(self.vault_idle, |total, assets| {
+                total.checked_add(assets).ok_or(SimulationError::Arithmetic)
+            })
+    }
+
     /// Builds one isolated candidate state from an exact snapshot and one inclusion projection.
     pub fn from_projection(
         snapshot: &ExactVaultSnapshot,
@@ -508,60 +585,8 @@ impl SimulationState {
         projection: &ProjectedVaultView,
         horizon_timestamp: u64,
     ) -> Result<U256, SimulationError> {
-        if horizon_timestamp < projection.head.timestamp {
-            return Err(SimulationError::Arithmetic);
-        }
-        let mut terminal_markets = BTreeMap::new();
-        for (id, market) in &self.markets {
-            let source = snapshot
-                .markets
-                .get(id)
-                .ok_or(SimulationError::IncompleteState)?;
-            let stored = crate::domain::StoredMarketState {
-                market_id: *id,
-                params: source.params,
-                total_supply_assets: market.total_supply_assets,
-                total_supply_shares: market.total_supply_shares,
-                total_borrow_assets: market.total_borrow_assets,
-                total_borrow_shares: market.total_borrow_shares,
-                last_update: projection.head.timestamp,
-                fee: source.fee,
-                irm: source.irm,
-                stored_rate_at_target: market.ending_rate_at_target,
-                morpho_loan_token_balance: self
-                    .shared_liquidity
-                    .remaining(TokenAddress(source.params.loan_token))?,
-            };
-            terminal_markets.insert(
-                *id,
-                accrue_market(
-                    &stored,
-                    horizon_timestamp,
-                    &AdaptiveCurveState {
-                        stored_rate_at_target: stored.stored_rate_at_target,
-                    },
-                )?
-                .market,
-            );
-        }
-        let mut terminal_adapter_assets = BTreeMap::new();
-        for position in self.positions.values() {
-            if position.current {
-                let market = terminal_markets
-                    .get(&position.market)
-                    .ok_or(SimulationError::IncompleteState)?;
-                let assets = expected_adapter_assets(position.internal_shares, market)?;
-                let total = terminal_adapter_assets
-                    .entry(position.adapter)
-                    .or_insert(U256::ZERO);
-                *total = total
-                    .checked_add(assets)
-                    .ok_or(SimulationError::Arithmetic)?;
-            }
-        }
-        if let Some(liquidity) = &self.liquidity_adapter {
-            terminal_adapter_assets.insert(liquidity.adapter, liquidity.real_assets);
-        }
+        let terminal_adapter_assets =
+            self.terminal_adapter_assets(snapshot, projection, horizon_timestamp)?;
         let mut parent = snapshot.parent.clone();
         parent.idle_assets = self.vault_idle;
         parent.stored_total_assets = match self.first_total_assets {
@@ -647,6 +672,56 @@ pub fn no_plan_terminal_existing_shareholder_assets(
         denominator_shares,
     )
     .map_err(MathError::from)?)
+}
+
+/// Projects total recoverable no-plan assets before the parent max-rate distribution ceiling.
+pub fn no_plan_terminal_real_assets(
+    snapshot: &ExactVaultSnapshot,
+    config: &ValidatedVaultConfig,
+    projection: &ProjectedVaultView,
+    horizon_timestamp: u64,
+) -> Result<U256, SimulationError> {
+    let head = crate::domain::BlockRef {
+        number: projection.head.number,
+        hash: projection.head.hash,
+        parent_hash: projection.head.parent_hash,
+        timestamp: horizon_timestamp,
+        gas_limit: projection.head.gas_limit,
+    };
+    let terminal = crate::state::projection::project_snapshot_to_head(snapshot, head, config)
+        .map_err(|_| SimulationError::IncompleteState)?;
+    let direct_assets =
+        snapshot
+            .positions
+            .iter()
+            .try_fold(U256::ZERO, |total, (position_key, position)| {
+                let adapter = snapshot
+                    .adapters
+                    .get(&position.adapter)
+                    .ok_or(SimulationError::IncompleteState)?;
+                if !adapter.current_market_ids.contains(&position.market_id) {
+                    return Ok(total);
+                }
+                let assets = terminal
+                    .vault
+                    .position_expected_assets
+                    .get(position_key)
+                    .ok_or(SimulationError::IncompleteState)?;
+                total
+                    .checked_add(*assets)
+                    .ok_or(SimulationError::Arithmetic)
+            })?;
+    direct_assets
+        .checked_add(snapshot.parent.idle_assets)
+        .and_then(|total| {
+            snapshot
+                .liquidity_adapter
+                .as_ref()
+                .map_or(Some(total), |adapter| {
+                    total.checked_add(adapter.real_assets)
+                })
+        })
+        .ok_or(SimulationError::Arithmetic)
 }
 
 fn adapter_real_assets(

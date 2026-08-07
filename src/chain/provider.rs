@@ -221,6 +221,8 @@ pub struct ProviderCapabilities {
     pub storage: bool,
     /// Transaction-count read succeeded.
     pub transaction_count: bool,
+    /// Standard EIP-1559 fee quote methods succeeded.
+    pub fee_quote: bool,
     /// Transaction lookup method succeeded.
     pub transaction_lookup: bool,
     /// Receipt lookup method succeeded.
@@ -261,8 +263,11 @@ pub enum ProviderError {
     #[error("provider HTTP client initialization failed")]
     ClientInitialization,
     /// JSON-RPC response could not be decoded.
-    #[error("provider returned malformed JSON-RPC")]
-    MalformedResponse,
+    #[error("provider returned malformed JSON-RPC for {method}")]
+    MalformedResponse {
+        /// Static method name; endpoint details and response bodies remain redacted.
+        method: &'static str,
+    },
     /// JSON-RPC method is unsupported.
     #[error("provider does not support method {method}")]
     MethodUnsupported {
@@ -345,6 +350,20 @@ pub trait ChainDataProvider: Send + Sync {
         to: u64,
         addresses: &[Address],
     ) -> Result<Vec<RpcLog>, ProviderError>;
+    /// Deterministic bounded log query with optional topic-position OR filters.
+    ///
+    /// The default preserves correctness by returning the address-filtered superset. Providers
+    /// that support standard topic filters should override it to avoid high-volume token logs.
+    async fn logs_with_topics(
+        &self,
+        from: u64,
+        to: u64,
+        addresses: &[Address],
+        topics: &[Option<Vec<B256>>],
+    ) -> Result<Vec<RpcLog>, ProviderError> {
+        let _ = topics;
+        self.logs(from, to, addresses).await
+    }
     /// One receipt lookup for fallback ingestion and transaction recovery.
     async fn receipt_by_hash(&self, hash: B256) -> Result<Option<RpcReceipt>, ProviderError>;
 }
@@ -440,6 +459,22 @@ pub trait AccountFundingProvider: Send + Sync {
         signer: Address,
         block: BlockRef,
     ) -> Result<U256, ProviderError>;
+}
+
+/// Exact standard EIP-1559 fee quote returned by the configured read provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RpcFeeQuote {
+    /// Provider-recommended total gas price in wei.
+    pub gas_price: U256,
+    /// Provider-recommended priority fee in wei.
+    pub max_priority_fee_per_gas: U256,
+}
+
+/// Typed read-only fee surface used by the execution controller.
+#[async_trait]
+pub trait FeeQuoteProvider: Send + Sync {
+    /// Reads the standard current gas price and priority fee without a local fee guess.
+    async fn fee_quote(&self) -> Result<RpcFeeQuote, ProviderError>;
 }
 
 /// Role-scoped HTTP provider.
@@ -566,6 +601,10 @@ impl HttpProvider {
         let _: String = self
             .request_unscoped("eth_getTransactionCount", json!([probe.signer, "latest"]))
             .await?;
+        let _: String = self.request_unscoped("eth_gasPrice", json!([])).await?;
+        let _: String = self
+            .request_unscoped("eth_maxPriorityFeePerGas", json!([]))
+            .await?;
         let _: Option<Value> = self
             .request_unscoped(
                 "eth_getTransactionByHash",
@@ -599,6 +638,7 @@ impl HttpProvider {
             code: true,
             storage: true,
             transaction_count: true,
+            fee_quote: true,
             transaction_lookup: true,
             receipt_lookup: true,
             signer_uses_big_blocks,
@@ -774,9 +814,9 @@ impl HttpProvider {
         let envelope: RpcResponse = response
             .json()
             .await
-            .map_err(|_| ProviderError::MalformedResponse)?;
+            .map_err(|_| ProviderError::MalformedResponse { method })?;
         if envelope.jsonrpc != "2.0" || envelope.id != id {
-            return Err(ProviderError::MalformedResponse);
+            return Err(ProviderError::MalformedResponse { method });
         }
         if let Some(error) = envelope.error {
             if error.code == -32601 {
@@ -788,7 +828,8 @@ impl HttpProvider {
                 category: classify_rpc_error(method, error.code, &error.message),
             });
         }
-        serde_json::from_value(envelope.result).map_err(|_| ProviderError::MalformedResponse)
+        serde_json::from_value(envelope.result)
+            .map_err(|_| ProviderError::MalformedResponse { method })
     }
 }
 
@@ -873,11 +914,24 @@ impl ChainDataProvider for HttpProvider {
         to: u64,
         addresses: &[Address],
     ) -> Result<Vec<RpcLog>, ProviderError> {
+        self.logs_with_topics(from, to, addresses, &[]).await
+    }
+
+    async fn logs_with_topics(
+        &self,
+        from: u64,
+        to: u64,
+        addresses: &[Address],
+        topics: &[Option<Vec<B256>>],
+    ) -> Result<Vec<RpcLog>, ProviderError> {
         let mut filter = serde_json::Map::new();
         filter.insert("fromBlock".to_owned(), json!(format_quantity(from)));
         filter.insert("toBlock".to_owned(), json!(format_quantity(to)));
         if !addresses.is_empty() {
             filter.insert("address".to_owned(), json!(addresses));
+        }
+        if !topics.is_empty() {
+            filter.insert("topics".to_owned(), json!(topics));
         }
         self.request(
             ProviderRole::Logs,
@@ -936,7 +990,9 @@ impl TransactionLookupProvider for HttpProvider {
             });
         let found = matching.next();
         if matching.next().is_some() {
-            return Err(ProviderError::MalformedResponse);
+            return Err(ProviderError::MalformedResponse {
+                method: "eth_getBlockByNumber",
+            });
         }
         Ok(found)
     }
@@ -1044,6 +1100,25 @@ impl AccountFundingProvider for HttpProvider {
             )
             .await?;
         parse_u256_quantity("eth_getBalance", &quantity)
+    }
+}
+
+#[async_trait]
+impl FeeQuoteProvider for HttpProvider {
+    async fn fee_quote(&self) -> Result<RpcFeeQuote, ProviderError> {
+        let gas_price: String = self
+            .request(ProviderRole::Read, "eth_gasPrice", json!([]))
+            .await?;
+        let max_priority_fee_per_gas: String = self
+            .request(ProviderRole::Read, "eth_maxPriorityFeePerGas", json!([]))
+            .await?;
+        Ok(RpcFeeQuote {
+            gas_price: parse_u256_quantity("eth_gasPrice", &gas_price)?,
+            max_priority_fee_per_gas: parse_u256_quantity(
+                "eth_maxPriorityFeePerGas",
+                &max_priority_fee_per_gas,
+            )?,
+        })
     }
 }
 

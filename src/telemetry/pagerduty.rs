@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
+use std::time::Duration;
 use url::Url;
 
 use crate::{
@@ -82,7 +83,11 @@ impl PagerDutyTransport {
             return Err(AlertTransportError::Request);
         }
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|_| AlertTransportError::Request)?,
             endpoint,
             integration_key,
             source,

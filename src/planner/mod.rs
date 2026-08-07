@@ -21,6 +21,7 @@ pub mod objective;
 pub mod rate;
 pub mod scheduler;
 pub mod simulator;
+pub mod top_k_apy;
 
 /// One deterministic inclusion-time scenario identity and head.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

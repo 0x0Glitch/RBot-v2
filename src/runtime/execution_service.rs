@@ -18,9 +18,9 @@ use crate::{
         logs::{RawEventLog, StateInvalidation, decode_watched_event},
         multicall::AtomicSnapshotProvider,
         provider::{
-            AccountFundingProvider, AccountNonceProvider, ChainDataProvider, NonceRecoveryProvider,
-            ProviderError, RpcErrorCategory, SignedTransactionSubmitter, TransactionLookupProvider,
-            TransactionSimulationProvider, parse_quantity,
+            AccountFundingProvider, AccountNonceProvider, ChainDataProvider, FeeQuoteProvider,
+            NonceRecoveryProvider, ProviderError, RpcErrorCategory, SignedTransactionSubmitter,
+            TransactionLookupProvider, TransactionSimulationProvider, parse_quantity,
         },
         receipts::validate_receipt,
     },
@@ -57,6 +57,7 @@ use crate::{
     },
     telemetry::alerts::{Alert, AlertDispatcher, AlertKind, AlertSeverity},
     transaction::{
+        fees::initial_fee_quote,
         final_preflight::{
             ExecutePreflightRequest, ExecutionReservationManager, PreflightError,
             execute_one_head_preflight,
@@ -316,6 +317,7 @@ where
     P: AtomicSnapshotProvider
         + ChainDataProvider
         + AccountFundingProvider
+        + FeeQuoteProvider
         + AccountNonceProvider
         + TransactionSimulationProvider
         + SignedTransactionSubmitter
@@ -408,6 +410,29 @@ where
                 .map(ExecutionServiceError::Provider)
                 .unwrap_or(ExecutionServiceError::Recovery))
         }
+    }
+
+    async fn recovery_header_by_number(
+        &self,
+        number: u64,
+    ) -> Result<BlockRef, ExecutionServiceError> {
+        let mut observed = None;
+        let mut first_error = None;
+        for provider in &self.recovery_providers {
+            match provider.header_by_number(number).await {
+                Ok(block) if observed.as_ref().is_some_and(|current| current != &block) => {
+                    return Err(ExecutionServiceError::ProviderDisagreement);
+                }
+                Ok(block) => observed = Some(block),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        observed.ok_or_else(|| {
+            first_error
+                .map(ExecutionServiceError::Provider)
+                .unwrap_or(ExecutionServiceError::Recovery)
+        })
     }
 
     async fn recovery_transaction_by_sender_nonce_in_block(
@@ -570,13 +595,13 @@ where
         // Confirmed/latest nonce plus the durable unresolved row is the complete nonce truth.
         // HyperEVM's pending tag is neither queried nor required.
         let nonce = self.confirmed_nonce(vault.signer_address).await?;
-        let maximum_fee = u128::try_from(self.config.app.execution.maximum_fee_per_gas_wei)
-            .map_err(|_| ExecutionServiceError::FeeRange)?;
-        let initial_fee = maximum_fee
-            .checked_div(2)
-            .filter(|fee| *fee != 0)
-            .ok_or(ExecutionServiceError::FeeRange)?;
-        let priority_fee = initial_fee.min(1_000_000_000_u128);
+        let quote = self.provider.fee_quote().await?;
+        let (initial_fee, priority_fee) = initial_fee_quote(
+            quote.gas_price,
+            quote.max_priority_fee_per_gas,
+            self.config.app.execution.maximum_fee_per_gas_wei,
+        )
+        .map_err(|_| ExecutionServiceError::FeeRange)?;
         let initial_cost = U256::from(self.config.app.execution.maximum_signed_transaction_gas)
             .checked_mul(U256::from(initial_fee))
             .ok_or(ExecutionServiceError::FeeRange)?;
@@ -1261,6 +1286,26 @@ where
         pending: &crate::storage::models::UnresolvedTransaction,
         head: BlockRef,
     ) -> Result<(), ExecutionServiceError> {
+        // `latest` account state can advance before canonical ingestion reaches the inclusion
+        // block. A receipt for one of our durably known hashes proves that the nonce must remain
+        // owned while the cursor catches up; classifying it as foreign during that gap would
+        // permanently quarantine a healthy signer on one-second chains.
+        for hash in &pending.known_transaction_hashes {
+            let Some(receipt) = self.recovery_receipt_by_hash(*hash).await? else {
+                continue;
+            };
+            let number = parse_quantity("receipt.block_number", &receipt.block_number)?;
+            let canonical_header = self.recovery_header_by_number(number).await?;
+            if receipt_matches_canonical_header(&receipt, *hash, canonical_header)? {
+                tracing::debug!(
+                    transaction_hash = %hash,
+                    inclusion_block = number,
+                    cursor_block = head.number,
+                    "known transaction inclusion is waiting for canonical ingestion"
+                );
+                return Ok(());
+            }
+        }
         for number in pending.created_block..=head.number {
             let Some(block) = self
                 .storage
@@ -2112,6 +2157,18 @@ fn recovered_transaction_is_included(
     }
 }
 
+fn receipt_matches_canonical_header(
+    receipt: &crate::chain::provider::RpcReceipt,
+    expected_hash: B256,
+    canonical_header: BlockRef,
+) -> Result<bool, ExecutionServiceError> {
+    if receipt.transaction_hash != expected_hash {
+        return Err(ExecutionServiceError::Recovery);
+    }
+    let number = parse_quantity("receipt.block_number", &receipt.block_number)?;
+    Ok(number == canonical_header.number && receipt.block_hash == canonical_header.hash)
+}
+
 fn derive_transaction_id(vault: VaultAddress, head: BlockRef, nonce: u64) -> TransactionId {
     let mut identity = Vec::with_capacity(68);
     identity.extend_from_slice(vault.0.as_slice());
@@ -2221,11 +2278,13 @@ mod tests {
 
     use super::{
         ExecutionServiceError, contract_identity_failed, current_state_failure_is_recoverable,
-        provider_dependency_failed, provider_error_is_outage, receipt_reconciliation_is_retryable,
-        receipt_reconciliation_is_state_drift, recovered_transaction_is_included,
+        provider_dependency_failed, provider_error_is_outage, receipt_matches_canonical_header,
+        receipt_reconciliation_is_retryable, receipt_reconciliation_is_state_drift,
+        recovered_transaction_is_included,
     };
     use crate::{
-        chain::provider::{ProviderError, RpcErrorCategory, RpcTransaction},
+        chain::provider::{ProviderError, RpcErrorCategory, RpcReceipt, RpcTransaction},
+        domain::BlockRef,
         reconciliation::{
             conformance::{ConformanceError, ReceiptReconciliationError},
             current_state::{CurrentStateError, CurrentStateSourceError},
@@ -2268,6 +2327,43 @@ mod tests {
         let mut malformed = transaction();
         malformed.block_number = Some("0x6".to_owned());
         assert!(recovered_transaction_is_included(&malformed).is_err());
+    }
+
+    #[test]
+    fn known_receipt_waits_only_when_its_inclusion_header_is_canonical() {
+        let hash = B256::repeat_byte(7);
+        let canonical = BlockRef {
+            number: 12,
+            hash: B256::repeat_byte(8),
+            parent_hash: B256::repeat_byte(6),
+            timestamp: 100,
+            gas_limit: 30_000_000,
+        };
+        let receipt = RpcReceipt {
+            transaction_hash: hash,
+            block_hash: canonical.hash,
+            block_number: "0xc".to_owned(),
+            transaction_index: "0x1".to_owned(),
+            status: Some("0x1".to_owned()),
+            gas_used: "0x5208".to_owned(),
+            logs: Vec::new(),
+        };
+        assert_eq!(
+            receipt_matches_canonical_header(&receipt, hash, canonical).ok(),
+            Some(true)
+        );
+
+        let orphaned = BlockRef {
+            hash: B256::repeat_byte(9),
+            ..canonical
+        };
+        assert_eq!(
+            receipt_matches_canonical_header(&receipt, hash, orphaned).ok(),
+            Some(false)
+        );
+        assert!(
+            receipt_matches_canonical_header(&receipt, B256::repeat_byte(10), canonical).is_err()
+        );
     }
 
     #[test]

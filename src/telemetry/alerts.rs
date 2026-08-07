@@ -227,7 +227,10 @@ impl AlertDispatcher {
         }
         let mut failed = false;
         for transport in &self.transports {
-            if transport.send(&alert).await.is_err() {
+            let delivery =
+                tokio::time::timeout(std::time::Duration::from_secs(12), transport.send(&alert))
+                    .await;
+            if !matches!(delivery, Ok(Ok(()))) {
                 failed = true;
             }
         }

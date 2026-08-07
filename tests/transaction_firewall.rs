@@ -108,6 +108,7 @@ fn raw_plan(config: &ValidatedConfig) -> V2Plan {
             after_spread: U256::ZERO,
             immediate_loss_assets: U256::ZERO,
             terminal_value_delta_assets: I256::ZERO,
+            expected_gain_assets: U256::ZERO,
         },
         solver_certificate: SolverCertificate {
             candidate_lattice_hash: B256::repeat_byte(0x51),

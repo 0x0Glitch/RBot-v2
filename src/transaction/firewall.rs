@@ -204,6 +204,11 @@ fn validate_plan_integrity(
                         != plan.episode_id.map(|episode| episode.0)
                     || plan.solver_certificate.objective_branch.is_none()
             }
+            PlanReason::TopKApyRebalance => {
+                plan.episode_id.is_some()
+                    || plan.solver_certificate.rate_episode_id.is_some()
+                    || plan.solver_certificate.objective_branch.is_some()
+            }
             PlanReason::CapitalDeployment | PlanReason::LiquidityMaintenance => {
                 plan.episode_id.is_some()
                     || plan.solver_certificate.rate_episode_id.is_some()
@@ -297,7 +302,7 @@ fn validate_actions(
         return Err(FirewallError::Action);
     }
     match plan.reason {
-        PlanReason::RateRebalance => {
+        PlanReason::RateRebalance | PlanReason::TopKApyRebalance => {
             if deallocated.is_zero()
                 || allocated.is_zero()
                 || deallocated != allocated

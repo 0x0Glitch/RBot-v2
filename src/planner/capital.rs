@@ -23,7 +23,7 @@ use crate::{
     state::projection::ProjectedVaultView,
 };
 
-fn cap_limited_allocation(
+pub(crate) fn cap_limited_allocation(
     snapshot: &ExactVaultSnapshot,
     projection: &ProjectedVaultView,
     position: crate::domain::PositionKey,
