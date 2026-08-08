@@ -1,0 +1,227 @@
+# Morpho Vault V2 reallocator configuration.
+#
+# NORMAL contains deployment inputs the person running the service normally sets.
+# ADVANCED contains allocator-approved safety, timing, and strategy policy. Start
+# with these conservative values and change them only after Shadow-mode review.
+
+schema_version: 6 # Must match the binary's supported configuration schema.
+
+normal:
+  node:
+    instance_id: morpho-v2-reallocator-example # Unique name for this process.
+    mode: shadow # observe | shadow | execute. Always commission in shadow.
+    data_dir: /var/lib/morpho-v2-reallocator # Unique durable directory per chain/process.
+
+  chain:
+    name: example-evm # Human-readable label used in logs and alerts.
+    chain_id: 31337 # Exact eth_chainId returned by both configured RPC providers.
+    morpho_blue: "0x0000000000000000000000000000000000000010" # Morpho singleton.
+    multicall3: "0x0000000000000000000000000000000000000011" # Multicall3 deployment.
+    expected_multicall3_code_hash: "0x1111111111111111111111111111111111111111111111111111111111111111" # keccak256(runtime bytecode).
+    event_start_block: 1234567 # Earliest managed-vault deployment block; history is replayed from here.
+    providers:
+      - name: primary
+        roles: [head, logs, read, simulate, submit, receipt] # The single live runtime provider.
+        production_grade: true
+        supports_websocket: true
+        supports_historical_state: false
+        http_url_env: MORPHO_V2_RPC_PRIMARY # Environment variable containing the HTTP URL.
+        websocket_url_env: MORPHO_V2_RPC_PRIMARY_WSS # Environment variable containing the WSS URL.
+      - name: official-fallback
+        roles: [checkpoint, read, receipt] # Must be operationally independent from primary.
+        production_grade: false
+        supports_websocket: false
+        supports_historical_state: false
+        http_url_env: MORPHO_V2_RPC_FALLBACK
+
+  signing:
+    kind: remote_signer # remote_signer for production; local_development is test-only.
+    endpoint_env: MORPHO_V2_SIGNER_ENDPOINT # Contains the HTTPS restricted-signer URL.
+    # Test-only alternative:
+    # kind: local_development
+    # private_key_env: TEST_PRIVATE_KEY
+    # execute_chain_id: 31337 # Explicit exact-chain authorization is mandatory.
+
+  alerts:
+    telegram:
+      enabled: true
+      bot_token_env: MORPHO_TELEGRAM_BOT_TOKEN # Secret token stays in the environment.
+      chat_id: "-1000000000000" # Destination chat/channel identifier.
+      message_thread_id: 42 # null when the destination has no topic/thread.
+    pagerduty:
+      enabled: true
+      integration_key_env: MORPHO_PAGERDUTY_KEY # Secret integration key environment variable.
+
+  # Add every vault managed by this process. All vaults must be on this chain and
+  # use the same allocator signer. Amounts are integer base units of the vault asset.
+  vaults:
+    - name: example-usdc-v2
+      address: "0x0000000000000000000000000000000000000100"
+      asset: "0x0000000000000000000000000000000000000001"
+      asset_decimals: 6
+      expected_vault_code_hash: "0x2222222222222222222222222222222222222222222222222222222222222222"
+      deployment_block: 2345000
+      signer_address: "0x0000000000000000000000000000000000000002" # Allocator EOA used for final eth_call and signing.
+      strategy: spread_equalization # Or top_k_apy_diversified for the shared diversified target.
+
+      # Vault-level safety policy. Copy an allocator-reviewed profile; do not guess these values.
+      strict_zero_routine_idle: true
+      minimum_action_assets: "1000000" # Smallest action worth submitting (1 USDC at 6 decimals).
+      maximum_rounding_dust_assets: "1000"
+      maximum_immediate_rebalance_loss_assets: "10000"
+      maximum_terminal_value_sacrifice_assets: "0"
+      minimum_active_positions_after_economic_exit: 1
+      maximum_movement_per_hour_assets: "2000000000000"
+      maximum_movement_per_day_assets: "10000000000000"
+      minimum_independent_event_assets: "1000000"
+      minimum_atomic_exit_coverage_assets: "100000000"
+      minimum_liquidity_adapter_assets: "100000000"
+      minimum_deposit_headroom_assets: "100000000"
+      deposit_headroom_search_upper_bound_assets: "1000000000000"
+      minimum_source_token_liquidity_assets: "100000000"
+      lock_operator_clearance_required: true
+      unattributed_idle_fail_closed: true
+      require_supported_nonzero_liquidity_adapter: true
+      require_zero_gates: true
+      required_vault_dead_address: "0x000000000000000000000000000000000000dead"
+      minimum_market_dead_supply_shares: "1000000000"
+      approved_allocators: ["0x0000000000000000000000000000000000000002"]
+      approved_sentinels: ["0x0000000000000000000000000000000000000003"]
+
+      rate_groups:
+        - name: core
+          minimum_assets: "0"
+          target_assets: "1000000000000"
+          maximum_assets: "2000000000000"
+          allow_cross_group_movement: false # Unsupported in the current release.
+
+      adapters:
+        - address: "0x0000000000000000000000000000000000000020"
+          kind: morpho_market_v1_adapter_v2
+          expected_code_hash: "0x3333333333333333333333333333333333333333333333333333333333333333"
+          maximum_markets: 20 # Discovery fails closed above this bound.
+
+      # Optional liquidity_adapter goes here when the vault has a supported one.
+      # Its addresses and code hashes must also appear in protocol-lock.local.toml.
+
+      positions:
+        - adapter: "0x0000000000000000000000000000000000000020"
+          loan_token: "0x0000000000000000000000000000000000000001"
+          collateral_token: "0x0000000000000000000000000000000000000030"
+          oracle: "0x0000000000000000000000000000000000000040"
+          irm: "0x0000000000000000000000000000000000000050"
+          lltv: "860000000000000000" # WAD (1e18 = 100%).
+          market_id: "0x2c828b94209517da283816b1d3b4ba7023ab490ec725568d0d042877f6169ffe"
+          mode: active # active | fixed | source_only | disabled | sync_required.
+          rate_group: core
+          minimum_position_assets: "0"
+          maximum_position_assets: "1000000000000"
+          minimum_source_liquidity_assets: "100000000"
+          maximum_source_utilization_wad: "950000000000000000"
+          minimum_relevance_entry_assets: "2000000"
+          minimum_relevance_exit_assets: "1000000"
+          minimum_rate_relevant_market_supply_assets: "100000000"
+          minimum_rate_relevant_market_borrow_assets: "100000000"
+          minimum_destination_market_supply_assets: "100000000"
+          minimum_destination_market_supply_shares: "1000000000"
+          maximum_action_assets: "1000000000000"
+          allow_active_complete_exit: false
+          complete_exit_dust_threshold_assets: "1000"
+          reward_policy:
+            mode: no_material_rewards
+            checked_at_block: 2345678
+            valid_until_timestamp: 4102444800
+            evidence_hash: "0x4444444444444444444444444444444444444444444444444444444444444444"
+
+advanced:
+  # These values materially alter safety or transaction behavior. The allocator
+  # may tune them after reviewing Shadow observations; operators normally leave them unchanged.
+  node:
+    full_reconciliation_interval: 2m # Exact full-state refresh cadence.
+    topology_reconciliation_interval: 15m # Full adapter/market discovery cadence.
+
+  chain:
+    maximum_log_range: 1000 # Provider-specific eth_getLogs block span.
+    reorg_rescan_blocks: 64 # Maximum ancestor search before fail-closed shutdown.
+    block_opportunity_policy:
+      kind: every_canonical_block # Use hyper_evm_fast_blocks + gas_limit only on that reviewed profile.
+
+  snapshot:
+    mode: atomic_latest # atomic_latest or pinned_block, subject to RPC support.
+    strict_signing_context: true
+    maximum_background_snapshot_age_blocks: 2
+    maximum_signing_snapshot_age_blocks: 0 # Zero requires the signing snapshot at the current head.
+    maximum_snapshot_retries: 5
+    maximum_evm_timestamp_lag_seconds: 0
+    maximum_snapshot_to_sign_latency: 750ms
+    maximum_sign_to_broadcast_latency: 5s
+
+  execution:
+    expected_inclusion_opportunities: 2
+    maximum_inclusion_opportunities: 24
+    maximum_rate_rebalance_pending_opportunities: 24
+    maximum_capital_deployment_pending_opportunities: 24
+    maximum_liquidity_maintenance_pending_opportunities: 24
+    identical_rebroadcast_after_opportunities: 6
+    replacement_after_opportunities: 12
+    cancel_when_opportunities_remaining: 4
+    receipt_confirmation_evm_blocks: 2
+    maximum_actions: 8
+    maximum_signed_transaction_gas: 1800000
+    gas_headroom_bps: 1500 # 1500 = 15% above eth_estimateGas.
+    maximum_fee_per_gas_wei: "100000000000"
+    maximum_daily_gas_spend_wei: "500000000000000000"
+
+  solver:
+    maximum_nodes: 200000
+    maximum_amount_candidates_per_position: 32
+    maximum_source_sets: 1024
+    maximum_destination_sets: 1024
+    allow_incomplete_rate_solver: false # Must remain false in Execute mode.
+
+  strategy:
+    objective: spot_borrow_rate_spread # Or utilization_spread; only the selected policy drives trades.
+    entry_spread_apr_bps: 10 # Start or re-enter only above 0.10% APR spread.
+    target_spread_apr_bps: 5 # Aim for 0.05% APR spread when feasible.
+    target_tolerance_apr_bps: 0 # Stop once the spread is at or below the 5 bps target.
+    utilization_entry_spread_bps: 25 # Utilization mode starts above a 0.25 percentage-point gap.
+    utilization_target_spread_bps: 10 # Utilization mode aims for at most a 0.10 percentage-point gap.
+    utilization_target_tolerance_bps: 0
+    utilization_minimum_improvement_bps: 1
+    utilization_portfolio_spread_tolerance_bps: 0
+    minimum_portfolio_improvement_apr_bps: 3
+    minimum_controllable_improvement_apr_bps: 3
+    portfolio_spread_tolerance_apr_bps: 0
+    confirmation_opportunities: 2
+    immediate_tranche_bps: 9000 # Re-solve under 90% of the calculated optimal movement.
+    persistent_confirmation_duration: 30s
+    minimum_independent_rate_events: 3
+    minimum_independent_event_span: 10s
+    minimum_independent_event_rate_impact_apr_bps: 1
+    minimum_independent_event_utilization_impact_bps: 1
+    maximum_rate_episode_duration: 10m
+    extreme_spread_bypass_enabled: false # Forbidden in Execute mode.
+    benefit_horizon: 6h
+    maximum_daily_transactions: 24
+    # Used only by vaults selecting top_k_apy_diversified. APY thresholds are annualized bps.
+    top_k_apy:
+      enter_apy_bps: 200 # Candidate conservative APY improvement required to enter.
+      exit_apy_bps: 250 # Current selected market underperformance required to exit.
+      replacement_apy_bps: 100 # Post-probe APY improvement required for replacement.
+      fourth_market_entry_gap_apy_bps: 50
+      fourth_market_exit_gap_apy_bps: 100
+      upside_ema_alpha_bps: 2000 # Accept 20% of each upward observation; downside is immediate.
+      probe_allocation_bps: 500 # Test the rate after adding 5% of direct capital.
+      membership_confirmation: 30m # Canonical time, including initial membership.
+      tick_interval: 5m # Mandatory exact canonical refresh without requiring an event.
+      minimum_direct_assets_for_four_markets: "0" # Asset base units; set a meaningful TVL floor.
+      three_market_weights_bps: [4000, 4000, 2000]
+      four_market_weights_bps: [3500, 3500, 1500, 1500]
+      entry_score_wad: "50000000000000000" # Rebalance when >5% of direct capital must move.
+      target_score_wad: "10000000000000000" # Stop at or below 1% target distance.
+      minimum_improvement_score_wad: "10000000000000000" # Require at least 1% improvement.
+      enforce_gas_economic_gate: true # Require projected 24-hour gain to cover conservative gas cost.
+      minimum_net_gain_assets: "0" # Asset units remaining after gas, loss, and safety multiplier.
+      gas_cost_multiplier: 3
+      native_token_price_ceiling_asset_wad: "0" # Must be set for Execute; vault asset per native token.
+      maximum_diversification_cost_apy_bps: 25

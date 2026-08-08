@@ -305,7 +305,8 @@ fn maximum_deposit(
                     high.checked_sub(low)
                         .and_then(|distance| distance.checked_add(U256::ONE))
                         .ok_or(ProjectionError::Arithmetic)?
-                        / U256::from(2_u8),
+                        .checked_div(U256::from(2_u8))
+                        .ok_or(ProjectionError::Arithmetic)?,
                 )
                 .ok_or(ProjectionError::Arithmetic)?;
             if executable(midpoint)? {
@@ -360,7 +361,15 @@ fn maximum_deposit(
                 .ok_or(ProjectionError::IncompleteSnapshot)?;
             let new_allocation =
                 add_signed_allocation(cap.recorded_allocation, transition.allocation_change)?;
-            if validate_allocation_cap(cap, parent_total_assets, new_allocation).is_err() {
+            if validate_allocation_cap(
+                cap,
+                parent_total_assets
+                    .checked_add(assets)
+                    .ok_or(ProjectionError::Arithmetic)?,
+                new_allocation,
+            )
+            .is_err()
+            {
                 return Ok(false);
             }
         }
@@ -376,7 +385,8 @@ fn maximum_deposit(
                 distance
                     .checked_add(U256::ONE)
                     .ok_or(ProjectionError::Arithmetic)?
-                    / U256::from(2_u8),
+                    .checked_div(U256::from(2_u8))
+                    .ok_or(ProjectionError::Arithmetic)?,
             )
             .ok_or(ProjectionError::Arithmetic)?;
         if executable(midpoint)? {
@@ -427,7 +437,8 @@ fn maximum_liquidity_deallocation(
                 high.checked_sub(low)
                     .and_then(|distance| distance.checked_add(U256::ONE))
                     .ok_or(ProjectionError::Arithmetic)?
-                    / U256::from(2_u8),
+                    .checked_div(U256::from(2_u8))
+                    .ok_or(ProjectionError::Arithmetic)?,
             )
             .ok_or(ProjectionError::Arithmetic)?;
         if deallocate(
@@ -457,8 +468,18 @@ pub fn project_snapshot_to_head(
     head: BlockRef,
     config: &ValidatedVaultConfig,
 ) -> Result<ProjectedVaultView, ProjectionError> {
+    let header_evm_lag = snapshot
+        .context
+        .block
+        .timestamp
+        .checked_sub(snapshot.context.evm_timestamp)
+        .ok_or(ProjectionError::IncompatibleHead)?;
+    let head_evm_timestamp = head
+        .timestamp
+        .checked_sub(header_evm_lag)
+        .ok_or(ProjectionError::IncompatibleHead)?;
     if head.number < snapshot.context.block.number
-        || head.timestamp < snapshot.context.block.timestamp
+        || head_evm_timestamp < snapshot.context.evm_timestamp
         || config.address.0 != snapshot.parent.vault
     {
         return Err(ProjectionError::IncompatibleHead);
@@ -467,7 +488,7 @@ pub fn project_snapshot_to_head(
     for (id, stored) in &snapshot.markets {
         let accrued = accrue_market(
             stored,
-            head.timestamp,
+            head_evm_timestamp,
             &AdaptiveCurveState {
                 stored_rate_at_target: stored.stored_rate_at_target,
             },
@@ -528,16 +549,27 @@ pub fn project_snapshot_to_head(
         .ok_or(ProjectionError::Arithmetic)?;
 
     let source_constraints_satisfied = config.positions.iter().all(|configured| {
-        snapshot
-            .markets
-            .get(&configured.market_id)
-            .zip(markets.get(&configured.market_id))
-            .is_some_and(|(stored, projected)| {
-                projected.accounting_liquidity >= configured.minimum_source_liquidity_assets
-                    && stored.morpho_loan_token_balance
-                        >= config.minimum_source_token_liquidity_assets
-                    && projected.utilization <= configured.maximum_source_utilization_wad
-            })
+        let source_eligible = snapshot
+            .positions
+            .get(&configured.position_key)
+            .is_some_and(|position| {
+                !position.internal_supply_shares.is_zero()
+                    && matches!(
+                        configured.mode,
+                        crate::domain::MarketMode::Active | crate::domain::MarketMode::SourceOnly
+                    )
+            });
+        !source_eligible
+            || snapshot
+                .markets
+                .get(&configured.market_id)
+                .zip(markets.get(&configured.market_id))
+                .is_some_and(|(stored, projected)| {
+                    projected.accounting_liquidity >= configured.minimum_source_liquidity_assets
+                        && stored.morpho_loan_token_balance
+                            >= config.minimum_source_token_liquidity_assets
+                        && projected.utilization <= configured.maximum_source_utilization_wad
+                })
     });
     let vault = ProjectedVaultState {
         timestamp: head.timestamp,

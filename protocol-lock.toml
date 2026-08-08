@@ -1,5 +1,5 @@
 schema_version = 1
-chain_id = 999
+chain_id = 31337
 
 # Official source commits are pinned. Address, runtime hash, compiler, optimizer,
 # and immutable values remain explicit UNSET deployment inputs; this checked-in
@@ -113,4 +113,3 @@ behavior_profile = "vault-v2-adapter-registry"
 service_identity = "UNSET"
 client_identity_env = "MORPHO_V2_SIGNER_CLIENT_IDENTITY"
 authentication_secret_env = "MORPHO_V2_SIGNER_AUTH_SECRET"
-

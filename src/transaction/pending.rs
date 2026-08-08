@@ -29,9 +29,9 @@ use crate::{
     },
 };
 
-/// Monotonic count of eligible HyperEVM fast-block opportunities.
+/// Monotonic count of eligible inclusion opportunities under the configured chain policy.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct FastBlockOpportunity(pub u64);
+pub struct InclusionOpportunity(pub u64);
 
 /// Stable reason a pending transaction must be cancelled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,20 +182,20 @@ impl TouchedResources {
     }
 }
 
-/// Fast-block state for the one unresolved transaction.
+/// Inclusion-opportunity state for the one unresolved transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingClock {
     /// Semantic plan class.
     pub reason: PlanReason,
     /// Opportunity at initial broadcast.
-    pub submitted_at: FastBlockOpportunity,
+    pub submitted_at: InclusionOpportunity,
     /// Opportunity at the most recent broadcast attempt.
-    pub last_attempt_at: FastBlockOpportunity,
+    pub last_attempt_at: InclusionOpportunity,
     /// Exact dependencies touched by the plan.
     pub touched: TouchedResources,
 }
 
-/// Required action at one fast-block opportunity.
+/// Required action at one inclusion opportunity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PendingDecision {
     /// No lifecycle mutation is due.
@@ -227,7 +227,7 @@ pub enum PendingPolicyError {
     #[error("pending transaction identity is inconsistent")]
     Identity,
     /// Opportunity counter moved backwards or overflowed.
-    #[error("fast-block opportunity counter is invalid")]
+    #[error("inclusion-opportunity counter is invalid")]
     Clock,
     /// Fee policy failed.
     #[error(transparent)]
@@ -246,10 +246,10 @@ pub enum PendingPolicyError {
     SubmissionHash,
 }
 
-/// Evaluates cancellation before replacement using fast-block opportunities only.
+/// Evaluates cancellation before replacement using configured inclusion opportunities only.
 pub fn assess_pending(
     clock: &PendingClock,
-    current: FastBlockOpportunity,
+    current: InclusionOpportunity,
     invalidations: &[StateInvalidation],
     signals: PendingSafetySignals,
     execution: &ValidatedExecutionConfig,
@@ -275,10 +275,10 @@ pub fn assess_pending(
     }
     let horizon = pending_horizon(clock.reason, execution)?;
     let remaining = horizon.saturating_sub(age);
-    if age > 0 && (age >= horizon || remaining <= execution.cancel_when_fast_blocks_remaining) {
+    if age > 0 && (age >= horizon || remaining <= execution.cancel_when_opportunities_remaining) {
         return Ok(PendingDecision::Cancel(CancellationReason::PendingHorizon));
     }
-    if attempt_age >= execution.replacement_after_fast_blocks {
+    if attempt_age >= execution.replacement_after_opportunities {
         Ok(PendingDecision::Replace)
     } else {
         Ok(PendingDecision::Wait)
@@ -290,12 +290,14 @@ fn pending_horizon(
     execution: &ValidatedExecutionConfig,
 ) -> Result<u64, PendingPolicyError> {
     match reason {
-        PlanReason::RateRebalance => Ok(execution.maximum_rate_rebalance_pending_fast_blocks),
+        PlanReason::RateRebalance | PlanReason::TopKApyRebalance => {
+            Ok(execution.maximum_rate_rebalance_pending_opportunities)
+        }
         PlanReason::CapitalDeployment => {
-            Ok(execution.maximum_capital_deployment_pending_fast_blocks)
+            Ok(execution.maximum_capital_deployment_pending_opportunities)
         }
         PlanReason::LiquidityMaintenance => {
-            Ok(execution.maximum_liquidity_maintenance_pending_fast_blocks)
+            Ok(execution.maximum_liquidity_maintenance_pending_opportunities)
         }
         PlanReason::PositionSyncRequired => Err(PendingPolicyError::Identity),
     }
@@ -319,7 +321,7 @@ pub struct PendingAttemptRequest {
     pub cancellation_gas_limit: u64,
     /// Durable signing/submission timestamp.
     pub created_at: u64,
-    /// Canonical fast-block clock source at signing.
+    /// Canonical inclusion-opportunity clock source at signing.
     pub signed_block: u64,
 }
 
@@ -332,8 +334,10 @@ pub async fn execute_pending_attempt(
     request: PendingAttemptRequest,
 ) -> Result<PendingAttemptOutcome, PendingPolicyError> {
     if !matches!(
-        request.expected_state,
-        TransactionState::Submitted | TransactionState::Replaced
+        (request.expected_state, request.decision),
+        (TransactionState::Submitted | TransactionState::Replaced, _)
+            | (TransactionState::Signed, PendingDecision::Cancel(_))
+            | (TransactionState::Orphaned, PendingDecision::Cancel(_))
     ) {
         return Err(PendingPolicyError::Identity);
     }
@@ -345,9 +349,10 @@ pub async fn execute_pending_attempt(
         execution.maximum_fee_per_gas_wei,
     )?;
     let transaction_id: TransactionId = request.pending.transaction_id();
-    let (kind, next_state, signed) = match request.decision {
+    let (kind, signed_state, next_state, signed) = match request.decision {
         PendingDecision::Replace => (
             TransactionAttemptKind::Replacement,
+            TransactionState::ReplacementSigned,
             TransactionState::Replaced,
             signer
                 .sign_replacement(SignReplacementRequest {
@@ -366,6 +371,7 @@ pub async fn execute_pending_attempt(
             }
             (
                 TransactionAttemptKind::Cancellation,
+                TransactionState::CancellationSigned,
                 TransactionState::CancellationSubmitted,
                 signer
                     .sign_cancellation(SignCancellationRequest {
@@ -403,6 +409,18 @@ pub async fn execute_pending_attempt(
             request.signed_block,
         )
         .await?;
+    storage
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: signed_state,
+            next_state,
+            transaction_hash: Some(signed.transaction_hash),
+            submitted_at: Some(request.created_at),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: request.created_at,
+        })
+        .await?;
     let submitted_hash = match submission {
         Ok(hash) => hash,
         Err(error)
@@ -424,18 +442,6 @@ pub async fn execute_pending_attempt(
     if submitted_hash != signed.transaction_hash {
         return Err(PendingPolicyError::SubmissionHash);
     }
-    storage
-        .transition_transaction(TransactionTransition {
-            transaction_id,
-            expected_state: request.expected_state,
-            next_state,
-            transaction_hash: Some(signed.transaction_hash),
-            submitted_at: Some(request.created_at),
-            included_block: None,
-            included_block_hash: None,
-            updated_at: request.created_at,
-        })
-        .await?;
     Ok(PendingAttemptOutcome::Broadcast(submitted_hash))
 }
 
@@ -446,7 +452,7 @@ mod tests {
     use alloy::primitives::{Address, B256};
 
     use super::{
-        CancellationReason, FastBlockOpportunity, PendingClock, PendingDecision,
+        CancellationReason, InclusionOpportunity, PendingClock, PendingDecision,
         PendingSafetySignals, TouchedResources, assess_pending,
     };
     use crate::{
@@ -458,25 +464,27 @@ mod tests {
     fn test_config() -> Option<ValidatedConfig> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
         let mut config = AppConfig::load(&path).ok()?;
-        config.execution.maximum_inclusion_fast_blocks = 8;
-        config.execution.maximum_rate_rebalance_pending_fast_blocks = 6;
+        config.execution.maximum_inclusion_opportunities = 8;
         config
             .execution
-            .maximum_capital_deployment_pending_fast_blocks = 6;
+            .maximum_rate_rebalance_pending_opportunities = 6;
         config
             .execution
-            .maximum_liquidity_maintenance_pending_fast_blocks = 6;
-        config.execution.identical_rebroadcast_after_fast_blocks = 1;
-        config.execution.replacement_after_fast_blocks = 2;
-        config.execution.cancel_when_fast_blocks_remaining = 1;
+            .maximum_capital_deployment_pending_opportunities = 6;
+        config
+            .execution
+            .maximum_liquidity_maintenance_pending_opportunities = 6;
+        config.execution.identical_rebroadcast_after_opportunities = 1;
+        config.execution.replacement_after_opportunities = 2;
+        config.execution.cancel_when_opportunities_remaining = 1;
         config.validate().ok()
     }
 
     fn pending_clock() -> PendingClock {
         PendingClock {
             reason: PlanReason::RateRebalance,
-            submitted_at: FastBlockOpportunity(10),
-            last_attempt_at: FastBlockOpportunity(10),
+            submitted_at: InclusionOpportunity(10),
+            last_attempt_at: InclusionOpportunity(10),
             touched: TouchedResources {
                 vault: VaultAddress(Address::with_last_byte(1)),
                 positions: vec![PositionKey(B256::repeat_byte(2))],
@@ -487,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn only_fast_opportunities_age_replacement_and_cancellation() {
+    fn only_eligible_opportunities_age_replacement_and_cancellation() {
         let config = test_config();
         assert!(config.is_some(), "test configuration must validate");
         let Some(config) = config else {
@@ -497,7 +505,7 @@ mod tests {
         assert_eq!(
             assess_pending(
                 &clock,
-                FastBlockOpportunity(10),
+                InclusionOpportunity(10),
                 &[],
                 PendingSafetySignals::default(),
                 &config.app.execution,
@@ -508,7 +516,7 @@ mod tests {
         assert_eq!(
             assess_pending(
                 &clock,
-                FastBlockOpportunity(12),
+                InclusionOpportunity(12),
                 &[],
                 PendingSafetySignals::default(),
                 &config.app.execution,
@@ -519,7 +527,7 @@ mod tests {
         assert_eq!(
             assess_pending(
                 &clock,
-                FastBlockOpportunity(15),
+                InclusionOpportunity(15),
                 &[],
                 PendingSafetySignals::default(),
                 &config.app.execution,
@@ -530,7 +538,7 @@ mod tests {
         assert!(
             assess_pending(
                 &clock,
-                FastBlockOpportunity(9),
+                InclusionOpportunity(9),
                 &[],
                 PendingSafetySignals::default(),
                 &config.app.execution,
@@ -550,7 +558,7 @@ mod tests {
         assert_eq!(
             assess_pending(
                 &clock,
-                FastBlockOpportunity(10),
+                InclusionOpportunity(10),
                 &[StateInvalidation::MarketState(MarketId(B256::repeat_byte(
                     4
                 )))],
@@ -565,7 +573,7 @@ mod tests {
         assert_eq!(
             assess_pending(
                 &clock,
-                FastBlockOpportunity(10),
+                InclusionOpportunity(10),
                 &[StateInvalidation::MarketState(MarketId(B256::repeat_byte(
                     9
                 )))],

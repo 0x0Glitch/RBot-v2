@@ -37,6 +37,35 @@ pub fn signed_gas_limit(estimate: u64, headroom_bps: u32, maximum: u64) -> Resul
     Ok(value)
 }
 
+/// Builds a live EIP-1559 initial fee pair under one configured hard ceiling.
+///
+/// The total fee uses two times the provider quote to tolerate a normal base-fee increase. The
+/// configured maximum remains only a ceiling; it is never used as the routine fee source.
+pub fn initial_fee_quote(
+    quoted_gas_price: U256,
+    quoted_priority_fee: U256,
+    configured_maximum: U256,
+) -> Result<(u128, u128), FeeError> {
+    if quoted_gas_price.is_zero()
+        || configured_maximum <= U256::ONE
+        || quoted_gas_price >= configured_maximum
+    {
+        return Err(FeeError::Bound);
+    }
+    let maximum_initial = configured_maximum
+        .checked_sub(U256::ONE)
+        .ok_or(FeeError::Arithmetic)?;
+    let maximum_fee = quoted_gas_price
+        .checked_mul(U256::from(2_u8))
+        .ok_or(FeeError::Arithmetic)?
+        .min(maximum_initial);
+    let priority_fee = quoted_priority_fee.min(maximum_fee);
+    Ok((
+        u128::try_from(maximum_fee).map_err(|_| FeeError::Bound)?,
+        u128::try_from(priority_fee).map_err(|_| FeeError::Bound)?,
+    ))
+}
+
 /// Enforces a strictly higher same-calldata fee pair under the production cap.
 pub fn validate_replacement_fees(
     old_maximum: u128,
@@ -52,4 +81,35 @@ pub fn validate_replacement_fees(
         return Err(FeeError::Bound);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::U256;
+
+    use super::{FeeError, initial_fee_quote};
+
+    #[test]
+    fn live_fee_quote_is_doubled_but_never_replaced_by_the_ceiling() {
+        assert_eq!(
+            initial_fee_quote(
+                U256::from(100_000_000_u64),
+                U256::ZERO,
+                U256::from(100_000_000_000_u64),
+            ),
+            Ok((200_000_000, 0)),
+        );
+        assert_eq!(
+            initial_fee_quote(U256::from(60_u8), U256::from(3_u8), U256::from(100_u8)),
+            Ok((99, 3)),
+        );
+        assert_eq!(
+            initial_fee_quote(U256::ZERO, U256::ZERO, U256::from(100_u8)),
+            Err(FeeError::Bound),
+        );
+        assert_eq!(
+            initial_fee_quote(U256::from(100_u8), U256::ZERO, U256::from(100_u8)),
+            Err(FeeError::Bound),
+        );
+    }
 }

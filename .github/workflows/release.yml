@@ -1,0 +1,48 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  linux-binary:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Build immutable binary
+        env:
+          MORPHO_V2_BUILD_REVISION: ${{ github.sha }}
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - name: Create release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d release
+          install -m 0755 target/x86_64-unknown-linux-gnu/release/morpho-v2-reallocator release/morpho-v2-reallocator
+          binary_sha=$(sha256sum release/morpho-v2-reallocator | awk '{print $1}')
+          cargo_lock_sha=$(sha256sum Cargo.lock | awk '{print $1}')
+          build_environment=$(rustc -vV | tr '\n' ';')
+          jq -n \
+            --arg release_version "${GITHUB_REF_NAME}" \
+            --arg source_commit "${GITHUB_SHA}" \
+            --arg cargo_lock_sha256 "$cargo_lock_sha" \
+            --arg binary_sha256 "$binary_sha" \
+            --arg build_environment "github-actions/ubuntu-24.04;$build_environment" \
+            --arg build_timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{release_version:$release_version,source_commit:$source_commit,cargo_lock_sha256:$cargo_lock_sha256,binary_sha256:$binary_sha256,build_environment:$build_environment,build_timestamp:$build_timestamp}' \
+            > release/release-manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: morpho-v2-reallocator-${{ github.sha }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30

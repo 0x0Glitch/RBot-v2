@@ -9,13 +9,13 @@ use crate::{
     chain::{
         logs::{
             EventDecodeError, EventSource, ProtocolEvent, RawEventLog, classify_transaction,
-            decode_event,
+            decode_watched_event,
         },
         provider::{ProviderError, TransactionLookupProvider, parse_quantity},
     },
     config::{ValidatedConfig, ValidatedVaultConfig},
     contracts::bindings::IERC20,
-    domain::{BlockRef, TokenAddress},
+    domain::BlockRef,
     state::{
         attribution::{OrderedAssetFlow, OrderedTransactionFlow},
         idle_locks::{IdleLockError, IdleLockLedger},
@@ -126,14 +126,8 @@ pub async fn apply_idle_logs<P: TransactionLookupProvider>(
                 continue;
             };
             let raw = raw_log(log);
-            let decoded = match decode_event(source, &raw) {
-                Ok(decoded) => decoded,
-                Err(EventDecodeError::UnknownSignature(_))
-                    if matches!(source, EventSource::Token(TokenAddress(_))) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
+            let Some(decoded) = decode_watched_event(source, &raw)? else {
+                continue;
             };
             if let ProtocolEvent::Token(IERC20::IERC20Events::Transfer(transfer)) = &decoded.event
                 && transfer.from != transfer.to

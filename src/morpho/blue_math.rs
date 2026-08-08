@@ -19,8 +19,8 @@ pub fn mul_div_down(x: U256, y: U256, denominator: U256) -> Result<U256, Arithme
         return Err(ArithmeticError::DivisionByZero);
     }
     x.checked_mul(y)
+        .and_then(|product| product.checked_div(denominator))
         .ok_or(ArithmeticError::Overflow)
-        .map(|product| product / denominator)
 }
 
 /// Returns unit-preserving `ceil(x * y / denominator)` like pinned
@@ -36,8 +36,9 @@ pub fn mul_div_up(x: U256, y: U256, denominator: U256) -> Result<U256, Arithmeti
                 .checked_sub(U256::ONE)
                 .ok_or(ArithmeticError::Underflow)?,
         )
+        .ok_or(ArithmeticError::Overflow)?
+        .checked_div(denominator)
         .ok_or(ArithmeticError::Overflow)
-        .map(|numerator| numerator / denominator)
 }
 
 /// Multiplies two WAD values to WAD, rounded down per pinned `MathLib.wMulDown`.

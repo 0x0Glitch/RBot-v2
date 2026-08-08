@@ -17,11 +17,15 @@ fn neighbors(value: U256, maximum: U256, output: &mut BTreeSet<U256>) {
     if value <= maximum {
         output.insert(value);
     }
-    if !value.is_zero() {
-        output.insert(value - U256::ONE);
+    if !value.is_zero()
+        && let Some(neighbor) = value.checked_sub(U256::ONE)
+    {
+        output.insert(neighbor);
     }
-    if value < maximum {
-        output.insert(value + U256::ONE);
+    if value < maximum
+        && let Some(neighbor) = value.checked_add(U256::ONE)
+    {
+        output.insert(neighbor);
     }
 }
 
@@ -42,7 +46,7 @@ pub fn build_candidate_lattice(
             .is_some_and(|count| count <= limit.max(1))
     {
         let amounts: Vec<_> = (0..=small_maximum).map(U256::from).collect();
-        let mut encoded = Vec::with_capacity(amounts.len() * 32);
+        let mut encoded = Vec::with_capacity(amounts.len().saturating_mul(32));
         for amount in &amounts {
             encoded.extend_from_slice(&amount.to_be_bytes::<32>());
         }
@@ -51,7 +55,16 @@ pub fn build_candidate_lattice(
             hash: keccak256(encoded),
         };
     }
-    let mut priority = Vec::new();
+    // Exact feasibility boundaries always survive small configured limits. Neighbor probes and
+    // binary fractions are useful refinements, but must never crowd out zero, the minimum action,
+    // or the maximum executable amount.
+    let mut priority = [U256::ZERO, minimum_action.min(maximum), maximum].to_vec();
+    priority.extend(
+        prioritized_boundaries
+            .iter()
+            .copied()
+            .map(|boundary| boundary.min(maximum)),
+    );
     for boundary in [U256::ZERO, minimum_action, maximum]
         .into_iter()
         .chain(prioritized_boundaries.iter().copied())
@@ -62,7 +75,9 @@ pub fn build_candidate_lattice(
     }
     let mut divisor = U256::from(2_u8);
     for _ in 0..16 {
-        priority.push(maximum / divisor);
+        if let Some(fraction) = maximum.checked_div(divisor) {
+            priority.push(fraction);
+        }
         if let Some(next) = divisor.checked_mul(U256::from(2_u8)) {
             divisor = next;
         }
@@ -78,7 +93,7 @@ pub fn build_candidate_lattice(
         }
     }
     selected.sort_unstable();
-    let mut encoded = Vec::with_capacity(selected.len() * 32);
+    let mut encoded = Vec::with_capacity(selected.len().saturating_mul(32));
     for amount in &selected {
         encoded.extend_from_slice(&amount.to_be_bytes::<32>());
     }

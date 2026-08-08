@@ -119,6 +119,9 @@ pub enum ReceiptReconciliationError {
     /// No unique canonical known attempt was found.
     #[error("confirmed transaction has no unique canonical signed attempt")]
     MissingCanonicalAttempt,
+    /// The canonical provider has not made the included transaction available yet.
+    #[error("confirmed transaction is temporarily unavailable from the provider")]
+    TransactionUnavailable,
     /// Durable fee values cannot be represented by the signed EIP-1559 domain.
     #[error("durable fee value exceeds EIP-1559 transaction domain")]
     FeeRange,
@@ -295,7 +298,7 @@ pub fn validate_receipt_conformance(
             changed_shares: action.changed_shares,
         })
         .collect::<Vec<_>>();
-    if adapter_actions != expected_adapter {
+    if !adapter_actions_match_expected(&adapter_actions, &expected_adapter) {
         return Err(ConformanceError::AdapterEvent);
     }
     let expected_morpho = expectation
@@ -319,13 +322,52 @@ pub fn validate_receipt_conformance(
             })
         })
         .collect::<Result<Vec<_>, ConformanceError>>()?;
-    if morpho_actions != expected_morpho {
+    if !morpho_actions_match_expected(&morpho_actions, &expected_morpho) {
         return Err(ConformanceError::MorphoEvent);
+    }
+    if !adapter_shares_match_morpho(&adapter_actions, &morpho_actions) {
+        return Err(ConformanceError::AdapterEvent);
     }
     if transfers != expected_transfers(expectation)? {
         return Err(ConformanceError::Transfer);
     }
     build_report(expectation, receipt)
+}
+
+fn adapter_actions_match_expected(observed: &[AdapterAction], expected: &[AdapterAction]) -> bool {
+    observed.len() == expected.len()
+        && observed.iter().zip(expected).all(|(observed, expected)| {
+            observed.kind == expected.kind
+                && observed.adapter == expected.adapter
+                && observed.market == expected.market
+                && observed.new_allocation == expected.new_allocation
+                && !observed.changed_shares.is_zero()
+        })
+}
+
+fn morpho_actions_match_expected(observed: &[MorphoAction], expected: &[MorphoAction]) -> bool {
+    observed.len() == expected.len()
+        && observed.iter().zip(expected).all(|(observed, expected)| {
+            observed.kind == expected.kind
+                && observed.market == expected.market
+                && observed.caller == expected.caller
+                && observed.on_behalf == expected.on_behalf
+                && observed.receiver == expected.receiver
+                && observed.assets == expected.assets
+                && !observed.shares.is_zero()
+        })
+}
+
+fn adapter_shares_match_morpho(adapters: &[AdapterAction], morpho: &[MorphoAction]) -> bool {
+    adapters.iter().all(|adapter| {
+        morpho.iter().any(|action| {
+            action.kind == adapter.kind
+                && action.market == adapter.market
+                && action.caller == adapter.adapter
+                && action.on_behalf == adapter.adapter
+                && action.shares == adapter.changed_shares
+        })
+    })
 }
 
 /// Loads one confirmed transaction, verifies its canonical attempt, and atomically advances state.
@@ -356,11 +398,14 @@ pub async fn reconcile_confirmed_transaction(
     if matching.len() != 1 {
         return Err(ReceiptReconciliationError::MissingCanonicalAttempt);
     }
-    let receipt = matching[0];
+    let receipt = matching
+        .first()
+        .copied()
+        .ok_or(ReceiptReconciliationError::MissingCanonicalAttempt)?;
     let observed = provider
         .transaction_by_hash(receipt.transaction_hash)
         .await?
-        .ok_or(ReceiptReconciliationError::MissingCanonicalAttempt)?;
+        .ok_or(ReceiptReconciliationError::TransactionUnavailable)?;
     let transaction = RoutineTransactionFields {
         chain_id: config.app.chain.chain_id,
         from: pending.reservation.signer,
@@ -476,7 +521,7 @@ fn validate_log_order(receipt: &CanonicalReceiptRecord) -> Result<(), Conformanc
     }) || receipt
         .logs
         .windows(2)
-        .any(|pair| pair[0].log_index >= pair[1].log_index)
+        .any(|pair| matches!(pair, [previous, current] if previous.log_index >= current.log_index))
     {
         return Err(ConformanceError::LogOrder);
     }

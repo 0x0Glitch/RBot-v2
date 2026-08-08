@@ -70,7 +70,10 @@ pub fn validate_receipt(
         })
         .collect::<Result<Vec<_>, _>>()?;
     for pair in logs.windows(2) {
-        if pair[0].log_index >= pair[1].log_index {
+        let [previous, current] = pair else {
+            continue;
+        };
+        if previous.log_index >= current.log_index {
             return Err(ChainError::InvalidBundle(
                 "receipt logs are not strictly ordered",
             ));
@@ -151,7 +154,10 @@ fn validate_log(
     }
     let mut topics = [None; 4];
     for (index, topic) in log.topics.into_iter().enumerate() {
-        topics[index] = Some(topic);
+        let slot = topics
+            .get_mut(index)
+            .ok_or(ChainError::InvalidBundle("log topic index exceeds four"))?;
+        *slot = Some(topic);
     }
     Ok(CanonicalLogRecord {
         chain_id,

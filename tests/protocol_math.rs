@@ -1,4 +1,5 @@
 //! Protocol-math boundary and property tests independent of the EVM differential suite.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 
 use std::collections::{BTreeMap, BTreeSet};
 

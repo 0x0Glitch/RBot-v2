@@ -57,13 +57,14 @@ pub fn register_build_info(registry: &mut Registry) {
 #[error("unknown operational metric")]
 pub struct UnknownMetric;
 
-/// Immutable registry plus update handles for every release-one metric.
+/// Immutable registry plus update handles for metrics backed by live runtime state.
 pub struct OperationalMetrics {
     registry: Arc<Registry>,
     gauges: BTreeMap<&'static str, Gauge>,
     counters: BTreeMap<&'static str, Counter>,
     rate_snapshot_block: Family<VaultLabels, Gauge>,
     observed_rate_spread_bps: Family<VaultLabels, Gauge>,
+    observed_utilization_spread_bps: Family<VaultLabels, Gauge>,
     market_spot_borrow_rate: Family<MarketLabels, Gauge>,
     market_spot_supply_rate: Family<MarketLabels, Gauge>,
     market_utilization: Family<MarketLabels, Gauge>,
@@ -76,7 +77,7 @@ impl Default for OperationalMetrics {
 }
 
 impl OperationalMetrics {
-    /// Registers the complete bounded-cardinality release-one metric set.
+    /// Registers the bounded-cardinality operational metric set.
     #[must_use]
     pub fn new() -> Self {
         let mut registry = Registry::default();
@@ -113,6 +114,12 @@ impl OperationalMetrics {
             "Observed spot borrow-rate spread as simple APR basis points.",
             observed_rate_spread_bps.clone(),
         );
+        let observed_utilization_spread_bps = Family::<VaultLabels, Gauge>::default();
+        registry.register(
+            "reallocator_observed_utilization_spread_bps",
+            "Observed maximum-minus-minimum market utilization spread in basis points.",
+            observed_utilization_spread_bps.clone(),
+        );
         let market_spot_borrow_rate = Family::<MarketLabels, Gauge>::default();
         registry.register(
             "reallocator_market_spot_borrow_rate",
@@ -137,6 +144,7 @@ impl OperationalMetrics {
             counters,
             rate_snapshot_block,
             observed_rate_spread_bps,
+            observed_utilization_spread_bps,
             market_spot_borrow_rate,
             market_spot_supply_rate,
             market_utilization,
@@ -173,6 +181,9 @@ impl OperationalMetrics {
         self.observed_rate_spread_bps
             .get_or_create(&vault_labels)
             .set(saturating_i64(snapshot.spread_apr_bps));
+        self.observed_utilization_spread_bps
+            .get_or_create(&vault_labels)
+            .set(saturating_i64(snapshot.utilization_spread_bps));
         for market in &snapshot.markets {
             let labels = MarketLabels {
                 vault: vault.clone(),
@@ -201,75 +212,26 @@ fn saturating_u256_i64(value: alloy::primitives::U256) -> i64 {
 
 const GAUGE_NAMES: &[&str] = &[
     "reallocator_up",
+    "reallocator_ready",
+    "reallocator_ready_for_execute",
+    "reallocator_providers_ready",
+    "reallocator_exact_state_ready",
     "reallocator_last_processed_block",
-    "reallocator_head_lag_blocks",
-    "reallocator_fast_block_opportunity",
-    "reallocator_snapshot_duration_seconds",
-    "reallocator_snapshot_to_sign_seconds",
-    "reallocator_sign_to_broadcast_seconds",
-    "reallocator_rpc_latency_seconds",
-    "reallocator_vault_idle_assets",
-    "reallocator_locked_idle_assets",
-    "reallocator_locked_idle_assets_by_kind",
-    "reallocator_unreserved_idle_assets",
-    "reallocator_lock_ledger_verified",
-    "reallocator_pending_deployment_assets",
-    "reallocator_candidate_portfolio_spread_before_bps",
-    "reallocator_candidate_portfolio_spread_post_bps",
-    "reallocator_candidate_controllable_spread_before_bps",
-    "reallocator_candidate_controllable_spread_post_bps",
-    "reallocator_entry_spread_bps",
-    "reallocator_target_spread_bps",
-    "reallocator_rate_episode_active",
-    "reallocator_rate_episode_branch",
-    "reallocator_rate_episode_age_seconds",
-    "reallocator_rate_episode_immediate_budget_assets",
-    "reallocator_rate_episode_immediate_used_assets",
-    "reallocator_rate_episode_pending_assets",
-    "reallocator_rate_episode_total_used_assets",
-    "reallocator_rate_episode_remaining_assets",
-    "reallocator_rate_episode_persistent_confirmed",
-    "reallocator_rate_episode_independent_events",
-    "reallocator_rate_episode_target_reached",
-    "reallocator_terminal_value_delta_assets",
-    "reallocator_immediate_rebalance_loss_assets",
-    "reallocator_solver_nodes_evaluated",
-    "reallocator_solver_nodes",
-    "reallocator_solver_search_complete",
-    "reallocator_market_expected_position_assets",
-    "reallocator_cap_recorded_allocation",
-    "reallocator_cap_absolute_limit",
-    "reallocator_cap_relative_limit",
-    "reallocator_cap_signed_change",
-    "reallocator_atomic_exit_coverage_assets",
-    "reallocator_max_executable_deposit_assets",
-    "reallocator_liquidity_adapter_assets",
-    "reallocator_seed_requirement_ready",
-    "reallocator_parent_dead_shares",
-    "reallocator_market_dead_supply_shares",
-    "reallocator_reward_policy_ready",
-    "reallocator_reward_policy_seconds_until_expiry",
-    "reallocator_reward_policy_ignored_by_mandate",
+    "reallocator_last_processed_timestamp_seconds",
     "reallocator_pending_transaction",
-    "reallocator_gas_estimate",
-    "reallocator_signed_gas_limit",
-    "reallocator_signer_balance_wei",
-    "reallocator_rate_episode_pending_movement_assets",
-    "reallocator_idle_lock_assets",
-    "reallocator_pending_admin_operations",
     "reallocator_json_format_info",
+    "reallocator_storage_queue_depth",
+    "reallocator_storage_queue_high_water",
+    "reallocator_storage_oldest_command_age_milliseconds",
 ];
 
 const COUNTER_NAMES: &[&str] = &[
-    "reallocator_snapshot_success_total",
-    "reallocator_snapshot_retry_total",
-    "reallocator_idle_ledger_replay_failure_total",
-    "reallocator_same_head_preflight_retry_total",
-    "reallocator_transaction_reverts_total",
-    "reallocator_interleaving_opportunity_detected_total",
-    "reallocator_reconciliation_failures_total",
-    "reallocator_rpc_requests_total",
-    "reallocator_snapshot_retries_total",
+    // `prometheus-client` appends the required `_total` suffix while encoding.
+    "reallocator_snapshot_success",
+    "reallocator_idle_ledger_replay_failure",
+    "reallocator_snapshot_retries",
+    "reallocator_plans_superseded",
+    "reallocator_strategy_ticks",
 ];
 
 #[cfg(test)]
@@ -280,6 +242,7 @@ mod tests {
     use super::*;
     use crate::{
         api::dto::MarketRateView,
+        config::StrategyObjective,
         domain::{BlockRef, MarketId, VaultAddress},
     };
 
@@ -287,13 +250,17 @@ mod tests {
     fn complete_metric_set_and_build_info_are_registered() -> Result<(), std::fmt::Error> {
         let metrics = OperationalMetrics::new();
         let _ = metrics.set("reallocator_up", 1);
-        let _ = metrics.increment("reallocator_snapshot_success_total");
+        let _ = metrics.increment("reallocator_snapshot_success");
         let mut output = String::new();
         encode(&mut output, &metrics.registry)?;
         assert!(output.contains("reallocator_build_info"));
         assert!(output.contains("version=\"0.1.0\""));
-        for name in GAUGE_NAMES.iter().chain(COUNTER_NAMES) {
+        for name in GAUGE_NAMES {
             assert!(output.contains(name));
+        }
+        for name in COUNTER_NAMES {
+            assert!(output.contains(&format!("{name}_total")));
+            assert!(!output.contains(&format!("{name}_total_total")));
         }
         Ok(())
     }
@@ -314,6 +281,11 @@ mod tests {
             },
             spread_rate_per_second_wad: U256::from(11_u8),
             spread_apr_bps: 12,
+            utilization_spread_wad: U256::from(13_u8),
+            utilization_spread_bps: 14,
+            selected_objective: StrategyObjective::UtilizationSpread,
+            vault_strategy: crate::config::VaultStrategy::SpreadEqualization,
+            selected_objective_spread_wad: U256::from(13_u8),
             markets: vec![MarketRateView {
                 market_id: MarketId(B256::repeat_byte(13)),
                 spot_borrow_rate_per_second_wad: U256::from(14_u8),
@@ -326,6 +298,7 @@ mod tests {
         encode(&mut output, &metrics.registry)?;
         assert!(output.contains("reallocator_rate_snapshot_block{vault=\"0x0000000000000000000000000000000000000007\"} 42"));
         assert!(output.contains("reallocator_observed_rate_spread_bps{vault=\"0x0000000000000000000000000000000000000007\"} 12"));
+        assert!(output.contains("reallocator_observed_utilization_spread_bps{vault=\"0x0000000000000000000000000000000000000007\"} 14"));
         assert!(output.contains("market=\"0x0d"), "{output}");
         assert!(output.contains(" 14"));
         Ok(())

@@ -138,8 +138,8 @@ pub enum SignerError {
     #[error("replacement or cancellation policy failed")]
     Policy,
     /// Remote transport or authentication failed.
-    #[error("remote signer transport failed: {0}")]
-    Transport(String),
+    #[error("remote signer transport failed")]
+    Transport,
     /// Remote response is malformed.
     #[error("remote signer response is malformed")]
     Response,

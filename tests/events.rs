@@ -1,11 +1,12 @@
 //! Official pinned event signatures, strict decoding, effect decoding, and adapter-data tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, I256, IntoLogData, U256};
 use alloy::sol_types::{SolCall, SolEvent};
 use morpho_v2_reallocator::chain::logs::{
     AdapterEventKind, EventDecodeError, EventSource, MorphoEventKind, RawEventLog, VaultEventKind,
-    WatchedEventKind, decode_event,
+    WatchedEventKind, decode_event, decode_watched_event,
 };
 use morpho_v2_reallocator::contracts::bindings::{
     IERC20, IIrm, IMorpho, IMorphoMarketV1AdapterV2, IVaultV2,
@@ -676,4 +677,53 @@ fn event_signatures_match_official_solidity_text() {
         IIrm::BorrowRateUpdate::SIGNATURE_HASH,
         alloy::primitives::keccak256("BorrowRateUpdate(bytes32,uint256,uint256)")
     );
+}
+
+#[test]
+fn unrelated_events_from_watched_contract_addresses_are_ignored() {
+    let vault = VaultAddress(Address::with_last_byte(1));
+    let inherited_transfer = IERC20::Transfer {
+        from: Address::with_last_byte(2),
+        to: Address::with_last_byte(3),
+        value: U256::ONE,
+    }
+    .to_log_data();
+    let raw = RawEventLog {
+        address: vault.0,
+        topics: inherited_transfer.topics().to_vec(),
+        data: inherited_transfer.data,
+    };
+    assert!(matches!(
+        decode_watched_event(EventSource::Vault(vault), &raw),
+        Ok(None)
+    ));
+
+    let morpho = Address::with_last_byte(4);
+    let raw = RawEventLog {
+        address: morpho,
+        topics: vec![alloy::primitives::keccak256(
+            "FlashLoan(address,address,uint256)",
+        )],
+        data: Bytes::new(),
+    };
+    assert!(matches!(
+        decode_watched_event(EventSource::Morpho(morpho), &raw),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn malformed_watched_event_is_not_downgraded_to_irrelevant() {
+    let vault = VaultAddress(Address::with_last_byte(1));
+    let raw = RawEventLog {
+        address: vault.0,
+        topics: vec![IVaultV2::Deposit::SIGNATURE_HASH],
+        data: Bytes::new(),
+    };
+    assert!(matches!(
+        decode_watched_event(EventSource::Vault(vault), &raw),
+        Err(EventDecodeError::Malformed(WatchedEventKind::Vault(
+            VaultEventKind::Deposit
+        )))
+    ));
 }

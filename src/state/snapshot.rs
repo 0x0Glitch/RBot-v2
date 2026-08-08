@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::chain::multicall::{
     AtomicCall, AtomicReadResult, AtomicSnapshotProvider, MulticallError, atomic_latest,
-    pinned_block,
+    atomic_latest_reported, pinned_block,
 };
 use crate::config::{
     SnapshotMode, ValidatedChainConfig, ValidatedSnapshotConfig, ValidatedStrategyConfig,
@@ -106,7 +106,6 @@ pub(crate) enum SnapshotKey {
     ParentSendAssetsGate,
     ParentAdapterRegistry,
     ParentAdaptersLength,
-    ParentAdapterAt(usize),
     ParentAdapterEnabled(AdapterAddress),
     ParentLiquidityAdapter,
     ParentLiquidityData,
@@ -193,6 +192,29 @@ pub struct SnapshotManifest {
     pub calls: Vec<ApprovedSnapshotCall>,
 }
 
+/// Protocol evaluation timestamps taken from one exact canonical block.
+///
+/// Transaction-opportunity and confirmation counts are deliberately absent from this type: block
+/// counts cannot be converted into Unix seconds without observing the resulting canonical blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalSnapshotTimestamps {
+    /// Timestamp used to assess executable administrative operations.
+    pub administrative_horizon_timestamp: u64,
+    /// Timestamp used as the start of reward validity.
+    pub expected_inclusion_timestamp: u64,
+}
+
+impl CanonicalSnapshotTimestamps {
+    /// Binds every protocol evaluation timestamp to the supplied canonical block.
+    #[must_use]
+    pub const fn from_block(block: crate::domain::BlockRef) -> Self {
+        Self {
+            administrative_horizon_timestamp: block.timestamp,
+            expected_inclusion_timestamp: block.timestamp,
+        }
+    }
+}
+
 /// Inputs required to generate the complete read set for one configured vault.
 pub struct SnapshotBlueprint<'a> {
     /// Chain and core protocol addresses.
@@ -213,9 +235,11 @@ pub struct SnapshotBlueprint<'a> {
     pub event_cursor: crate::domain::BlockRef,
     /// Current idle-lock ledger.
     pub idle_locks: IdleLockLedgerSnapshot,
-    /// Latest accepted inclusion plus confirmation/reconciliation allowance.
+    /// Exact canonical block timestamp used to assess executable administrative operations.
+    /// Future block timestamps are never estimated.
     pub administrative_horizon_timestamp: u64,
-    /// Expected inclusion timestamp used for reward validity.
+    /// Exact canonical block timestamp used as the start of reward validity.
+    /// Future block timestamps are never estimated.
     pub expected_inclusion_timestamp: u64,
     /// Durable rate-episode readiness.
     pub rate_episode_state_verified: bool,
@@ -289,8 +313,11 @@ impl SnapshotManifest {
                 || call.expected_code_hash.is_zero()
                 || call.allow_failure
                 || call.call_data.len() < 4
-                || call.call_data[..4] != call.selector
-                || keccak256(&call.call_data[4..]) != call.canonical_arguments_hash
+                || call.call_data.get(..4) != Some(call.selector.as_slice())
+                || call
+                    .call_data
+                    .get(4..)
+                    .is_none_or(|arguments| keccak256(arguments) != call.canonical_arguments_hash)
                 || !read_selector_allowed(call.selector)
             {
                 return Err(SnapshotError::InvalidManifest);
@@ -453,23 +480,6 @@ pub fn build_snapshot_manifest(
         ReturnSchema::Uint(256),
         SnapshotPurpose::Parent,
     )?;
-    let current_adapters = blueprint
-        .topology
-        .adapters
-        .iter()
-        .filter_map(|(adapter, topology)| topology.currently_enabled.then_some(*adapter))
-        .collect::<Vec<_>>();
-    for (index, _) in current_adapters.iter().enumerate() {
-        builder.call(
-            SnapshotKey::ParentAdapterAt(index),
-            vault,
-            IVaultV2::adaptersCall {
-                index: U256::from(index),
-            },
-            ReturnSchema::Address,
-            SnapshotPurpose::Parent,
-        )?;
-    }
     builder.call(
         SnapshotKey::ParentLiquidityAdapter,
         vault,
@@ -1039,17 +1049,6 @@ pub async fn build_exact_snapshot<P: AtomicSnapshotProvider>(
     blueprint: &SnapshotBlueprint<'_>,
 ) -> Result<ExactVaultSnapshot, SnapshotError> {
     let manifest = build_snapshot_manifest(blueprint)?;
-    verify_manifest_code(
-        provider,
-        &manifest,
-        blueprint.snapshot_policy.mode,
-        blueprint.event_cursor,
-        (
-            blueprint.chain.multicall3,
-            blueprint.chain.expected_multicall3_code_hash,
-        ),
-    )
-    .await?;
     let calls = manifest
         .calls
         .iter()
@@ -1058,16 +1057,114 @@ pub async fn build_exact_snapshot<P: AtomicSnapshotProvider>(
             call_data: call.call_data.clone(),
         })
         .collect::<Vec<_>>();
-    let atomic = match blueprint.snapshot_policy.mode {
+    let verify_code = verify_manifest_code(
+        provider,
+        &manifest,
+        blueprint.code_hashes,
+        blueprint.snapshot_policy.mode,
+        blueprint.event_cursor,
+        (
+            blueprint.chain.multicall3,
+            blueprint.chain.expected_multicall3_code_hash,
+        ),
+    );
+    let read_snapshot = read_atomic_snapshot(provider, blueprint, &calls);
+    let ((), atomic) = tokio::try_join!(verify_code, read_snapshot)?;
+    let values = decode_results(&manifest, &atomic)?;
+    assemble_snapshot(blueprint, atomic, values)
+}
+
+/// Builds a background exact snapshot after the complete locked identity set has passed the
+/// process-start gate.
+///
+/// This path is intentionally limited to canonical background refresh. Transaction preflight and
+/// post-state reconciliation use [`build_exact_snapshot`] so they still bind code verification to
+/// their own strict read context.
+pub async fn build_background_snapshot_after_identity_gate<P: AtomicSnapshotProvider>(
+    provider: &P,
+    blueprint: &SnapshotBlueprint<'_>,
+) -> Result<ExactVaultSnapshot, SnapshotError> {
+    let manifest = build_snapshot_manifest(blueprint)?;
+    let calls = manifest
+        .calls
+        .iter()
+        .map(|call| AtomicCall {
+            target: call.target,
+            call_data: call.call_data.clone(),
+        })
+        .collect::<Vec<_>>();
+    let atomic = read_atomic_snapshot(provider, blueprint, &calls).await?;
+    let values = decode_results(&manifest, &atomic)?;
+    assemble_snapshot(blueprint, atomic, values)
+}
+
+/// Builds an exact latest-state snapshot whose block context is reported from inside the
+/// Multicall aggregate instead of being imposed through a historical `eth_call` block tag.
+///
+/// The supplied topology remains the complete manifest source. Callers must process canonical
+/// events through the returned snapshot block and compare the replayed topology revision before
+/// publishing a plan.
+pub async fn build_reported_latest_background_snapshot_after_identity_gate<
+    P: AtomicSnapshotProvider,
+>(
+    provider: &P,
+    blueprint: &SnapshotBlueprint<'_>,
+) -> Result<ExactVaultSnapshot, SnapshotError> {
+    let manifest = build_snapshot_manifest(blueprint)?;
+    let calls = manifest
+        .calls
+        .iter()
+        .map(|call| AtomicCall {
+            target: call.target,
+            call_data: call.call_data.clone(),
+        })
+        .collect::<Vec<_>>();
+    let atomic = atomic_latest_reported(
+        provider,
+        blueprint.chain.multicall3,
+        blueprint.chain.chain_id,
+        blueprint.snapshot_policy.maximum_evm_timestamp_lag_seconds,
+        &calls,
+        blueprint.snapshot_policy.maximum_snapshot_retries,
+    )
+    .await?;
+    let values = decode_results(&manifest, &atomic)?;
+    let timestamps = CanonicalSnapshotTimestamps {
+        administrative_horizon_timestamp: atomic.evm_timestamp,
+        expected_inclusion_timestamp: atomic.evm_timestamp,
+    };
+    let rebound = SnapshotBlueprint {
+        chain: blueprint.chain,
+        snapshot_policy: blueprint.snapshot_policy,
+        strategy: blueprint.strategy,
+        vault: blueprint.vault,
+        topology: blueprint.topology,
+        code_hashes: blueprint.code_hashes,
+        static_config_revision: blueprint.static_config_revision,
+        event_cursor: atomic.block,
+        idle_locks: blueprint.idle_locks.clone(),
+        administrative_horizon_timestamp: timestamps.administrative_horizon_timestamp,
+        expected_inclusion_timestamp: timestamps.expected_inclusion_timestamp,
+        rate_episode_state_verified: blueprint.rate_episode_state_verified,
+    };
+    assemble_snapshot(&rebound, atomic, values)
+}
+
+async fn read_atomic_snapshot<P: AtomicSnapshotProvider>(
+    provider: &P,
+    blueprint: &SnapshotBlueprint<'_>,
+    calls: &[AtomicCall],
+) -> Result<AtomicReadResult, SnapshotError> {
+    match blueprint.snapshot_policy.mode {
         SnapshotMode::PinnedBlock => {
             pinned_block(
                 provider,
                 blueprint.chain.multicall3,
                 blueprint.chain.chain_id,
                 blueprint.event_cursor,
-                &calls,
+                calls,
             )
-            .await?
+            .await
         }
         SnapshotMode::AtomicLatest => {
             atomic_latest(
@@ -1075,14 +1172,13 @@ pub async fn build_exact_snapshot<P: AtomicSnapshotProvider>(
                 blueprint.chain.multicall3,
                 blueprint.chain.chain_id,
                 blueprint.event_cursor,
-                &calls,
+                calls,
                 blueprint.snapshot_policy.maximum_snapshot_retries,
             )
-            .await?
+            .await
         }
-    };
-    let values = decode_results(&manifest, &atomic)?;
-    assemble_snapshot(blueprint, atomic, values)
+    }
+    .map_err(SnapshotError::from)
 }
 
 /// Canonically hashes an exact snapshot with its self-referential field zeroed.
@@ -1121,12 +1217,6 @@ pub fn bind_idle_lock_ledger(
     {
         idle_locks.verified = true;
     }
-    let enabled_adapters = blueprint
-        .topology
-        .adapters
-        .iter()
-        .filter_map(|(adapter, topology)| topology.currently_enabled.then_some(*adapter))
-        .collect::<BTreeSet<_>>();
     let report = classify_capabilities(CapabilityInputs {
         config: blueprint.vault,
         strategy: blueprint.strategy,
@@ -1136,10 +1226,10 @@ pub fn bind_idle_lock_ledger(
         positions: &snapshot.positions,
         markets: &snapshot.markets,
         caps: &snapshot.caps,
-        enabled_adapters: &enabled_adapters,
+        enabled_adapters: &snapshot.enabled_adapters,
         pending_admin: &snapshot.pending_admin,
-        administrative_horizon_timestamp: blueprint.administrative_horizon_timestamp,
-        expected_inclusion_timestamp: blueprint.expected_inclusion_timestamp,
+        administrative_horizon_timestamp: snapshot.context.evm_timestamp,
+        expected_inclusion_timestamp: snapshot.context.evm_timestamp,
         lock_ledger_verified: idle_locks.verified,
         unattributed_idle_assets: idle_locks.unattributed_idle_assets,
         rate_episode_state_verified: blueprint.rate_episode_state_verified,
@@ -1147,6 +1237,42 @@ pub fn bind_idle_lock_ledger(
     snapshot.capabilities = report.capabilities;
     snapshot.idle_locks = idle_locks;
     snapshot.snapshot_hash = hash_exact_snapshot(snapshot)?;
+    Ok(())
+}
+
+/// Reconciles event-discovered topology with the snapshot's exact current adapter state.
+pub fn reconcile_topology_from_snapshot(
+    topology: &mut TopologyIndex,
+    snapshot: &ExactVaultSnapshot,
+) -> Result<(), SnapshotError> {
+    let current_adapters = snapshot
+        .enabled_adapters
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    reconcile_topology_exact(
+        topology,
+        &current_adapters,
+        &snapshot.adapters,
+        snapshot.context.block.number,
+    )
+}
+
+fn reconcile_topology_exact(
+    topology: &mut TopologyIndex,
+    current_adapters: &[AdapterAddress],
+    adapters: &BTreeMap<AdapterAddress, DirectAdapterState>,
+    block_number: u64,
+) -> Result<(), SnapshotError> {
+    let mut current_markets = topology
+        .adapters
+        .iter()
+        .map(|(adapter, state)| (*adapter, state.current_market_ids.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (adapter, state) in adapters {
+        current_markets.insert(*adapter, state.current_market_ids.clone());
+    }
+    topology.reconcile_exact(current_adapters, &current_markets, block_number)?;
     Ok(())
 }
 
@@ -1161,6 +1287,7 @@ struct CanonicalExactSnapshot<'a> {
     context: &'a StateContext,
     parent: &'a ParentVaultState,
     adapters: Vec<&'a DirectAdapterState>,
+    enabled_adapters: &'a BTreeSet<AdapterAddress>,
     positions: Vec<&'a DirectMarketPositionState>,
     markets: Vec<&'a StoredMarketState>,
     caps: Vec<&'a CapState>,
@@ -1188,6 +1315,7 @@ fn canonical_snapshot_bytes(
         context: &snapshot.context,
         parent: &snapshot.parent,
         adapters: snapshot.adapters.values().collect(),
+        enabled_adapters: &snapshot.enabled_adapters,
         positions: snapshot.positions.values().collect(),
         markets: snapshot.markets.values().collect(),
         caps: snapshot.caps.values().collect(),
@@ -1247,7 +1375,9 @@ impl<'a> ManifestBuilder<'a> {
             target,
             expected_code_hash,
             selector,
-            canonical_arguments_hash: keccak256(&call_data[4..]),
+            canonical_arguments_hash: keccak256(
+                call_data.get(4..).ok_or(SnapshotError::InvalidManifest)?,
+            ),
             expected_return,
             allow_failure: false,
             purpose,
@@ -1260,6 +1390,7 @@ impl<'a> ManifestBuilder<'a> {
 async fn verify_manifest_code<P: AtomicSnapshotProvider>(
     provider: &P,
     manifest: &SnapshotManifest,
+    locked_code_hashes: &BTreeMap<Address, B256>,
     mode: SnapshotMode,
     block: crate::domain::BlockRef,
     multicall: (Address, B256),
@@ -1269,6 +1400,11 @@ async fn verify_manifest_code<P: AtomicSnapshotProvider>(
         .iter()
         .map(|call| (call.target, call.expected_code_hash))
         .collect::<BTreeSet<_>>();
+    targets.extend(
+        locked_code_hashes
+            .iter()
+            .map(|(target, expected)| (*target, *expected)),
+    );
     targets.insert(multicall);
     let checks = stream::iter(targets)
         .map(|(target, expected)| async move {
@@ -1311,7 +1447,11 @@ fn decode_value(schema: ReturnSchema, data: &Bytes) -> Result<DecodedValue, Snap
         ReturnSchema::Bool => canonical::<bool>(data).map(DecodedValue::Bool),
         ReturnSchema::Uint(bits) => {
             let value = canonical::<U256>(data)?;
-            if bits == 0 || bits > 256 || (bits < 256 && value >= (U256::ONE << bits)) {
+            let exceeds_width = bits < 256
+                && U256::ONE
+                    .checked_shl(usize::from(bits))
+                    .is_none_or(|limit| value >= limit);
+            if bits == 0 || bits > 256 || exceeds_width {
                 return Err(SnapshotError::ReturnSchemaMismatch);
             }
             Ok(DecodedValue::Uint(value))
@@ -1326,14 +1466,20 @@ fn decode_value(schema: ReturnSchema, data: &Bytes) -> Result<DecodedValue, Snap
         ReturnSchema::MorphoMarket => {
             let value = canonical::<(U256, U256, U256, U256, U256, U256)>(data)?;
             let fields = [value.0, value.1, value.2, value.3, value.4, value.5];
-            if fields.iter().any(|field| *field >= (U256::ONE << 128)) {
+            let uint128_limit = U256::from(u128::MAX)
+                .checked_add(U256::ONE)
+                .ok_or(SnapshotError::ReturnSchemaMismatch)?;
+            if fields.iter().any(|field| *field >= uint128_limit) {
                 return Err(SnapshotError::ReturnSchemaMismatch);
             }
             Ok(DecodedValue::Market(fields))
         }
         ReturnSchema::MorphoPosition => {
             let value = canonical::<(U256, U256, U256)>(data)?;
-            if value.1 >= (U256::ONE << 128) || value.2 >= (U256::ONE << 128) {
+            let uint128_limit = U256::from(u128::MAX)
+                .checked_add(U256::ONE)
+                .ok_or(SnapshotError::ReturnSchemaMismatch)?;
+            if value.1 >= uint128_limit || value.2 >= uint128_limit {
                 return Err(SnapshotError::ReturnSchemaMismatch);
             }
             Ok(DecodedValue::Position([value.0, value.1, value.2]))
@@ -1376,7 +1522,6 @@ fn read_selector_allowed(selector: [u8; 4]) -> bool {
         IVaultV2::sendAssetsGateCall::SELECTOR,
         IVaultV2::adapterRegistryCall::SELECTOR,
         IVaultV2::adaptersLengthCall::SELECTOR,
-        IVaultV2::adaptersCall::SELECTOR,
         IVaultV2::isAdapterCall::SELECTOR,
         IVaultV2::isAllocatorCall::SELECTOR,
         IVaultV2::isSentinelCall::SELECTOR,
@@ -1489,13 +1634,6 @@ fn assemble_snapshot(
     let mut enabled_adapters = BTreeSet::new();
     let mut adapters = BTreeMap::new();
     let parent_count = usize_from_u256(uint(&values, &SnapshotKey::ParentAdaptersLength)?)?;
-    let mut parent_order = Vec::with_capacity(parent_count);
-    for index in 0..parent_count {
-        parent_order.push(AdapterAddress(address(
-            &values,
-            &SnapshotKey::ParentAdapterAt(index),
-        )?));
-    }
     for (adapter, topology) in &blueprint.topology.adapters {
         let enabled = boolean(&values, &SnapshotKey::ParentAdapterEnabled(*adapter))?;
         if enabled {
@@ -1654,18 +1792,19 @@ fn assemble_snapshot(
     } else {
         None
     };
-    let topology_enabled = blueprint
-        .topology
-        .adapters
-        .iter()
-        .filter_map(|(adapter, topology)| topology.currently_enabled.then_some(*adapter))
-        .collect::<BTreeSet<_>>();
-    if parent_order.iter().copied().collect::<BTreeSet<_>>() != enabled_adapters
-        || parent_order.len() != enabled_adapters.len()
-        || enabled_adapters != topology_enabled
-    {
+    // Exact `isAdapter` reads establish membership for every all-ever adapter. The exact array
+    // length proves no additional enabled adapter is absent from event-discovered topology.
+    if parent_count != enabled_adapters.len() {
         return Err(SnapshotError::IdentityMismatch);
     }
+    let parent_adapters = enabled_adapters.iter().copied().collect::<Vec<_>>();
+    let mut exact_topology = blueprint.topology.clone();
+    reconcile_topology_exact(
+        &mut exact_topology,
+        &parent_adapters,
+        &adapters,
+        atomic.block.number,
+    )?;
     let parent = ParentVaultState {
         vault: vault_address.0,
         asset,
@@ -1945,12 +2084,14 @@ fn assemble_snapshot(
         context: StateContext {
             chain_id: blueprint.chain.chain_id,
             block: atomic.block,
+            evm_timestamp: atomic.evm_timestamp,
             block_hash_binding: atomic.block_hash_binding,
             static_config_revision: blueprint.static_config_revision,
-            dynamic_topology_revision: blueprint.topology.revision()?,
+            dynamic_topology_revision: exact_topology.revision()?,
         },
         parent,
         adapters,
+        enabled_adapters,
         liquidity_adapter,
         positions,
         markets,
@@ -2097,7 +2238,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::chain::provider::ProviderError;
+    use crate::chain::provider::{ProviderError, RpcErrorCategory};
     use crate::config::AppConfig;
     use crate::domain::BlockRef;
     use crate::state::topology::AdapterTopology;
@@ -2108,6 +2249,8 @@ mod tests {
         aggregate_results: Vec<(bool, Bytes)>,
         code: Bytes,
         header_calls: AtomicUsize,
+        header_errors_remaining: AtomicUsize,
+        code_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -2122,6 +2265,23 @@ mod tests {
                 .unwrap_or(self.fallback_header))
         }
 
+        async fn header_by_number(&self, _number: u64) -> Result<BlockRef, ProviderError> {
+            if self
+                .header_errors_remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ProviderError::Rpc {
+                    method: "eth_getBlockByNumber",
+                    code: -32_603,
+                    category: RpcErrorCategory::Unknown,
+                });
+            }
+            self.latest_header().await
+        }
+
         async fn call_latest(
             &self,
             _target: Address,
@@ -2133,13 +2293,18 @@ mod tests {
         async fn call_at_block(
             &self,
             _target: Address,
-            _data: &Bytes,
+            data: &Bytes,
             _block: BlockRef,
         ) -> Result<Bytes, ProviderError> {
-            Ok(self.aggregate_results.clone().abi_encode().into())
+            if data.get(..4) == Some(IVaultV2::adaptersLengthCall::SELECTOR.as_slice()) {
+                Ok(U256::ONE.abi_encode().into())
+            } else {
+                Ok(self.aggregate_results.clone().abi_encode().into())
+            }
         }
 
         async fn code_at(&self, _target: Address) -> Result<Bytes, ProviderError> {
+            self.code_calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.code.clone())
         }
 
@@ -2148,6 +2313,7 @@ mod tests {
             _target: Address,
             _block: BlockRef,
         ) -> Result<Bytes, ProviderError> {
+            self.code_calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.code.clone())
         }
     }
@@ -2168,6 +2334,15 @@ mod tests {
             timestamp: 1_900_000_000,
             gas_limit: 10_000_000,
         }
+    }
+
+    #[test]
+    fn protocol_timestamps_are_bound_to_the_exact_canonical_block() {
+        let mut block = fixture_head();
+        block.timestamp = u64::MAX;
+        let timestamps = CanonicalSnapshotTimestamps::from_block(block);
+        assert_eq!(timestamps.administrative_horizon_timestamp, u64::MAX);
+        assert_eq!(timestamps.expected_inclusion_timestamp, u64::MAX);
     }
 
     fn fixture_topology(vault: &ValidatedVaultConfig) -> TopologyIndex {
@@ -2246,8 +2421,6 @@ mod tests {
             SnapshotKey::ParentAdaptersLength | SnapshotKey::AdapterMarketLength(_) => {
                 U256::ONE.abi_encode().into()
             }
-            SnapshotKey::ParentAdapterAt(0) => adapter.0.abi_encode().into(),
-            SnapshotKey::ParentAdapterAt(_) => Bytes::new(),
             SnapshotKey::ParentAdapterEnabled(_)
             | SnapshotKey::ParentAllocatorRole(_)
             | SnapshotKey::ParentSentinelRole(_)
@@ -2342,7 +2515,10 @@ mod tests {
         let code_hash = keccak256(&code);
         config.app.chain.expected_multicall3_code_hash = code_hash;
         let vault = &config.app.vaults[0];
-        let topology = fixture_topology(vault);
+        let mut topology = fixture_topology(vault);
+        for adapter in topology.adapters.values_mut() {
+            adapter.currently_enabled = false;
+        }
         let head = fixture_head();
         let addresses = [
             config.app.chain.multicall3,
@@ -2399,6 +2575,8 @@ mod tests {
             aggregate_results,
             code,
             header_calls: AtomicUsize::new(0),
+            header_errors_remaining: AtomicUsize::new(0),
+            code_calls: AtomicUsize::new(0),
         };
         let first = match build_exact_snapshot(&provider, &blueprint).await {
             Ok(snapshot) => snapshot,
@@ -2408,6 +2586,17 @@ mod tests {
             Ok(snapshot) => snapshot,
             Err(error) => panic!("repeat fixture snapshot must build: {error}"),
         };
+        let verified_code_calls = provider.code_calls.load(Ordering::Relaxed);
+        let background =
+            match build_background_snapshot_after_identity_gate(&provider, &blueprint).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => panic!("startup-gated background snapshot must build: {error}"),
+            };
+        assert_eq!(
+            provider.code_calls.load(Ordering::Relaxed),
+            verified_code_calls
+        );
+        assert_eq!(background, first);
         assert_eq!(first, second);
         assert_eq!(
             first.snapshot_hash,
@@ -2415,6 +2604,40 @@ mod tests {
         );
         assert!(first.capabilities.can_allocate);
         assert_eq!(first.positions.len(), 1);
+
+        let older_cursor = BlockRef {
+            number: head.number.saturating_sub(1),
+            hash: head.parent_hash,
+            parent_hash: B256::repeat_byte(0x19),
+            timestamp: head.timestamp.saturating_sub(1),
+            gas_limit: head.gas_limit,
+        };
+        let reported_blueprint = SnapshotBlueprint {
+            chain: blueprint.chain,
+            snapshot_policy: blueprint.snapshot_policy,
+            strategy: blueprint.strategy,
+            vault: blueprint.vault,
+            topology: blueprint.topology,
+            code_hashes: blueprint.code_hashes,
+            static_config_revision: blueprint.static_config_revision,
+            event_cursor: older_cursor,
+            idle_locks: blueprint.idle_locks.clone(),
+            administrative_horizon_timestamp: older_cursor.timestamp,
+            expected_inclusion_timestamp: older_cursor.timestamp,
+            rate_episode_state_verified: blueprint.rate_episode_state_verified,
+        };
+        let reported = match build_reported_latest_background_snapshot_after_identity_gate(
+            &provider,
+            &reported_blueprint,
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("reported latest snapshot must build: {error}"),
+        };
+        assert_eq!(reported.context.block, head);
+        assert_eq!(reported.parent, first.parent);
+        assert_eq!(reported.positions, first.positions);
     }
 
     #[tokio::test]
@@ -2433,6 +2656,8 @@ mod tests {
             aggregate_results: results,
             code: Bytes::from_static(&[1]),
             header_calls: AtomicUsize::new(0),
+            header_errors_remaining: AtomicUsize::new(0),
+            code_calls: AtomicUsize::new(0),
         };
         let result = atomic_latest(
             &provider,
@@ -2453,7 +2678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_movement_discards_result_and_attempts_a_new_bracket() {
+    async fn head_movement_discards_result_without_a_duplicate_before_header() {
         let first = fixture_head();
         let second = BlockRef {
             number: first.number + 1,
@@ -2463,7 +2688,7 @@ mod tests {
             gas_limit: first.gas_limit,
         };
         let provider = FixtureProvider {
-            headers: Mutex::new(VecDeque::from([first, second, second])),
+            headers: Mutex::new(VecDeque::from([second])),
             fallback_header: second,
             aggregate_results: vec![
                 (true, U256::from(first.number).abi_encode().into()),
@@ -2473,9 +2698,108 @@ mod tests {
             ],
             code: Bytes::from_static(&[1]),
             header_calls: AtomicUsize::new(0),
+            header_errors_remaining: AtomicUsize::new(0),
+            code_calls: AtomicUsize::new(0),
         };
         let result = atomic_latest(&provider, Address::with_last_byte(1), 999, first, &[], 2).await;
         assert!(matches!(result, Err(MulticallError::CursorNotAtHead)));
-        assert_eq!(provider.header_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(provider.header_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn reported_latest_binds_the_aggregate_to_its_own_canonical_header() {
+        let reported = fixture_head();
+        let provider = FixtureProvider {
+            headers: Mutex::new(VecDeque::from([reported])),
+            fallback_header: reported,
+            aggregate_results: vec![
+                (true, U256::from(reported.number).abi_encode().into()),
+                (true, U256::from(reported.timestamp).abi_encode().into()),
+                (true, U256::from(999_u64).abi_encode().into()),
+                (true, reported.parent_hash.abi_encode().into()),
+            ],
+            code: Bytes::from_static(&[1]),
+            header_calls: AtomicUsize::new(0),
+            header_errors_remaining: AtomicUsize::new(0),
+            code_calls: AtomicUsize::new(0),
+        };
+        let result =
+            atomic_latest_reported(&provider, Address::with_last_byte(1), 999, 0, &[], 2).await;
+        assert!(matches!(result, Ok(result) if result.block == reported));
+        assert_eq!(provider.header_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn reported_latest_rejects_a_header_that_does_not_match_the_evm_context() {
+        let reported = fixture_head();
+        let mismatched = BlockRef {
+            timestamp: reported.timestamp.saturating_add(1),
+            ..reported
+        };
+        let provider = FixtureProvider {
+            headers: Mutex::new(VecDeque::from([mismatched, mismatched])),
+            fallback_header: mismatched,
+            aggregate_results: vec![
+                (true, U256::from(reported.number).abi_encode().into()),
+                (true, U256::from(reported.timestamp).abi_encode().into()),
+                (true, U256::from(999_u64).abi_encode().into()),
+                (true, reported.parent_hash.abi_encode().into()),
+            ],
+            code: Bytes::from_static(&[1]),
+            header_calls: AtomicUsize::new(0),
+            header_errors_remaining: AtomicUsize::new(0),
+            code_calls: AtomicUsize::new(0),
+        };
+        let result =
+            atomic_latest_reported(&provider, Address::with_last_byte(1), 999, 0, &[], 2).await;
+        assert!(matches!(result, Err(MulticallError::ContextMismatch)));
+        assert_eq!(provider.header_calls.load(Ordering::Relaxed), 2);
+
+        let lagged_provider = FixtureProvider {
+            headers: Mutex::new(VecDeque::from([mismatched])),
+            fallback_header: mismatched,
+            aggregate_results: vec![
+                (true, U256::from(reported.number).abi_encode().into()),
+                (true, U256::from(reported.timestamp).abi_encode().into()),
+                (true, U256::from(999_u64).abi_encode().into()),
+                (true, reported.parent_hash.abi_encode().into()),
+            ],
+            code: Bytes::from_static(&[1]),
+            header_calls: AtomicUsize::new(0),
+            header_errors_remaining: AtomicUsize::new(0),
+            code_calls: AtomicUsize::new(0),
+        };
+        let accepted =
+            atomic_latest_reported(&lagged_provider, Address::with_last_byte(1), 999, 1, &[], 1)
+                .await;
+        assert!(matches!(
+            accepted,
+            Ok(result)
+                if result.block == mismatched && result.evm_timestamp == reported.timestamp
+        ));
+    }
+
+    #[tokio::test]
+    async fn reported_latest_retries_when_the_header_index_trails_execution() {
+        let reported = fixture_head();
+        let provider = FixtureProvider {
+            headers: Mutex::new(VecDeque::from([reported])),
+            fallback_header: reported,
+            aggregate_results: vec![
+                (true, U256::from(reported.number).abi_encode().into()),
+                (true, U256::from(reported.timestamp).abi_encode().into()),
+                (true, U256::from(999_u64).abi_encode().into()),
+                (true, reported.parent_hash.abi_encode().into()),
+            ],
+            code: Bytes::from_static(&[1]),
+            header_calls: AtomicUsize::new(0),
+            header_errors_remaining: AtomicUsize::new(1),
+            code_calls: AtomicUsize::new(0),
+        };
+        let result =
+            atomic_latest_reported(&provider, Address::with_last_byte(1), 999, 0, &[], 2).await;
+        assert!(matches!(result, Ok(result) if result.block == reported));
+        assert_eq!(provider.header_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.header_errors_remaining.load(Ordering::Relaxed), 0);
     }
 }

@@ -12,10 +12,12 @@ use thiserror::Error;
 
 use crate::{
     chain::provider::{
-        ChainDataProvider, ProviderError, SignedTransactionSubmitter, TransactionSimulationProvider,
+        AccountNonceProvider, ChainDataProvider, ProviderError, SignedTransactionSubmitter,
+        TransactionSimulationProvider,
     },
-    config::{ValidatedConfig, ValidatedVaultConfig},
-    domain::{BlockRef, RateObjectiveBranch, TransactionId},
+    config::{SnapshotMode, ValidatedConfig, ValidatedVaultConfig, VaultStrategy},
+    domain::{BlockRef, PlanId, PlanReason, RateObjectiveBranch, TransactionId},
+    morpho::blue_math::{WAD, mul_div_up},
     storage::{
         StorageError,
         actor::StorageHandle,
@@ -46,7 +48,7 @@ use crate::{
 /// Stable inclusion scenario identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InclusionScenarioKind {
-    /// First eligible fast-block opportunity.
+    /// First eligible inclusion opportunity.
     Earliest,
     /// Configured expected inclusion opportunity.
     Expected,
@@ -54,15 +56,19 @@ pub enum InclusionScenarioKind {
     LatestAccepted,
 }
 
-/// Time and fee assumptions supplied to the exact preflight planner.
+/// Inclusion-opportunity and fee assumptions supplied to the exact preflight planner.
+///
+/// Opportunity offsets are transaction-lifecycle counters, not elapsed seconds. Every scenario
+/// is therefore bound to the same exact canonical block. If that block stops being the canonical
+/// head, the signing gate rejects the attempt and the caller refreshes and replans.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InclusionAssumption {
     /// Scenario kind.
     pub kind: InclusionScenarioKind,
-    /// Offset in eligible HyperEVM fast-block opportunities.
-    pub fast_block_offset: u64,
-    /// Projected Unix timestamp.
-    pub projected_timestamp: u64,
+    /// Offset in eligible opportunities under the configured chain policy.
+    pub opportunity_offset: u64,
+    /// Exact canonical block supplying all protocol time-dependent values.
+    pub canonical_block: BlockRef,
     /// Maximum fee assumption in wei.
     pub max_fee_per_gas: u128,
 }
@@ -113,8 +119,6 @@ pub struct ExecutePreflightRequest {
     pub max_fee_per_gas: u128,
     /// EIP-1559 priority fee.
     pub max_priority_fee_per_gas: u128,
-    /// Unix timestamp used for durable records.
-    pub created_at: u64,
 }
 
 /// Successful broadcast whose exact bytes were durable first.
@@ -137,6 +141,8 @@ pub struct PreparedPreflightPlan {
     pub plan: ValidatedPlan,
     /// One exact projection for every action in plan order.
     pub action_projections: Vec<ActionProjection>,
+    /// Inclusion assumptions rebound to the exact snapshot selected by the source.
+    pub scenarios: [InclusionAssumption; 3],
 }
 
 /// Exact state/planner bridge. Implementations must persist the rebuilt exact snapshot.
@@ -236,6 +242,15 @@ pub enum PreflightSourceError {
     /// Exact refresh or plan construction failed at a non-secret semantic stage.
     #[error("exact preflight source failed at `{0}`")]
     FailedAt(&'static str),
+    /// An RPC/indexing dependency is temporarily unavailable; no bytes were signed.
+    #[error("exact preflight source is temporarily unavailable at `{0}`")]
+    RetryableAt(&'static str),
+    /// A classified transport, rate-limit, or server outage may trip the bounded breaker.
+    #[error("exact preflight provider is unavailable at `{0}`")]
+    ProviderOutageAt(&'static str),
+    /// Local durability, configuration, or protocol identity is inconsistent.
+    #[error("exact preflight source has a fatal invariant failure at `{0}`")]
+    FatalAt(&'static str),
 }
 
 /// One-head final preflight or submission failure.
@@ -248,9 +263,12 @@ pub enum PreflightError {
     #[error("signer already owns an unresolved transaction")]
     NonceBusy,
     /// Head, event cursor, or queued invalidation changed the decision context.
-    #[error("same-head signing context changed")]
-    HeadChanged,
-    /// HyperEVM signer is not on the required fast-block lane.
+    #[error("planning context was superseded; refresh exact state and replan")]
+    RefreshAndReplan,
+    /// The canonical signer nonce changed before the final signing gate.
+    #[error("canonical signer nonce changed during final preflight")]
+    NonceChanged,
+    /// HyperEVM signer is not on the explicitly configured fast-block lane.
     #[error("signer is using HyperEVM big blocks")]
     BigBlocks,
     /// Snapshot-to-sign or sign-to-broadcast release latency failed.
@@ -265,6 +283,12 @@ pub enum PreflightError {
     /// Gas computation failed.
     #[error(transparent)]
     Fee(#[from] FeeError),
+    /// Rolling hourly or daily semantic movement would exceed vault policy.
+    #[error("rolling movement budget would be exceeded")]
+    MovementBudget,
+    /// Conservative 24-hour strategy benefit does not cover gas, loss, and policy margin.
+    #[error("top-K economic execution gate rejected the transaction")]
+    EconomicGate,
     /// Independent transaction firewall failed.
     #[error(transparent)]
     Firewall(#[from] FirewallError),
@@ -282,7 +306,7 @@ pub enum PreflightError {
     ClockRange,
 }
 
-/// Builds the required earliest, expected and latest accepted scenario clocks.
+/// Builds the required earliest, expected and latest accepted opportunity assumptions.
 pub fn inclusion_assumptions(
     head: BlockRef,
     expected_offset: u64,
@@ -290,23 +314,18 @@ pub fn inclusion_assumptions(
     max_fee_per_gas: u128,
 ) -> Result<[InclusionAssumption; 3], PreflightError> {
     if expected_offset == 0 || latest_offset < expected_offset {
-        return Err(PreflightError::HeadChanged);
+        return Err(PreflightError::RefreshAndReplan);
     }
-    let build = |kind, offset| {
-        head.timestamp
-            .checked_add(offset)
-            .map(|projected_timestamp| InclusionAssumption {
-                kind,
-                fast_block_offset: offset,
-                projected_timestamp,
-                max_fee_per_gas,
-            })
-            .ok_or(PreflightError::ClockRange)
+    let build = |kind, opportunity_offset| InclusionAssumption {
+        kind,
+        opportunity_offset,
+        canonical_block: head,
+        max_fee_per_gas,
     };
     Ok([
-        build(InclusionScenarioKind::Earliest, 1)?,
-        build(InclusionScenarioKind::Expected, expected_offset)?,
-        build(InclusionScenarioKind::LatestAccepted, latest_offset)?,
+        build(InclusionScenarioKind::Earliest, 1),
+        build(InclusionScenarioKind::Expected, expected_offset),
+        build(InclusionScenarioKind::LatestAccepted, latest_offset),
     ])
 }
 
@@ -314,6 +333,7 @@ pub fn inclusion_assumptions(
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_one_head_preflight(
     head_provider: &dyn ChainDataProvider,
+    nonce_provider: &dyn AccountNonceProvider,
     simulator: &dyn TransactionSimulationProvider,
     submitter: &dyn SignedTransactionSubmitter,
     source: &dyn ExactPreflightSource,
@@ -332,29 +352,62 @@ pub async fn execute_one_head_preflight(
     {
         return Err(PreflightError::NonceBusy);
     }
-    if simulator.using_big_blocks(vault.signer_address).await? {
+    if config
+        .app
+        .chain
+        .block_opportunity_policy
+        .requires_hyper_evm_signer_lane_check()
+        && simulator.using_big_blocks(vault.signer_address).await?
+    {
         return Err(PreflightError::BigBlocks);
     }
     let started = Instant::now();
-    let head = head_provider.latest_header().await?;
-    require_cursor(source.event_cursor().await?, head)?;
-    let scenarios = inclusion_assumptions(
-        head,
-        config.app.execution.expected_inclusion_fast_blocks,
-        config.app.execution.maximum_inclusion_fast_blocks,
+    let requested_head = head_provider.latest_header().await?;
+    if config.app.snapshot.mode == SnapshotMode::PinnedBlock
+        && require_cursor(source.event_cursor().await?, requested_head).is_err()
+    {
+        tracing::debug!(stage = "initial_cursor", "same-head preflight deferred");
+        return Err(PreflightError::RefreshAndReplan);
+    }
+    let requested_scenarios = inclusion_assumptions(
+        requested_head,
+        config.app.execution.expected_inclusion_opportunities,
+        config.app.execution.maximum_inclusion_opportunities,
         request.max_fee_per_gas,
     )?;
-    let prepared = match source.rebuild_plan(head, &scenarios).await {
+    let prepared = match source
+        .rebuild_plan(requested_head, &requested_scenarios)
+        .await
+    {
         Ok(prepared) => prepared,
         Err(PreflightSourceError::ContextChanged) => {
-            return Err(PreflightError::HeadChanged);
+            tracing::debug!(stage = "plan_rebuild", "same-head preflight deferred");
+            return Err(PreflightError::RefreshAndReplan);
         }
         Err(error) => return Err(error.into()),
     };
+    tracing::debug!(
+        stage = "rebuilt_plan",
+        elapsed_ms = started.elapsed().as_millis(),
+        "same-head preflight progress"
+    );
+    let scenarios = prepared.scenarios;
     let plan = prepared.plan;
-    if plan.plan().snapshot.block != head || plan.plan().vault != vault.address {
-        return Err(PreflightError::HeadChanged);
+    let head = plan.plan().snapshot.block;
+    if scenarios
+        .iter()
+        .any(|scenario| scenario.canonical_block != head)
+        || plan.plan().vault != vault.address
+    {
+        return Err(PreflightError::RefreshAndReplan);
     }
+    validate_rolling_movement(
+        storage,
+        vault,
+        plan.plan().projection.movement_assets,
+        head.timestamp,
+    )
+    .await?;
     let expected_actions = expected_action_records(&plan, &prepared.action_projections, vault)?;
     let calldata = encode_validated_plan(&plan);
     let calldata_hash = keccak256(&calldata);
@@ -364,19 +417,42 @@ pub async fn execute_one_head_preflight(
         calldata_hash.as_slice(),
     ]);
 
-    require_head(head_provider.latest_header().await?, head)?;
+    // Latest-only providers cannot keep the complete planning read set and event cursor on one
+    // fast block. The plan remains bound to its canonical atomic snapshot, while the exact typed
+    // call is simulated at the newest canonical block available immediately before signing.
+    let simulation_head = if config.app.snapshot.mode == SnapshotMode::AtomicLatest {
+        head_provider.latest_header().await?
+    } else {
+        head
+    };
     let (call_output, gas_estimate) = tokio::try_join!(
-        simulator.call_at(vault.signer_address, vault.address.0, &calldata, head),
-        simulator.estimate_gas_at(vault.signer_address, vault.address.0, &calldata, head),
+        simulator.call_at(
+            vault.signer_address,
+            vault.address.0,
+            &calldata,
+            simulation_head,
+        ),
+        simulator.estimate_gas_at(
+            vault.signer_address,
+            vault.address.0,
+            &calldata,
+            simulation_head,
+        ),
     )?;
-    require_head(head_provider.latest_header().await?, head)?;
+    tracing::debug!(
+        stage = "simulated",
+        elapsed_ms = started.elapsed().as_millis(),
+        "same-head preflight progress"
+    );
     let gas_limit = signed_gas_limit(
         gas_estimate,
         config.app.execution.gas_headroom_bps,
         config.app.execution.maximum_signed_transaction_gas,
     )?;
+    validate_top_k_economic_gate(&plan, gas_limit, request.max_fee_per_gas, vault, config)?;
     let simulation_after_hash = context_hash(&[
         simulation_before_hash.as_slice(),
+        simulation_head.hash.as_slice(),
         call_output.as_ref(),
         &gas_estimate.to_be_bytes(),
         &gas_limit.to_be_bytes(),
@@ -399,15 +475,18 @@ pub async fn execute_one_head_preflight(
         &config.app.execution,
     )?;
     storage
-        .persist_plan(plan.plan().clone(), request.created_at)
+        .persist_plan(plan.plan().clone(), head.timestamp)
         .await?;
     let elapsed_nanos =
         u64::try_from(started.elapsed().as_nanos()).map_err(|_| PreflightError::ClockRange)?;
-    let preflight_id = context_hash(&[
-        plan.plan().plan_id.0.as_slice(),
-        head.hash.as_slice(),
-        calldata_hash.as_slice(),
-    ]);
+    let preflight_id = final_preflight_id(
+        request.transaction_id,
+        plan.plan().plan_id,
+        head,
+        calldata_hash,
+        simulation_before_hash,
+        simulation_after_hash,
+    );
     storage
         .persist_final_preflight(FinalPreflightRecord {
             preflight_id,
@@ -421,17 +500,27 @@ pub async fn execute_one_head_preflight(
             signed_gas_limit: gas_limit,
             expected_actions,
             completed_monotonic_nanos: elapsed_nanos,
-            created_at: request.created_at,
+            created_at: head.timestamp,
         })
         .await?;
+    tracing::debug!(
+        stage = "preflight_durable",
+        elapsed_ms = started.elapsed().as_millis(),
+        "same-head preflight progress"
+    );
     let durable = reserve_durable_rebalance(
         storage,
         &plan,
         transaction,
         request.transaction_id,
-        request.created_at,
+        head.timestamp,
     )
     .await?;
+    tracing::debug!(
+        stage = "rebalance_reserved",
+        elapsed_ms = started.elapsed().as_millis(),
+        "same-head preflight progress"
+    );
     let movement_reservation_id = durable
         .movement_reservation()
         .map_or(B256::ZERO, |reservation| reservation.reservation_id);
@@ -442,24 +531,62 @@ pub async fn execute_one_head_preflight(
         .movement_reservation()
         .map(|reservation| reservation.budget_after);
 
-    let gate_head = head_provider.latest_header().await?;
-    let gate_cursor = source.event_cursor().await?;
+    // Pinned-block mode retains the one-head fence. Latest-only mode intentionally permits the
+    // chain to advance after planning and simulation; a revert is handled by refreshing state and
+    // replanning. The final gate still owns the allocator nonce and never bypasses the typed
+    // transaction firewall.
+    let (gate_head, gate_cursor, gate_nonce, invalidation_queued) = tokio::try_join!(
+        async {
+            head_provider
+                .latest_header()
+                .await
+                .map_err(PreflightError::from)
+        },
+        async { source.event_cursor().await.map_err(PreflightError::from) },
+        async {
+            // Nonce safety never depends on a provider's `pending` view or historical nonce
+            // support. The provider returns the confirmed `latest` nonce; durable storage proves
+            // whether this process already owns one unresolved transaction.
+            nonce_provider
+                .account_nonce(vault.signer_address)
+                .await
+                .map_err(PreflightError::from)
+        },
+        async {
+            source
+                .invalidation_queued()
+                .await
+                .map_err(PreflightError::from)
+        },
+    )?;
     let elapsed_millis =
         u64::try_from(started.elapsed().as_millis()).map_err(|_| PreflightError::ClockRange)?;
-    if gate_head != head
-        || require_cursor(gate_cursor, head).is_err()
-        || source.invalidation_queued().await?
+    let strict_context_changed = config.app.snapshot.mode == SnapshotMode::PinnedBlock
+        && (gate_head != head || require_cursor(gate_cursor, head).is_err());
+    if strict_context_changed
+        || invalidation_queued
+        || gate_nonce != request.nonce
         || u128::from(elapsed_millis) > config.app.snapshot.maximum_snapshot_to_sign_latency_millis
     {
-        abort_unsigned_rebalance(storage, &durable, request.created_at).await?;
-        return Err(
-            if elapsed_millis as u128 > config.app.snapshot.maximum_snapshot_to_sign_latency_millis
-            {
-                PreflightError::Latency
-            } else {
-                PreflightError::HeadChanged
-            },
+        let latency_exceeded = u128::from(elapsed_millis)
+            > config.app.snapshot.maximum_snapshot_to_sign_latency_millis;
+        tracing::debug!(
+            stage = "signing_gate",
+            elapsed_ms = elapsed_millis,
+            strict_context_changed,
+            invalidation_queued,
+            nonce_changed = gate_nonce != request.nonce,
+            latency_exceeded,
+            "same-head preflight deferred"
         );
+        abort_unsigned_rebalance(storage, &durable, head.timestamp).await?;
+        return Err(if gate_nonce != request.nonce {
+            PreflightError::NonceChanged
+        } else if latency_exceeded {
+            PreflightError::Latency
+        } else {
+            PreflightError::RefreshAndReplan
+        });
     }
     let signing_gate_hash = context_hash(&[
         simulation_after_hash.as_slice(),
@@ -485,7 +612,7 @@ pub async fn execute_one_head_preflight(
         .record_attempt_broadcast(
             request.transaction_id,
             signed.transaction_hash,
-            request.created_at,
+            head.timestamp,
             head.number,
         )
         .await?;
@@ -499,10 +626,10 @@ pub async fn execute_one_head_preflight(
             expected_state: TransactionState::Signed,
             next_state: TransactionState::Submitted,
             transaction_hash: Some(signed.transaction_hash),
-            submitted_at: Some(request.created_at),
+            submitted_at: Some(head.timestamp),
             included_block: None,
             included_block_hash: None,
-            updated_at: request.created_at,
+            updated_at: head.timestamp,
         })
         .await?;
     if sign_started.elapsed().as_millis()
@@ -531,6 +658,97 @@ pub async fn execute_one_head_preflight(
         submitted_hash,
         signed,
     })
+}
+
+async fn validate_rolling_movement(
+    storage: &StorageHandle,
+    vault: &ValidatedVaultConfig,
+    proposed: U256,
+    now: u64,
+) -> Result<(), PreflightError> {
+    let (hourly, daily) = tokio::try_join!(
+        storage.movement_since(vault.address, now.saturating_sub(3_600)),
+        storage.movement_since(vault.address, now.saturating_sub(86_400)),
+    )?;
+    if hourly
+        .checked_add(proposed)
+        .is_none_or(|total| total > vault.maximum_movement_per_hour_assets)
+        || daily
+            .checked_add(proposed)
+            .is_none_or(|total| total > vault.maximum_movement_per_day_assets)
+    {
+        Err(PreflightError::MovementBudget)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_top_k_economic_gate(
+    plan: &ValidatedPlan,
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+    vault: &ValidatedVaultConfig,
+    config: &ValidatedConfig,
+) -> Result<(), PreflightError> {
+    if vault.strategy != VaultStrategy::TopKApyDiversified
+        || !matches!(
+            plan.plan().reason,
+            PlanReason::CapitalDeployment | PlanReason::TopKApyRebalance
+        )
+    {
+        return Ok(());
+    }
+    let settings = &config.app.strategy.top_k_apy;
+    if !settings.enforce_gas_economic_gate {
+        return Ok(());
+    }
+    if settings.native_token_price_ceiling_asset_wad.is_zero() {
+        return Err(PreflightError::EconomicGate);
+    }
+    let required = required_top_k_gain_assets(
+        gas_limit,
+        max_fee_per_gas,
+        vault.asset_decimals,
+        settings,
+        plan.plan().projection.immediate_loss_assets,
+    )?;
+    require_top_k_gain(plan.plan().projection.expected_gain_assets, required)
+}
+
+fn require_top_k_gain(gain: U256, required: U256) -> Result<(), PreflightError> {
+    if gain < required {
+        Err(PreflightError::EconomicGate)
+    } else {
+        Ok(())
+    }
+}
+
+fn required_top_k_gain_assets(
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+    asset_decimals: u8,
+    settings: &crate::config::ValidatedTopKApyConfig,
+    immediate_loss_assets: U256,
+) -> Result<U256, PreflightError> {
+    let native_cost_wei = U256::from(gas_limit)
+        .checked_mul(U256::from(max_fee_per_gas))
+        .ok_or(PreflightError::EconomicGate)?;
+    let whole_asset_wad = mul_div_up(
+        native_cost_wei,
+        settings.native_token_price_ceiling_asset_wad,
+        WAD,
+    )
+    .map_err(|_| PreflightError::EconomicGate)?;
+    let asset_scale = U256::from(10_u8)
+        .checked_pow(U256::from(asset_decimals))
+        .ok_or(PreflightError::EconomicGate)?;
+    let gas_assets =
+        mul_div_up(whole_asset_wad, asset_scale, WAD).map_err(|_| PreflightError::EconomicGate)?;
+    gas_assets
+        .checked_mul(U256::from(settings.gas_cost_multiplier))
+        .and_then(|cost| cost.checked_add(immediate_loss_assets))
+        .and_then(|cost| cost.checked_add(settings.minimum_net_gain_assets))
+        .ok_or(PreflightError::EconomicGate)
 }
 
 pub(crate) fn expected_action_records(
@@ -636,7 +854,7 @@ fn require_head(observed: BlockRef, expected: BlockRef) -> Result<(), PreflightE
     if observed == expected {
         Ok(())
     } else {
-        Err(PreflightError::HeadChanged)
+        Err(PreflightError::RefreshAndReplan)
     }
 }
 
@@ -653,17 +871,39 @@ fn context_hash(parts: &[&[u8]]) -> B256 {
     keccak256(bytes)
 }
 
+fn final_preflight_id(
+    transaction_id: TransactionId,
+    plan_id: PlanId,
+    head: BlockRef,
+    calldata_hash: B256,
+    simulation_before_hash: B256,
+    simulation_after_hash: B256,
+) -> B256 {
+    context_hash(&[
+        transaction_id.0.as_slice(),
+        plan_id.0.as_slice(),
+        head.hash.as_slice(),
+        calldata_hash.as_slice(),
+        simulation_before_hash.as_slice(),
+        simulation_after_hash.as_slice(),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use alloy::primitives::B256;
+    use alloy::primitives::{B256, U256};
 
     use super::{
         ExecutionReservationManager, InclusionScenarioKind, PreflightError, ReservationError,
-        inclusion_assumptions, require_head,
+        final_preflight_id, inclusion_assumptions, require_head, require_top_k_gain,
+        required_top_k_gain_assets,
     };
-    use crate::{config::AppConfig, domain::BlockRef};
+    use crate::{
+        config::AppConfig,
+        domain::{BlockRef, PlanId, TransactionId},
+    };
 
     fn head(timestamp: u64) -> BlockRef {
         BlockRef {
@@ -676,38 +916,39 @@ mod tests {
     }
 
     #[test]
-    fn inclusion_scenarios_are_ordered_and_use_checked_timestamps() {
-        let scenarios = inclusion_assumptions(head(1_900_000_000), 3, 7, 100);
+    fn inclusion_scenarios_are_ordered_and_bound_to_the_exact_canonical_block() {
+        let canonical = head(1_900_000_000);
+        let scenarios = inclusion_assumptions(canonical, 3, 7, 100);
         assert!(scenarios.is_ok());
         let scenarios = match scenarios {
             Ok(scenarios) => scenarios,
             Err(_) => return,
         };
         assert_eq!(scenarios[0].kind, InclusionScenarioKind::Earliest);
-        assert_eq!(scenarios[0].fast_block_offset, 1);
-        assert_eq!(scenarios[0].projected_timestamp, 1_900_000_001);
+        assert_eq!(scenarios[0].opportunity_offset, 1);
         assert_eq!(scenarios[1].kind, InclusionScenarioKind::Expected);
-        assert_eq!(scenarios[1].fast_block_offset, 3);
+        assert_eq!(scenarios[1].opportunity_offset, 3);
         assert_eq!(scenarios[2].kind, InclusionScenarioKind::LatestAccepted);
-        assert_eq!(scenarios[2].fast_block_offset, 7);
-        assert!(
-            scenarios
-                .iter()
-                .all(|scenario| scenario.max_fee_per_gas == 100)
-        );
+        assert_eq!(scenarios[2].opportunity_offset, 7);
+        assert!(scenarios.iter().all(
+            |scenario| scenario.max_fee_per_gas == 100 && scenario.canonical_block == canonical
+        ));
 
         assert!(matches!(
             inclusion_assumptions(head(1), 0, 1, 100),
-            Err(PreflightError::HeadChanged)
+            Err(PreflightError::RefreshAndReplan)
         ));
         assert!(matches!(
             inclusion_assumptions(head(1), 3, 2, 100),
-            Err(PreflightError::HeadChanged)
+            Err(PreflightError::RefreshAndReplan)
         ));
-        assert!(matches!(
-            inclusion_assumptions(head(u64::MAX), 1, 1, 100),
-            Err(PreflightError::ClockRange)
-        ));
+        let maximum_timestamp = inclusion_assumptions(head(u64::MAX), 1, 1, 100);
+        assert!(maximum_timestamp.is_ok());
+        assert!(maximum_timestamp.is_ok_and(|scenarios| {
+            scenarios
+                .iter()
+                .all(|scenario| scenario.canonical_block.timestamp == u64::MAX)
+        }));
     }
 
     #[test]
@@ -720,8 +961,35 @@ mod tests {
         };
         assert!(matches!(
             require_head(moved, expected),
-            Err(PreflightError::HeadChanged)
+            Err(PreflightError::RefreshAndReplan)
         ));
+    }
+
+    #[test]
+    fn preflight_identity_is_unique_per_transaction_attempt() {
+        let canonical = head(1_900_000_000);
+        let plan_id = PlanId(B256::repeat_byte(0x11));
+        let calldata_hash = B256::repeat_byte(0x22);
+        let simulation_before_hash = B256::repeat_byte(0x33);
+        let simulation_after_hash = B256::repeat_byte(0x44);
+        let first = final_preflight_id(
+            TransactionId(B256::repeat_byte(0x51)),
+            plan_id,
+            canonical,
+            calldata_hash,
+            simulation_before_hash,
+            simulation_after_hash,
+        );
+        let retry = final_preflight_id(
+            TransactionId(B256::repeat_byte(0x52)),
+            plan_id,
+            canonical,
+            calldata_hash,
+            simulation_before_hash,
+            simulation_after_hash,
+        );
+
+        assert_ne!(first, retry);
     }
 
     #[test]
@@ -742,5 +1010,29 @@ mod tests {
         ));
         drop(first);
         assert!(manager.acquire(vault).is_ok());
+    }
+
+    #[test]
+    fn top_k_economic_gate_uses_exact_asset_units_and_inclusive_boundary() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.hyperevm.json");
+        let config = AppConfig::load(&path).and_then(AppConfig::validate);
+        assert!(config.is_ok());
+        let Ok(config) = config else {
+            return;
+        };
+        let required = required_top_k_gain_assets(
+            1_000_000,
+            1_000_000_000,
+            config.app.vaults[0].asset_decimals,
+            &config.app.strategy.top_k_apy,
+            U256::ZERO,
+        );
+        assert_eq!(required.ok(), Some(U256::from(301_000_u64)));
+        assert!(!config.app.strategy.top_k_apy.enforce_gas_economic_gate);
+        assert!(require_top_k_gain(U256::from(301_000_u64), U256::from(301_000_u64)).is_ok());
+        assert!(matches!(
+            require_top_k_gain(U256::from(300_999_u64), U256::from(301_000_u64)),
+            Err(PreflightError::EconomicGate)
+        ));
     }
 }

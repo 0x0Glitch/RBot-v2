@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "stage": "production",
-  "chain_id": 999,
+  "chain_id": 31337,
   "config_revision": "UNSET",
   "protocol_lock_digest": "UNSET",
   "build_revision": "UNSET",

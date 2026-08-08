@@ -1,8 +1,22 @@
 //! Lexicographic objective ranking.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use alloy::primitives::{I256, U256};
 
-use crate::domain::PlanReason;
+use crate::{
+    config::StrategyObjective,
+    domain::{MarketId, MarketMode, PlanReason, ProjectedMarketState},
+};
+
+/// Whether one configured market belongs to portfolio strategy measurements.
+///
+/// Disabled and synchronization-blocked markets remain visible to exact accounting but are not
+/// optimization targets and therefore cannot define a rate or utilization spread.
+#[must_use]
+pub const fn strategy_market_mode_included(mode: MarketMode) -> bool {
+    !matches!(mode, MarketMode::Disabled | MarketMode::SyncRequired)
+}
 
 /// Exact objective tuple calculated after hard feasibility.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,7 +64,7 @@ pub fn ranks_before(
                 current.action_count,
             )
         }
-        PlanReason::RateRebalance => {
+        PlanReason::RateRebalance | PlanReason::TopKApyRebalance => {
             let candidate_reaches = candidate.applicable_spread <= target_spread;
             let current_reaches = current.applicable_spread <= target_spread;
             if target_reachable && candidate_reaches != current_reaches {
@@ -114,5 +128,46 @@ pub fn rate_spread<'a>(rates: impl Iterator<Item = &'a U256>) -> U256 {
     }
     maximum
         .zip(minimum)
-        .map_or(U256::ZERO, |(maximum, minimum)| maximum - minimum)
+        .and_then(|(maximum, minimum)| maximum.checked_sub(minimum))
+        .unwrap_or(U256::ZERO)
+}
+
+/// Returns max-minus-min only when every named market has an exact projected state.
+#[must_use]
+pub fn complete_rate_spread(
+    markets: &BTreeSet<MarketId>,
+    states: &BTreeMap<MarketId, ProjectedMarketState>,
+) -> Option<U256> {
+    let rates = markets
+        .iter()
+        .map(|market| states.get(market).map(|state| state.spot_borrow_rate))
+        .collect::<Option<Vec<_>>>()?;
+    (!rates.is_empty()).then(|| rate_spread(rates.iter()))
+}
+
+/// Returns one market's exact value in the selected spread-objective domain.
+#[must_use]
+pub const fn strategy_value(state: &ProjectedMarketState, objective: StrategyObjective) -> U256 {
+    match objective {
+        StrategyObjective::SpotBorrowRateSpread => state.spot_borrow_rate,
+        StrategyObjective::UtilizationSpread => state.utilization,
+    }
+}
+
+/// Returns max-minus-min for the selected strategy only when all market states are present.
+#[must_use]
+pub fn complete_strategy_spread(
+    markets: &BTreeSet<MarketId>,
+    states: &BTreeMap<MarketId, ProjectedMarketState>,
+    objective: StrategyObjective,
+) -> Option<U256> {
+    let values = markets
+        .iter()
+        .map(|market| {
+            states
+                .get(market)
+                .map(|state| strategy_value(state, objective))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!values.is_empty()).then(|| rate_spread(values.iter()))
 }

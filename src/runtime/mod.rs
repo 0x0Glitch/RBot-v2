@@ -3,9 +3,12 @@
 pub mod controller;
 pub mod current_state_source;
 pub mod execution_service;
+pub mod failure;
 pub mod identity;
 pub mod idle_ledger_service;
 pub mod messages;
+pub mod planning_coordinator;
+pub mod planning_revision;
 pub mod planning_service;
 pub mod preflight_source;
 pub mod process_guard;

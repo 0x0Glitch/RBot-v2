@@ -131,6 +131,8 @@ pub struct StateContext {
     pub chain_id: u64,
     /// Canonical block.
     pub block: BlockRef,
+    /// Timestamp observed by Solidity inside the authoritative aggregate.
+    pub evm_timestamp: u64,
     /// Strength of the read binding.
     pub block_hash_binding: BlockHashBinding,
     /// Hash of static validated configuration.
@@ -179,7 +181,7 @@ pub fn derive_position_key(adapter: AdapterAddress, params: &MarketParams) -> Po
         lltv: params.lltv,
     }
     .abi_encode();
-    let mut input = Vec::with_capacity(Address::len_bytes() + market_data.len());
+    let mut input = Vec::with_capacity(Address::len_bytes().saturating_add(market_data.len()));
     input.extend_from_slice(adapter.0.as_slice());
     input.extend_from_slice(&market_data);
     PositionKey(alloy::primitives::keccak256(input))
@@ -744,6 +746,9 @@ pub struct ExactVaultSnapshot {
     /// Direct adapters.
     #[serde(with = "crate::serde_helpers::btree_map")]
     pub adapters: BTreeMap<AdapterAddress, DirectAdapterState>,
+    /// Exact current parent adapter set read from the vault array and `isAdapter` getters.
+    #[serde(default)]
+    pub enabled_adapters: BTreeSet<AdapterAddress>,
     /// Supported liquidity-only adapter, when configured.
     pub liquidity_adapter: Option<VaultV1LiquidityAdapterState>,
     /// Direct positions.
@@ -834,6 +839,8 @@ pub enum PlanReason {
     CapitalDeployment,
     /// Equalize configured direct-market spot borrow rates.
     RateRebalance,
+    /// Move direct assets toward the confirmed conservative top-K APY target.
+    TopKApyRebalance,
     /// Report a required reviewed zero-asset synchronization.
     PositionSyncRequired,
 }
@@ -866,7 +873,7 @@ pub enum V2Action {
     },
 }
 
-/// Applicable rate-spread objective branch.
+/// Applicable spread-objective branch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -890,7 +897,7 @@ pub struct SolverCertificate {
     pub search_complete_for_lattice: bool,
     /// Frozen rate episode, when applicable.
     pub rate_episode_id: Option<B256>,
-    /// Rate objective branch, when applicable.
+    /// Spread objective branch, when applicable.
     pub objective_branch: Option<RateObjectiveBranch>,
     /// Whether any candidate could reach the target band.
     pub target_reachable: bool,
@@ -903,14 +910,17 @@ pub struct SolverCertificate {
 pub struct PlanProjection {
     /// Total requested movement in vault-asset units.
     pub movement_assets: U256,
-    /// Pre-action applicable rate spread in per-second WAD units.
+    /// Pre-action spread in the selected objective's native WAD domain.
     pub before_spread: U256,
-    /// Post-action applicable rate spread in per-second WAD units.
+    /// Post-action spread in the selected objective's native WAD domain.
     pub after_spread: U256,
     /// Immediate action-local loss in vault-asset units.
     pub immediate_loss_assets: U256,
     /// Terminal existing-shareholder value delta in vault-asset units.
     pub terminal_value_delta_assets: I256,
+    /// Positive recoverable-vault-asset gain used by the final economic execution gate.
+    #[serde(default)]
+    pub expected_gain_assets: U256,
 }
 
 /// Unvalidated semantic plan. Transaction code accepts only a later validated wrapper.
@@ -928,6 +938,15 @@ pub struct V2Plan {
     pub config_revision: B256,
     /// Dynamic topology revision.
     pub topology_revision: B256,
+    /// Monotonic revision of the exact contracts and markets queried for this plan.
+    #[serde(default)]
+    pub read_set_revision: u64,
+    /// Highest relevant event block included by the planning snapshot.
+    #[serde(default)]
+    pub latest_relevant_event_block: u64,
+    /// Per-vault latest-wins planner generation.
+    #[serde(default)]
+    pub planner_generation: u64,
     /// Ordered deallocation-first actions.
     pub actions: Vec<V2Action>,
     /// Exact projected effects.

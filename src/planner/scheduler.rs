@@ -59,7 +59,7 @@ fn priority(reason: PlanReason) -> u8 {
     match reason {
         PlanReason::LiquidityMaintenance => 0,
         PlanReason::CapitalDeployment => 1,
-        PlanReason::RateRebalance => 2,
+        PlanReason::RateRebalance | PlanReason::TopKApyRebalance => 2,
         PlanReason::PositionSyncRequired => 3,
     }
 }

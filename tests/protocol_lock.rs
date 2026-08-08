@@ -1,4 +1,5 @@
 //! Protocol source and runtime identity lock validation tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::collections::BTreeMap;
@@ -6,8 +7,8 @@ use std::collections::BTreeMap;
 use alloy::primitives::Bytes;
 use morpho_v2_reallocator::contracts::code_identity::{CodeIdentityError, verify_runtime_code};
 use morpho_v2_reallocator::protocol_lock::{
-    ContractIdentity, IdentityKind, ProtocolLock, ProtocolLockError, ProxyPolicy,
-    RemoteSignerIdentity,
+    ContractIdentity, IdentityKind, ProtocolLock, ProtocolLockError, ProxyImplementationIdentity,
+    ProxyPolicy, RemoteSignerIdentity,
 };
 
 const VAULT_COMMIT: &str = "b1e9005c5d7a1c99eaa909dde02a365886faac07";
@@ -26,6 +27,7 @@ fn identity(index: u8, name: &str, kind: IdentityKind) -> ContractIdentity {
         optimizer_runs: 200,
         constructor_immutables: BTreeMap::new(),
         proxy_policy: ProxyPolicy::RejectProxy,
+        proxy_implementation: None,
         behavior_profile: "test-profile".to_owned(),
     }
 }
@@ -143,4 +145,32 @@ fn runtime_bytecode_must_match_the_locked_hash() {
         verify_runtime_code(identity, &Bytes::from_static(&[0x60, 0x01])),
         Err(CodeIdentityError::HashMismatch { .. })
     ));
+}
+
+#[test]
+fn pinned_proxy_requires_complete_distinct_implementation_identity() {
+    let mut missing = valid_lock();
+    missing.contract[5].proxy_policy = ProxyPolicy::PinnedProxy;
+    let error = match missing.validate() {
+        Ok(_) => panic!("proxy without implementation identity must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(validation_field(error), "contract.proxy_implementation");
+
+    let mut complete = valid_lock();
+    complete.contract[5].proxy_policy = ProxyPolicy::PinnedProxy;
+    complete.contract[5].proxy_implementation = Some(ProxyImplementationIdentity {
+        storage_slot: format!("0x{:064x}", 9),
+        address: format!("0x{:040x}", 10),
+        runtime_code_hash: format!("0x{:064x}", 11),
+    });
+    let validated = match complete.validate() {
+        Ok(lock) => lock,
+        Err(error) => panic!("complete proxy identity rejected: {error}"),
+    };
+    assert!(validated.contracts.iter().any(|identity| {
+        identity.name == "asset"
+            && identity.proxy_policy == ProxyPolicy::PinnedProxy
+            && identity.proxy_implementation.is_some()
+    }));
 }

@@ -1,11 +1,16 @@
 //! Single-writer atomic JSON storage actor with bounded commands and acknowledgments.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     thread::{self, JoinHandle},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
@@ -15,7 +20,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     domain::{BlockRef, EpisodeId, ExactVaultSnapshot, RateGroupId, V2Plan, VaultAddress},
-    planner::episodes::{RateEpisodeState, RateSignalEpisode},
+    planner::{
+        episodes::{RateEpisodeState, RateEpisodeStopReason, RateSignalEpisode},
+        top_k_apy::TopKApyMemory,
+    },
     state::topology::TopologyIndex,
 };
 
@@ -23,21 +31,32 @@ use super::{
     StorageError,
     models::{
         CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
-        FinalPreflightRecord, NonceReservation, PendingConformance, PendingReconciliationContext,
-        PersistedTopology, RateMovementReservationRecord, RateMovementReservationState,
-        ReconciliationRecord, RewindResult, SignedAttemptRecord, SignedTransactionRecord,
-        TransactionAttemptKind, TransactionState, TransactionTransition, UnresolvedTransaction,
+        DurableTransactionSummary, FinalPreflightRecord, NonceReservation, PendingConformance,
+        PendingReconciliationContext, PersistedTopology, RateMovementReservationRecord,
+        RateMovementReservationState, ReconciliationRecord, RewindResult, SignedAttemptRecord,
+        SignedTransactionRecord, TransactionAttemptKind, TransactionState, TransactionTransition,
+        UnresolvedTransaction,
     },
 };
 
 /// Default bounded storage mailbox capacity.
 pub const DEFAULT_STORAGE_CHANNEL_CAPACITY: usize = 128;
-const JSON_FORMAT_VERSION: u32 = 2;
+const STORAGE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const JSON_FORMAT_VERSION: u32 = 4;
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const JOURNAL_SEGMENT_EVENTS: u64 = 128;
-const HOT_BLOCK_RETENTION: u64 = 4_096;
-const HOT_SNAPSHOT_RETENTION: usize = 256;
-const HOT_PLAN_RETENTION: usize = 256;
+const HOT_BLOCK_RETENTION: u64 = 512;
+const HOT_SNAPSHOT_RETENTION: usize = 32;
+const HOT_PLAN_RETENTION: usize = 32;
+const HOT_TOPOLOGY_RETENTION: usize = 256;
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +103,13 @@ struct TimedEpisode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct TimedTopKApyMemory {
+    vault: VaultAddress,
+    memory: TopKApyMemory,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TransactionRow {
     reservation: NonceReservation,
     state: TransactionState,
@@ -119,6 +145,8 @@ struct JsonState {
     reconciliation_records: Vec<ReconciliationRecord>,
     topology_history: Vec<TopologyRevision>,
     rate_episodes: Vec<TimedEpisode>,
+    #[serde(default)]
+    top_k_apy_memory: Vec<TimedTopKApyMemory>,
 }
 
 impl Default for JsonState {
@@ -140,6 +168,7 @@ impl Default for JsonState {
             reconciliation_records: Vec::new(),
             topology_history: Vec::new(),
             rate_episodes: Vec::new(),
+            top_k_apy_memory: Vec::new(),
         }
     }
 }
@@ -155,8 +184,9 @@ struct JsonStore {
 }
 
 impl JsonStore {
-    fn open(path: PathBuf) -> Result<Self, StorageError> {
+    fn open(path: PathBuf, initialization_timestamp: u64) -> Result<Self, StorageError> {
         let mut migrated = false;
+        let mut movement_migration = false;
         let checkpoint_exists = path.exists();
         let mut state = if checkpoint_exists {
             let bytes = std::fs::read(&path)?;
@@ -165,6 +195,12 @@ impl JsonStore {
                 JSON_FORMAT_VERSION => {}
                 1 => {
                     migrate_v1_to_v2(&mut state)?;
+                    migrated = true;
+                    movement_migration = true;
+                }
+                2 => movement_migration = true,
+                3 => {
+                    state.format_version = JSON_FORMAT_VERSION;
                     migrated = true;
                 }
                 actual => {
@@ -206,6 +242,10 @@ impl JsonStore {
             checkpoint_revision,
             checkpoint_head_hash,
         )?;
+        if movement_migration {
+            migrate_v2_to_v3(&mut state, initialization_timestamp)?;
+            migrated = true;
+        }
         if manifest.as_ref().is_some_and(|manifest| {
             manifest.journal_revision > state.revision
                 || manifest.journal_revision == state.revision
@@ -443,7 +483,9 @@ fn read_journal_segment(path: &Path) -> Result<Vec<JournalRecord>, StorageError>
             file.sync_all()?;
             break;
         }
-        let payload = &chunk[..chunk.len().saturating_sub(1)];
+        let payload = chunk.strip_suffix(b"\n").ok_or(StorageError::Invariant(
+            "complete journal line has no newline",
+        ))?;
         if !payload.is_empty() {
             records.push(serde_json::from_slice(payload)?);
         }
@@ -516,6 +558,47 @@ fn compact_hot_state(state: &mut JsonState) {
         .filter(|entry| referenced_plan_ids.contains(&entry.plan.plan_id))
         .map(|entry| entry.plan.clone())
         .collect::<Vec<_>>();
+    if state.topology_history.len() > HOT_TOPOLOGY_RETENTION {
+        let excess = state
+            .topology_history
+            .len()
+            .saturating_sub(HOT_TOPOLOGY_RETENTION);
+        state.topology_history.drain(..excess);
+    }
+    let topology_replay_from = state
+        .topology_history
+        .first()
+        .map(|revision| revision.block.number);
+    let episode_replay_from = state
+        .rate_episodes
+        .iter()
+        .filter(|entry| entry.episode.state != RateEpisodeState::Complete)
+        .map(|entry| entry.episode.detection_block.number)
+        .min();
+    if let Some(replay_from) = topology_replay_from
+        .into_iter()
+        .chain(episode_replay_from)
+        .min()
+    {
+        state
+            .canonical_logs
+            .retain(|log| log.block_number >= replay_from);
+        let lifecycle_hashes = state
+            .transactions
+            .iter()
+            .filter_map(|transaction| transaction.transaction_hash)
+            .chain(
+                state
+                    .transaction_attempts
+                    .iter()
+                    .map(|attempt| attempt.transaction_hash),
+            )
+            .collect::<BTreeSet<_>>();
+        state.canonical_receipts.retain(|receipt| {
+            receipt.block_number >= replay_from
+                || lifecycle_hashes.contains(&receipt.transaction_hash)
+        });
+    }
     let mut pinned_blocks = state
         .transactions
         .iter()
@@ -542,6 +625,31 @@ fn compact_hot_state(state: &mut JsonState) {
             .canonical_receipts
             .iter()
             .map(|receipt| receipt.block_number),
+    );
+    // A topology checkpoint is independently replayable only while its canonical block identity
+    // remains checkable. Pin the small retained checkpoint window alongside lifecycle evidence.
+    pinned_blocks.extend(
+        state
+            .topology_history
+            .iter()
+            .map(|revision| revision.block.number),
+    );
+    pinned_blocks.extend(
+        state
+            .rate_episodes
+            .iter()
+            .filter(|entry| entry.episode.state != RateEpisodeState::Complete)
+            .flat_map(|entry| {
+                std::iter::once(entry.episode.detection_block.number)
+                    .chain(entry.episode.confirmation_block.map(|block| block.number))
+                    .chain(
+                        entry
+                            .episode
+                            .independent_events
+                            .iter()
+                            .map(|event| event.block.number),
+                    )
+            }),
     );
     if let Some(latest) = state
         .canonical_blocks
@@ -589,11 +697,6 @@ fn compact_hot_state(state: &mut JsonState) {
             .map(|(_, plan)| plan)
             .collect();
     }
-    if state.topology_history.len() > HOT_SNAPSHOT_RETENTION {
-        state
-            .topology_history
-            .drain(..state.topology_history.len() - HOT_SNAPSHOT_RETENTION);
-    }
 }
 
 fn migrate_v1_to_v2(state: &mut JsonState) -> Result<(), StorageError> {
@@ -626,8 +729,77 @@ fn migrate_v1_to_v2(state: &mut JsonState) -> Result<(), StorageError> {
             .find(|row| row.reservation.transaction_id == attempt.transaction_id)
             .map_or(0, |row| row.reservation.created_block);
     }
+    state.format_version = 2;
+    Ok(())
+}
+
+fn migrate_v2_to_v3(
+    state: &mut JsonState,
+    initialization_timestamp: u64,
+) -> Result<(), StorageError> {
+    let rolling_window_start = initialization_timestamp.saturating_sub(86_400);
+    for index in 0..state.transactions.len() {
+        let transaction = state
+            .transactions
+            .get(index)
+            .ok_or(StorageError::Invariant(
+                "transaction disappeared during format migration",
+            ))?;
+        if !transaction.reservation.movement_assets.is_zero() {
+            continue;
+        }
+        let transaction_id = transaction.reservation.transaction_id;
+        let plan_id = transaction.reservation.plan_id;
+        let transaction_state = transaction.state;
+        let created_at = transaction.reservation.created_at;
+        let movement = plan_id
+            .and_then(|plan_id| {
+                state
+                    .plans
+                    .iter()
+                    .find(|entry| entry.plan.plan_id == plan_id)
+                    .map(|entry| entry.plan.projection.movement_assets)
+            })
+            .or_else(|| {
+                state
+                    .rate_movement_reservations
+                    .iter()
+                    .find(|record| record.transaction_id == transaction_id)
+                    .map(|record| record.movement_assets)
+            })
+            .or_else(|| {
+                state
+                    .conformance_records
+                    .iter()
+                    .find(|record| record.transaction_id == transaction_id)
+                    .map(|record| record.movement_assets)
+            });
+        if let Some(movement) = movement {
+            let transaction = state
+                .transactions
+                .get_mut(index)
+                .ok_or(StorageError::Invariant(
+                    "transaction disappeared during format migration",
+                ))?;
+            transaction.reservation.movement_assets = movement;
+        } else if consumes_rolling_budget(transaction_state) && created_at >= rolling_window_start {
+            return Err(StorageError::Invariant(
+                "recent transaction lacks movement evidence required for format migration",
+            ));
+        }
+    }
     state.format_version = JSON_FORMAT_VERSION;
     Ok(())
+}
+
+const fn consumes_rolling_budget(state: TransactionState) -> bool {
+    !matches!(
+        state,
+        TransactionState::NonceReserved
+            | TransactionState::AbortedBeforeSigning
+            | TransactionState::Cancelled
+            | TransactionState::Reverted
+    )
 }
 
 /// Single-writer actor command. Every critical mutation has an acknowledgment.
@@ -781,12 +953,26 @@ pub enum StorageCommand {
         /// Snapshot result.
         reply: oneshot::Sender<Result<Option<ExactVaultSnapshot>, StorageError>>,
     },
+    /// Load the newest exact snapshot for a vault at or after a minimum block.
+    LoadLatestExactSnapshot {
+        /// Parent vault.
+        vault: VaultAddress,
+        /// Oldest acceptable block number.
+        minimum_block: u64,
+        /// Snapshot result.
+        reply: oneshot::Sender<Result<Option<ExactVaultSnapshot>, StorageError>>,
+    },
     /// Load the unique unresolved signer row.
     LoadUnresolved {
         /// Dedicated signer.
         signer: Address,
         /// Recovery result.
         reply: oneshot::Sender<Result<Option<UnresolvedTransaction>, StorageError>>,
+    },
+    /// Load every signed semantic transaction as a secret-free durable summary.
+    LoadTransactionSummaries {
+        /// Durable summaries in deterministic transaction-hash order.
+        reply: oneshot::Sender<Result<Vec<DurableTransactionSummary>, StorageError>>,
     },
     /// Load a chain cursor.
     LoadCursor {
@@ -812,10 +998,28 @@ pub enum StorageCommand {
         from_exclusive: u64,
         /// Included ending block.
         to_inclusive: u64,
-        /// Required gas limit for HyperEVM fast blocks; `None` counts every block.
+        /// Optional required gas limit; `None` counts every canonical block.
         required_gas_limit: Option<u64>,
         /// Exact count.
         reply: oneshot::Sender<Result<u64, StorageError>>,
+    },
+    /// Count semantic signer transactions durably opened in a rolling time window.
+    CountTransactionsSince {
+        /// Shared restricted allocator signer.
+        signer: Address,
+        /// Inclusive nonce-reservation timestamp lower bound.
+        since_timestamp: u64,
+        /// Exact count.
+        reply: oneshot::Sender<Result<u64, StorageError>>,
+    },
+    /// Sum canonical semantic plan movement opened in a rolling time window.
+    MovementSince {
+        /// Vault whose asset-domain movement is counted.
+        vault: VaultAddress,
+        /// Inclusive nonce-reservation timestamp lower bound.
+        since_timestamp: u64,
+        /// Exact asset-domain sum.
+        reply: oneshot::Sender<Result<U256, StorageError>>,
     },
     /// Sum conservative confirmed gas cost over a rolling timestamp window.
     ConfirmedGasSpendSince {
@@ -914,6 +1118,24 @@ pub enum StorageCommand {
         /// Episode result.
         reply: oneshot::Sender<Result<Option<RateSignalEpisode>, StorageError>>,
     },
+    /// Persist one vault's top-K APY memory after an exact canonical observation.
+    PersistTopKApyMemory {
+        /// Parent vault.
+        vault: VaultAddress,
+        /// Complete strategy-owned durable memory.
+        memory: Box<TopKApyMemory>,
+        /// Canonical update timestamp.
+        updated_at: u64,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    /// Load one vault's latest top-K APY memory.
+    LoadTopKApyMemory {
+        /// Parent vault.
+        vault: VaultAddress,
+        /// Durable memory result.
+        reply: oneshot::Sender<Result<Option<TopKApyMemory>, StorageError>>,
+    },
     /// Produce an atomic JSON backup.
     Backup {
         /// Destination.
@@ -930,13 +1152,56 @@ pub enum StorageCommand {
     },
 }
 
+struct StorageEnvelope {
+    command: StorageCommand,
+}
+
+#[derive(Default)]
+struct StorageQueueStatsInner {
+    depth: AtomicUsize,
+    high_water: AtomicUsize,
+    oldest_enqueued_epoch_millis: AtomicU64,
+}
+
+/// Bounded storage-mailbox telemetry snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageQueueStats {
+    /// Commands waiting for the storage owner.
+    pub depth: usize,
+    /// Highest observed waiting-command count since process start.
+    pub high_water: usize,
+    /// Conservative age of the oldest queued command.
+    pub oldest_age_millis: u64,
+}
+
 /// Cloneable bounded command handle; it never exposes mutable state.
 #[derive(Clone)]
 pub struct StorageHandle {
-    sender: mpsc::Sender<StorageCommand>,
+    sender: mpsc::Sender<StorageEnvelope>,
+    stats: Arc<StorageQueueStatsInner>,
 }
 
 impl StorageHandle {
+    /// Returns lock-free bounded-mailbox telemetry.
+    #[must_use]
+    pub fn queue_stats(&self) -> StorageQueueStats {
+        let depth = self.stats.depth.load(Ordering::Acquire);
+        let oldest = self
+            .stats
+            .oldest_enqueued_epoch_millis
+            .load(Ordering::Acquire);
+        let oldest_age_millis = if depth == 0 || oldest == 0 {
+            0
+        } else {
+            epoch_millis().saturating_sub(oldest)
+        };
+        StorageQueueStats {
+            depth,
+            high_water: self.stats.high_water.load(Ordering::Acquire),
+            oldest_age_millis,
+        }
+    }
+
     /// Applies one canonical block after an atomic JSON commit.
     pub async fn apply_canonical_block(
         &self,
@@ -1100,6 +1365,14 @@ impl StorageHandle {
             .await
     }
 
+    /// Loads every durably signed semantic transaction for the read-only operator API.
+    pub async fn load_transaction_summaries(
+        &self,
+    ) -> Result<Vec<DurableTransactionSummary>, StorageError> {
+        self.request(|reply| StorageCommand::LoadTransactionSummaries { reply })
+            .await
+    }
+
     /// Loads a chain cursor.
     pub async fn load_cursor(&self, chain_id: u64) -> Result<Option<BlockRef>, StorageError> {
         self.request(|reply| StorageCommand::LoadCursor { chain_id, reply })
@@ -1120,7 +1393,7 @@ impl StorageHandle {
         .await
     }
 
-    /// Counts canonical fast-lane opportunities, or every block on non-HyperEVM chains.
+    /// Counts canonical opportunities under the configured block policy.
     pub async fn count_execution_opportunities(
         &self,
         chain_id: u64,
@@ -1133,6 +1406,34 @@ impl StorageHandle {
             from_exclusive,
             to_inclusive,
             required_gas_limit,
+            reply,
+        })
+        .await
+    }
+
+    /// Counts semantic transactions opened by one signer since an inclusive timestamp.
+    pub async fn count_transactions_since(
+        &self,
+        signer: Address,
+        since_timestamp: u64,
+    ) -> Result<u64, StorageError> {
+        self.request(|reply| StorageCommand::CountTransactionsSince {
+            signer,
+            since_timestamp,
+            reply,
+        })
+        .await
+    }
+
+    /// Sums durable semantic movement opened by one signer since an inclusive timestamp.
+    pub async fn movement_since(
+        &self,
+        vault: VaultAddress,
+        since_timestamp: u64,
+    ) -> Result<U256, StorageError> {
+        self.request(|reply| StorageCommand::MovementSince {
+            vault,
+            since_timestamp,
             reply,
         })
         .await
@@ -1207,6 +1508,20 @@ impl StorageHandle {
         self.request(|reply| StorageCommand::LoadExactSnapshot {
             vault,
             block,
+            reply,
+        })
+        .await
+    }
+
+    /// Loads the newest durable exact snapshot at or after `minimum_block`.
+    pub async fn load_latest_exact_snapshot(
+        &self,
+        vault: VaultAddress,
+        minimum_block: u64,
+    ) -> Result<Option<ExactVaultSnapshot>, StorageError> {
+        self.request(|reply| StorageCommand::LoadLatestExactSnapshot {
+            vault,
+            minimum_block,
             reply,
         })
         .await
@@ -1353,6 +1668,31 @@ impl StorageHandle {
         .await
     }
 
+    /// Persists one complete top-K APY memory observation.
+    pub async fn persist_top_k_apy_memory(
+        &self,
+        vault: VaultAddress,
+        memory: TopKApyMemory,
+        updated_at: u64,
+    ) -> Result<(), StorageError> {
+        self.request(|reply| StorageCommand::PersistTopKApyMemory {
+            vault,
+            memory: Box::new(memory),
+            updated_at,
+            reply,
+        })
+        .await
+    }
+
+    /// Loads one vault's durable top-K APY memory.
+    pub async fn load_top_k_apy_memory(
+        &self,
+        vault: VaultAddress,
+    ) -> Result<Option<TopKApyMemory>, StorageError> {
+        self.request(|reply| StorageCommand::LoadTopKApyMemory { vault, reply })
+            .await
+    }
+
     /// Produces an atomic JSON backup.
     pub async fn backup(
         &self,
@@ -1372,18 +1712,32 @@ impl StorageHandle {
         command: impl FnOnce(oneshot::Sender<Result<T, StorageError>>) -> StorageCommand,
     ) -> Result<T, StorageError> {
         let (reply, receive) = oneshot::channel();
-        self.sender
-            .send(command(reply))
+        self.enqueue(command(reply)).await?;
+        tokio::time::timeout(STORAGE_COMMAND_TIMEOUT, receive)
             .await
-            .map_err(|_| StorageError::ActorStopped)?;
-        receive.await.map_err(|_| StorageError::ActorStopped)?
+            .map_err(|_| StorageError::CommandTimeout)?
+            .map_err(|_| StorageError::ActorStopped)?
     }
 
     async fn send(&self, command: StorageCommand) -> Result<(), StorageError> {
-        self.sender
-            .send(command)
+        self.enqueue(command).await
+    }
+
+    async fn enqueue(&self, command: StorageCommand) -> Result<(), StorageError> {
+        let permit = tokio::time::timeout(STORAGE_COMMAND_TIMEOUT, self.sender.reserve())
             .await
-            .map_err(|_| StorageError::ActorStopped)
+            .map_err(|_| StorageError::CommandTimeout)?
+            .map_err(|_| StorageError::ActorStopped)?;
+        let previous = self.stats.depth.fetch_add(1, Ordering::AcqRel);
+        let depth = previous.saturating_add(1);
+        self.stats.high_water.fetch_max(depth, Ordering::AcqRel);
+        if previous == 0 {
+            self.stats
+                .oldest_enqueued_epoch_millis
+                .store(epoch_millis(), Ordering::Release);
+        }
+        permit.send(StorageEnvelope { command });
+        Ok(())
     }
 }
 
@@ -1398,7 +1752,7 @@ impl StorageService {
     pub fn start(
         state_path: &Path,
         channel_capacity: usize,
-        _initialization_timestamp: u64,
+        initialization_timestamp: u64,
     ) -> Result<Self, StorageError> {
         if channel_capacity == 0 {
             return Err(StorageError::Invariant(
@@ -1416,13 +1770,15 @@ impl StorageService {
             .truncate(false)
             .open(lock_path)?;
         FileExt::try_lock_exclusive(&lock_file).map_err(|_| StorageError::DatabaseLocked)?;
-        let store = JsonStore::open(state_path.to_owned())?;
+        let store = JsonStore::open(state_path.to_owned(), initialization_timestamp)?;
         let (sender, receiver) = mpsc::channel(channel_capacity);
+        let stats = Arc::new(StorageQueueStatsInner::default());
+        let actor_stats = Arc::clone(&stats);
         let join = thread::Builder::new()
-            .name("morpho-v2-json-storage".to_owned())
-            .spawn(move || run_actor(store, lock_file, receiver))?;
+            .name("storage".to_owned())
+            .spawn(move || run_actor(store, lock_file, receiver, actor_stats))?;
         Ok(Self {
-            handle: StorageHandle { sender },
+            handle: StorageHandle { sender, stats },
             join: Some(join),
         })
     }
@@ -1437,15 +1793,30 @@ impl StorageService {
     pub async fn shutdown(mut self) -> Result<(), StorageError> {
         let (reply, receive) = oneshot::channel();
         self.handle.send(StorageCommand::Shutdown { reply }).await?;
-        receive.await.map_err(|_| StorageError::ActorStopped)??;
+        tokio::time::timeout(STORAGE_COMMAND_TIMEOUT, receive)
+            .await
+            .map_err(|_| StorageError::CommandTimeout)?
+            .map_err(|_| StorageError::ActorStopped)??;
         let join = self.join.take().ok_or(StorageError::ActorStopped)?;
         join.join().map_err(|_| StorageError::ActorPanicked)?;
         Ok(())
     }
 }
 
-fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receiver<StorageCommand>) {
-    while let Some(command) = receiver.blocking_recv() {
+fn run_actor(
+    mut store: JsonStore,
+    _lock_file: File,
+    mut receiver: mpsc::Receiver<StorageEnvelope>,
+    stats: Arc<StorageQueueStatsInner>,
+) {
+    while let Some(envelope) = receiver.blocking_recv() {
+        let remaining = stats.depth.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        if remaining == 0 {
+            stats
+                .oldest_enqueued_epoch_millis
+                .store(0, Ordering::Release);
+        }
+        let command = envelope.command;
         match command {
             StorageCommand::ApplyCanonicalBlock {
                 block,
@@ -1464,7 +1835,7 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
             } => {
                 let mut result = RewindResult::default();
                 let outcome = store.commit(|state| {
-                    result = rewind(state, chain_id, ancestor);
+                    result = rewind(state, chain_id, ancestor)?;
                     Ok(())
                 });
                 let _ = reply.send(outcome.map(|()| result));
@@ -1507,12 +1878,16 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                     {
                         return Err(StorageError::Invariant("preflight references unknown plan"));
                     }
-                    if state
+                    if let Some(existing) = state
                         .final_preflights
                         .iter()
-                        .any(|entry| entry.preflight_id == record.preflight_id)
+                        .find(|entry| entry.preflight_id == record.preflight_id)
                     {
-                        return Err(StorageError::Invariant("duplicate preflight identity"));
+                        return if existing == &record {
+                            Ok(())
+                        } else {
+                            Err(StorageError::Invariant("conflicting preflight identity"))
+                        };
                     }
                     state.final_preflights.push(record);
                     Ok(())
@@ -1625,8 +2000,61 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                     .map(|entry| entry.snapshot.clone());
                 let _ = reply.send(Ok(snapshot));
             }
+            StorageCommand::LoadLatestExactSnapshot {
+                vault,
+                minimum_block,
+                reply,
+            } => {
+                let latest_number = store
+                    .state
+                    .exact_snapshots
+                    .iter()
+                    .filter(|entry| {
+                        entry.snapshot.parent.vault == vault.0
+                            && entry.snapshot.context.block.number >= minimum_block
+                    })
+                    .map(|entry| entry.snapshot.context.block.number)
+                    .max();
+                let snapshot = latest_number.and_then(|number| {
+                    let matching = store
+                        .state
+                        .exact_snapshots
+                        .iter()
+                        .rev()
+                        .filter(|entry| {
+                            entry.snapshot.parent.vault == vault.0
+                                && entry.snapshot.context.block.number == number
+                        })
+                        .collect::<Vec<_>>();
+                    matching
+                        .iter()
+                        .find(|entry| entry.snapshot.idle_locks.verified)
+                        .or_else(|| matching.first())
+                        .map(|entry| entry.snapshot.clone())
+                });
+                let _ = reply.send(Ok(snapshot));
+            }
             StorageCommand::LoadUnresolved { signer, reply } => {
                 let _ = reply.send(load_unresolved(&store.state, signer));
+            }
+            StorageCommand::LoadTransactionSummaries { reply } => {
+                let mut summaries = store
+                    .state
+                    .transactions
+                    .iter()
+                    .filter_map(|transaction| {
+                        transaction.transaction_hash.map(|transaction_hash| {
+                            DurableTransactionSummary {
+                                vault: transaction.reservation.vault,
+                                transaction_hash,
+                                state: transaction.state,
+                                included_block: transaction.included_block,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                summaries.sort_by_key(|summary| summary.transaction_hash);
+                let _ = reply.send(Ok(summaries));
             }
             StorageCommand::LoadCursor { chain_id, reply } => {
                 let _ = reply.send(Ok(store.state.chain_cursors.get(&chain_id).copied()));
@@ -1672,6 +2100,46 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                         StorageError::Invariant("execution opportunity count exceeds u64")
                     })
                 };
+                let _ = reply.send(result);
+            }
+            StorageCommand::CountTransactionsSince {
+                signer,
+                since_timestamp,
+                reply,
+            } => {
+                let count = store
+                    .state
+                    .transactions
+                    .iter()
+                    .filter(|transaction| {
+                        transaction.reservation.signer == signer
+                            && transaction.reservation.created_at >= since_timestamp
+                            && consumes_rolling_budget(transaction.state)
+                    })
+                    .count();
+                let result = u64::try_from(count)
+                    .map_err(|_| StorageError::Invariant("transaction count exceeds u64"));
+                let _ = reply.send(result);
+            }
+            StorageCommand::MovementSince {
+                vault,
+                since_timestamp,
+                reply,
+            } => {
+                let result = store
+                    .state
+                    .transactions
+                    .iter()
+                    .filter(|transaction| {
+                        transaction.reservation.vault == vault
+                            && transaction.reservation.created_at >= since_timestamp
+                            && consumes_rolling_budget(transaction.state)
+                    })
+                    .try_fold(U256::ZERO, |total, transaction| {
+                        total
+                            .checked_add(transaction.reservation.movement_assets)
+                            .ok_or(StorageError::Invariant("rolling movement sum overflow"))
+                    });
                 let _ = reply.send(result);
             }
             StorageCommand::ConfirmedGasSpendSince {
@@ -1855,6 +2323,37 @@ fn run_actor(mut store: JsonStore, _lock_file: File, mut receiver: mpsc::Receive
                 };
                 let _ = reply.send(result);
             }
+            StorageCommand::PersistTopKApyMemory {
+                vault,
+                memory,
+                updated_at,
+                reply,
+            } => {
+                let _ = reply.send(store.commit(|state| {
+                    if memory.last_observed_timestamp > updated_at {
+                        return Err(StorageError::Invariant(
+                            "top-K memory timestamp exceeds durable update timestamp",
+                        ));
+                    }
+                    state.top_k_apy_memory.retain(|entry| entry.vault != vault);
+                    state.top_k_apy_memory.push(TimedTopKApyMemory {
+                        vault,
+                        memory: *memory,
+                        updated_at,
+                    });
+                    state.top_k_apy_memory.sort_by_key(|entry| entry.vault);
+                    Ok(())
+                }));
+            }
+            StorageCommand::LoadTopKApyMemory { vault, reply } => {
+                let memory = store
+                    .state
+                    .top_k_apy_memory
+                    .iter()
+                    .find(|entry| entry.vault == vault)
+                    .map(|entry| entry.memory.clone());
+                let _ = reply.send(Ok(memory));
+            }
             StorageCommand::Backup {
                 destination,
                 unique_suffix,
@@ -1901,10 +2400,11 @@ fn apply_block(
             "canonical receipt does not belong to block",
         ));
     }
-    if receipts
-        .windows(2)
-        .any(|pair| pair[0].transaction_index >= pair[1].transaction_index)
-    {
+    if receipts.windows(2).any(|pair| {
+        pair.first()
+            .zip(pair.get(1))
+            .is_some_and(|(first, second)| first.transaction_index >= second.transaction_index)
+    }) {
         return Err(StorageError::Invariant(
             "canonical receipts are not strictly ordered",
         ));
@@ -1942,10 +2442,11 @@ fn persist_canonical_receipt(
                 || log.transaction_hash != receipt.transaction_hash
                 || log.transaction_index != receipt.transaction_index
         })
-        || receipt
-            .logs
-            .windows(2)
-            .any(|pair| pair[0].log_index >= pair[1].log_index)
+        || receipt.logs.windows(2).any(|pair| {
+            pair.first()
+                .zip(pair.get(1))
+                .is_some_and(|(first, second)| first.log_index >= second.log_index)
+        })
     {
         return Err(StorageError::Invariant(
             "direct receipt is not bound to a canonical block",
@@ -2016,11 +2517,11 @@ fn confirmed_gas_spend_since(
                 .transactions
                 .iter()
                 .find(|transaction| {
-                    transaction.reservation.transaction_id == attempts[0].transaction_id
+                    transaction.reservation.transaction_id == attempt.transaction_id
                         && transaction.included_block == Some(receipt.block_number)
                         && transaction.included_block_hash == Some(receipt.block_hash)
                 })
-                .map_or(attempts[0].signed_at, |transaction| transaction.updated_at)
+                .map_or(attempt.signed_at, |transaction| transaction.updated_at)
         };
         if accounting_timestamp < since_timestamp {
             continue;
@@ -2035,7 +2536,11 @@ fn confirmed_gas_spend_since(
     Ok(spend)
 }
 
-fn rewind(state: &mut JsonState, chain_id: u64, ancestor: BlockRef) -> RewindResult {
+fn rewind(
+    state: &mut JsonState,
+    chain_id: u64,
+    ancestor: BlockRef,
+) -> Result<RewindResult, StorageError> {
     let old_blocks = state.canonical_blocks.len();
     let old_logs = state.canonical_logs.len();
     state
@@ -2060,13 +2565,79 @@ fn rewind(state: &mut JsonState, chain_id: u64, ancestor: BlockRef) -> RewindRes
         entry.snapshot.context.chain_id != chain_id
             || entry.snapshot.context.block.number <= ancestor.number
     });
-    state.rate_episodes.retain(|entry| {
-        entry.episode.detection_block.number <= ancestor.number
-            && entry
+    let orphaned_transaction_ids = state
+        .transactions
+        .iter()
+        .filter(|transaction| {
+            transaction
+                .included_block
+                .is_some_and(|number| number > ancestor.number)
+                && matches!(
+                    transaction.state,
+                    TransactionState::Included
+                        | TransactionState::Confirmed
+                        | TransactionState::ConformanceValidated
+                        | TransactionState::Reconciled
+                )
+        })
+        .map(|transaction| transaction.reservation.transaction_id)
+        .collect::<BTreeSet<_>>();
+    for reservation in state
+        .rate_movement_reservations
+        .iter_mut()
+        .filter(|reservation| {
+            reservation.state == RateMovementReservationState::Confirmed
+                && orphaned_transaction_ids.contains(&reservation.transaction_id)
+        })
+    {
+        if let Some(episode) = state
+            .rate_episodes
+            .iter_mut()
+            .find(|entry| entry.episode.episode_id == reservation.episode_id)
+        {
+            episode
+                .episode
+                .reopen_confirmed(reservation.movement_assets, reservation.budget_before)
+                .map_err(|_| {
+                    StorageError::Invariant("confirmed rate movement cannot be rewound")
+                })?;
+            reservation.state = RateMovementReservationState::Pending;
+        } else {
+            return Err(StorageError::Invariant(
+                "confirmed rate movement lost its episode during rewind",
+            ));
+        }
+    }
+    let pending_episode_ids = state
+        .rate_movement_reservations
+        .iter()
+        .filter(|reservation| reservation.state == RateMovementReservationState::Pending)
+        .map(|reservation| reservation.episode_id)
+        .collect::<BTreeSet<_>>();
+    for entry in &mut state.rate_episodes {
+        entry.episode.rewind_independent_events(ancestor);
+        if entry.episode.detection_block.number > ancestor.number
+            || entry
                 .episode
                 .confirmation_block
-                .is_none_or(|block| block.number <= ancestor.number)
+                .is_some_and(|block| block.number > ancestor.number)
+        {
+            entry
+                .episode
+                .complete(RateEpisodeStopReason::NonConsecutiveObservation);
+        }
+    }
+    state.rate_episodes.retain(|entry| {
+        pending_episode_ids.contains(&entry.episode.episode_id)
+            || entry.episode.detection_block.number <= ancestor.number
+                && entry
+                    .episode
+                    .confirmation_block
+                    .is_none_or(|block| block.number <= ancestor.number)
     });
+    state
+        .top_k_apy_memory
+        .retain(|entry| entry.memory.last_observed_block <= ancestor.number);
     let mut transactions_orphaned = 0_u64;
     for transaction in &mut state.transactions {
         if transaction
@@ -2085,13 +2656,13 @@ fn rewind(state: &mut JsonState, chain_id: u64, ancestor: BlockRef) -> RewindRes
         }
     }
     state.chain_cursors.insert(chain_id, ancestor);
-    RewindResult {
+    Ok(RewindResult {
         blocks_orphaned: usize_to_u64_saturating(
             old_blocks.saturating_sub(state.canonical_blocks.len()),
         ),
         logs_orphaned: usize_to_u64_saturating(old_logs.saturating_sub(state.canonical_logs.len())),
         transactions_orphaned,
-    }
+    })
 }
 
 fn parent_directory(path: &Path) -> &Path {
@@ -2305,12 +2876,21 @@ fn persist_signed_attempt(
         .iter_mut()
         .find(|row| row.reservation.transaction_id == attempt.transaction_id)
         .ok_or(StorageError::StaleTransition)?;
-    if !matches!(
-        row.state,
-        TransactionState::Submitted | TransactionState::Replaced
-    ) {
-        return Err(StorageError::StaleTransition);
-    }
+    let signed_state = match (attempt.kind, row.state) {
+        (
+            TransactionAttemptKind::Replacement,
+            TransactionState::Submitted | TransactionState::Replaced,
+        ) => TransactionState::ReplacementSigned,
+        (
+            TransactionAttemptKind::Cancellation,
+            TransactionState::Signed
+            | TransactionState::Submitted
+            | TransactionState::Replaced
+            | TransactionState::Orphaned,
+        ) => TransactionState::CancellationSigned,
+        _ => return Err(StorageError::StaleTransition),
+    };
+    row.state = signed_state;
     row.transaction_hash = Some(attempt.transaction_hash);
     row.raw_signed_transaction = Some(attempt.raw_signed_transaction.clone());
     row.updated_at = attempt.signed_at;
@@ -2366,6 +2946,7 @@ fn transition_transaction(
         transition.next_state,
         TransactionState::AbortedBeforeSigning
             | TransactionState::Reverted
+            | TransactionState::Cancelled
             | TransactionState::Failed
     );
     let row_index = state
@@ -2373,7 +2954,11 @@ fn transition_transaction(
         .iter()
         .position(|row| row.reservation.transaction_id == transition.transaction_id)
         .ok_or(StorageError::StaleTransition)?;
-    if state.transactions[row_index].state != transition.expected_state {
+    if state
+        .transactions
+        .get(row_index)
+        .is_none_or(|row| row.state != transition.expected_state)
+    {
         return Err(StorageError::StaleTransition);
     }
     if matches!(
@@ -2400,7 +2985,10 @@ fn transition_transaction(
             ))?;
         attempt.broadcast_at = Some(submitted_at);
     }
-    let row = &mut state.transactions[row_index];
+    let row = state
+        .transactions
+        .get_mut(row_index)
+        .ok_or(StorageError::StaleTransition)?;
     row.state = transition.next_state;
     if let Some(hash) = transition.transaction_hash {
         row.transaction_hash = Some(hash);
@@ -2443,8 +3031,12 @@ fn release_rate_movement(
     let Some(index) = matching.first().copied() else {
         return Ok(());
     };
-    let episode_id = state.rate_movement_reservations[index].episode_id;
-    let movement_assets = state.rate_movement_reservations[index].movement_assets;
+    let reservation = state
+        .rate_movement_reservations
+        .get(index)
+        .ok_or(StorageError::Invariant("rate movement disappeared"))?;
+    let episode_id = reservation.episode_id;
+    let movement_assets = reservation.movement_assets;
     let episode = state
         .rate_episodes
         .iter_mut()
@@ -2454,7 +3046,11 @@ fn release_rate_movement(
         .episode
         .release_pending(movement_assets)
         .map_err(|_| StorageError::Invariant("pending rate movement cannot be released"))?;
-    state.rate_movement_reservations[index].state = RateMovementReservationState::Released;
+    let reservation = state
+        .rate_movement_reservations
+        .get_mut(index)
+        .ok_or(StorageError::Invariant("rate movement disappeared"))?;
+    reservation.state = RateMovementReservationState::Released;
     Ok(())
 }
 
@@ -2684,7 +3280,10 @@ fn persist_reconciliation(
         confirmed_episode.as_ref(),
     ) {
         (Some(index), Some(confirmed)) => {
-            let reservation = &state.rate_movement_reservations[index];
+            let reservation = state
+                .rate_movement_reservations
+                .get(index)
+                .ok_or(StorageError::Invariant("rate movement disappeared"))?;
             if confirmed.episode_id != reservation.episode_id {
                 return Err(StorageError::Invariant(
                     "reconciliation confirms the wrong rate episode",
@@ -2740,7 +3339,11 @@ fn persist_reconciliation(
         persist_episode(state, episode, record.reconciled_at)?;
     }
     if let Some(index) = movement_indexes.first().copied() {
-        state.rate_movement_reservations[index].state = RateMovementReservationState::Confirmed;
+        let reservation = state
+            .rate_movement_reservations
+            .get_mut(index)
+            .ok_or(StorageError::Invariant("rate movement disappeared"))?;
+        reservation.state = RateMovementReservationState::Confirmed;
     }
     state.reconciliation_records.push(record);
     Ok(())
@@ -2847,9 +3450,12 @@ fn persist_episode(
 mod compaction_tests {
     use alloy::primitives::{Address, B256, Bytes, U256};
 
-    use super::{HOT_BLOCK_RETENTION, JsonState, TransactionRow, compact_hot_state};
+    use super::{
+        HOT_BLOCK_RETENTION, JsonState, TopologyRevision, TransactionRow, compact_hot_state,
+    };
     use crate::{
-        domain::{BlockRef, TransactionId, VaultAddress},
+        domain::{AdapterAddress, BlockRef, TransactionId, VaultAddress},
+        state::topology::TopologyIndex,
         storage::models::{
             CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, NonceReservation,
             TransactionState,
@@ -2888,6 +3494,51 @@ mod compaction_tests {
     }
 
     #[test]
+    fn retained_topology_checkpoint_pins_its_canonical_header() {
+        let mut state = JsonState::default();
+        let checkpoint = BlockRef {
+            number: 10,
+            hash: B256::repeat_byte(10),
+            parent_hash: B256::repeat_byte(9),
+            timestamp: 10,
+            gas_limit: 30_000_000,
+        };
+        state.canonical_blocks.push(CanonicalBlockRecord {
+            chain_id: 999,
+            block: checkpoint,
+        });
+        state.canonical_blocks.push(CanonicalBlockRecord {
+            chain_id: 999,
+            block: BlockRef {
+                number: HOT_BLOCK_RETENTION.saturating_add(100),
+                hash: B256::repeat_byte(20),
+                parent_hash: B256::repeat_byte(19),
+                timestamp: 100,
+                gas_limit: 30_000_000,
+            },
+        });
+        let vault = VaultAddress(Address::with_last_byte(1));
+        state.topology_history.push(TopologyRevision {
+            topology: TopologyIndex::new(
+                vault,
+                1,
+                [AdapterAddress(Address::with_last_byte(2))],
+                [],
+            ),
+            block: checkpoint,
+        });
+
+        compact_hot_state(&mut state);
+
+        assert!(
+            state
+                .canonical_blocks
+                .iter()
+                .any(|record| record.block == checkpoint)
+        );
+    }
+
+    #[test]
     fn unresolved_nonce_lane_pins_old_lifecycle_blocks() {
         let mut state = JsonState::default();
         for number in [10, 11, HOT_BLOCK_RETENTION.saturating_add(100)] {
@@ -2914,6 +3565,7 @@ mod compaction_tests {
                 max_fee_per_gas: U256::from(24_u8),
                 max_priority_fee_per_gas: U256::from(1_u8),
                 gas_limit: 25_000,
+                movement_assets: U256::from(25_u8),
                 created_block: 10,
                 created_at: 10,
             },

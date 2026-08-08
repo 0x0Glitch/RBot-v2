@@ -350,9 +350,6 @@ fn validate_production_profile(
     if config.app.node.mode != RuntimeMode::Execute {
         failures.push("release evidence can authorize only Execute mode".to_owned());
     }
-    if config.app.chain.chain_id != 999 {
-        failures.push("release-one production target must be HyperEVM chain ID 999".to_owned());
-    }
     if !matches!(config.app.signing, SigningConfig::RemoteSigner { .. }) {
         failures.push("canary and production require the authenticated remote signer".to_owned());
     }

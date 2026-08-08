@@ -19,7 +19,7 @@ use crate::{
 pub struct CurrentStateAssessment {
     /// Complete exact snapshot at a canonical block after inclusion.
     pub snapshot: ExactVaultSnapshot,
-    /// Current applicable spot-borrow-rate spread.
+    /// Current applicable spread in the configured objective's WAD domain.
     pub current_rate_spread: U256,
     /// Result of current deposit, exit, reserve and liquidity constraints.
     pub service_constraints_met: bool,
@@ -34,7 +34,7 @@ pub struct CurrentStateAssessment {
 /// State-owned exact refresh and recalculation boundary.
 #[async_trait]
 pub trait ExactCurrentStateSource: Send + Sync {
-    /// Rebuilds all exact state and recalculates rates and service constraints.
+    /// Rebuilds all exact state and recalculates the selected objective and service constraints.
     async fn rebuild_current_state(
         &self,
         conformance: &ConformanceReport,
@@ -47,6 +47,15 @@ pub enum CurrentStateSourceError {
     /// The acknowledged cursor is visible before its matching topology/state publication.
     #[error("exact current-state context is not published yet")]
     ContextNotReady,
+    /// A provider or context race may resolve without operator intervention.
+    #[error("exact current-state source is temporarily unavailable at `{0}`")]
+    RetryableAt(&'static str),
+    /// A classified transport, rate-limit, or server outage may trip the bounded breaker.
+    #[error("exact current-state provider is unavailable at `{0}`")]
+    ProviderOutageAt(&'static str),
+    /// A local durability failure cannot be safely retried inside this process.
+    #[error("exact current-state source encountered a fatal local failure at `{0}`")]
+    FatalAt(&'static str),
     /// Exact refresh or independent recalculation failed at a non-secret semantic stage.
     #[error("exact current-state source failed at `{0}`")]
     FailedAt(&'static str),
@@ -61,7 +70,7 @@ pub struct CurrentStateReport {
     pub snapshot_hash: B256,
     /// Exact current snapshot block.
     pub block: crate::domain::BlockRef,
-    /// Current applicable spot-borrow-rate spread.
+    /// Current applicable spread in the configured objective's WAD domain.
     pub current_rate_spread: U256,
     /// Whether current service constraints pass.
     pub service_constraints_met: bool,
@@ -221,8 +230,10 @@ fn validate_snapshot(
         if position.position_key != *key
             || position.market_id != derive_market_id(&position.market_params)
             || position.internal_supply_shares > position.actual_morpho_supply_shares
-            || position.actual_morpho_supply_shares - position.internal_supply_shares
-                != position.ignored_donation_shares
+            || position
+                .actual_morpho_supply_shares
+                .checked_sub(position.internal_supply_shares)
+                != Some(position.ignored_donation_shares)
             || !snapshot.adapters.contains_key(&position.adapter)
             || !snapshot.markets.contains_key(&position.market_id)
             || position.affected_caps.iter().any(|reference| {

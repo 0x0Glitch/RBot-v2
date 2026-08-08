@@ -3,14 +3,17 @@
 
 use std::collections::BTreeMap;
 
-use alloy::primitives::U256;
+use alloy::primitives::{B256, U256, keccak256};
 use thiserror::Error;
 
 use crate::domain::TokenAddress;
 use crate::{
     config::{SolverConfigCanonical, ValidatedVaultConfig},
     domain::{ExactVaultSnapshot, MarketMode, RequestedAssets, V2Action},
-    planner::{CandidatePlanSet, PlanBuilder, PlanningError, PlanningInput},
+    planner::{
+        CandidatePlanSet, PlanBuilder, PlanningError, PlanningInput,
+        certificate::{RejectionReason, SearchCertificate},
+    },
     state::projection::ProjectedVaultView,
 };
 
@@ -107,6 +110,16 @@ pub struct LiquiditySolveResult {
     pub actions: Vec<V2Action>,
     /// Exact post-action state.
     pub state: Option<crate::planner::simulator::SimulationState>,
+    /// Complete bounded-search evidence.
+    pub certificate: SearchCertificate,
+}
+
+fn empty_result(certificate: SearchCertificate) -> LiquiditySolveResult {
+    LiquiditySolveResult {
+        actions: Vec::new(),
+        state: None,
+        certificate,
+    }
 }
 
 /// Pure service-maintenance builder configured with bounded search policy.
@@ -143,222 +156,239 @@ impl PlanBuilder for LiquidityPlanBuilder {
     }
 }
 
-/// Builds a bounded deallocation-to-liquidity-adapter or idle-allocation maintenance plan.
+#[derive(Clone, Debug)]
+struct MaintenanceEndpoint {
+    position: crate::domain::PositionKey,
+    adapter: crate::domain::AdapterAddress,
+    data: alloy::primitives::Bytes,
+    allocation_maximum: U256,
+    deallocation_maximum: U256,
+    active_destination: bool,
+}
+
+impl MaintenanceEndpoint {
+    fn allocate(&self, assets: U256) -> V2Action {
+        V2Action::Allocate {
+            position: self.position,
+            adapter: self.adapter,
+            data: self.data.clone(),
+            requested_assets: RequestedAssets(assets),
+        }
+    }
+
+    fn deallocate(&self, assets: U256) -> V2Action {
+        V2Action::Deallocate {
+            position: self.position,
+            adapter: self.adapter,
+            data: self.data.clone(),
+            requested_assets: RequestedAssets(assets),
+        }
+    }
+}
+
+/// Builds a bounded exact service-restoration plan. Depending on the violated
+/// service value, this can replenish the liquidity adapter or move assets out
+/// of its binding deposit-cap path.
 pub fn solve_liquidity_maintenance(
     snapshot: &ExactVaultSnapshot,
     projection: &ProjectedVaultView,
     vault: &ValidatedVaultConfig,
     solver: &SolverConfigCanonical,
 ) -> LiquiditySolveResult {
-    if let (Some(destination), Some(current_state)) =
+    let mut certificate = SearchCertificate {
+        candidate_lattice_hash: B256::ZERO,
+        nodes_evaluated: 0,
+        node_limit: solver.maximum_nodes,
+        search_complete: true,
+        rejection_counts: BTreeMap::new(),
+    };
+    let Ok(base) =
+        crate::planner::simulator::SimulationState::from_projection(snapshot, projection)
+    else {
+        certificate.search_complete = false;
+        return empty_result(certificate);
+    };
+    if base.validate_service_constraints(snapshot, vault).is_ok() {
+        certificate.candidate_lattice_hash = keccak256([]);
+        return empty_result(certificate);
+    }
+    let idle = match base.unreserved_idle() {
+        Ok(value) => value,
+        Err(_) => {
+            certificate.search_complete = false;
+            return empty_result(certificate);
+        }
+    };
+    let Some(direct) = vault
+        .positions
+        .iter()
+        .map(|position| {
+            let current = projection
+                .vault
+                .position_expected_assets
+                .get(&position.position_key)
+                .copied()?;
+            Some(MaintenanceEndpoint {
+                position: position.position_key,
+                adapter: position.adapter,
+                data: crate::domain::encode_adapter_data(&position.market_params),
+                allocation_maximum: position
+                    .maximum_position_assets
+                    .saturating_sub(current)
+                    .min(position.maximum_action_assets),
+                deallocation_maximum: current
+                    .saturating_sub(position.minimum_position_assets)
+                    .min(position.maximum_action_assets),
+                active_destination: position.mode == MarketMode::Active,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        certificate.search_complete = false;
+        return empty_result(certificate);
+    };
+    let liquidity = if let (Some(configured), Some(current)) =
         (&vault.liquidity_adapter, &snapshot.liquidity_adapter)
     {
-        let required = vault.minimum_liquidity_adapter_assets.max(
-            vault
-                .minimum_atomic_exit_coverage_assets
-                .saturating_sub(snapshot.parent.idle_assets),
-        );
-        let deficit = required.saturating_sub(current_state.real_assets);
-        if deficit.is_zero()
-            && projection.deposit_headroom_satisfied
-            && projection.atomic_exit_coverage_satisfied
-            && projection.source_constraints_satisfied
-        {
-            return LiquiditySolveResult {
-                actions: Vec::new(),
-                state: None,
-            };
+        MaintenanceEndpoint {
+            position: configured.position_key,
+            adapter: configured.address,
+            data: alloy::primitives::Bytes::new(),
+            allocation_maximum: configured.maximum_action_assets,
+            deallocation_maximum: current
+                .real_assets
+                .saturating_sub(vault.minimum_liquidity_adapter_assets)
+                .min(current.max_withdraw)
+                .min(configured.maximum_action_assets),
+            active_destination: false,
         }
-        if deficit.is_zero() {
-            return LiquiditySolveResult {
-                actions: Vec::new(),
-                state: None,
-            };
-        }
-        let base =
-            match crate::planner::simulator::SimulationState::from_projection(snapshot, projection)
-            {
-                Ok(state) => state,
-                Err(_) => {
-                    return LiquiditySolveResult {
-                        actions: Vec::new(),
-                        state: None,
-                    };
-                }
-            };
-        let idle = match base.unreserved_idle() {
-            Ok(value) => value,
-            Err(_) => U256::ZERO,
+    } else {
+        let Some(endpoint) = direct.iter().find(|position| {
+            position.adapter.0 == snapshot.parent.liquidity_adapter
+                && position.data == snapshot.parent.liquidity_data
+        }) else {
+            certificate.search_complete = false;
+            return empty_result(certificate);
         };
-        let desired = deficit
-            .max(vault.minimum_action_assets)
-            .min(destination.maximum_action_assets);
+        endpoint.clone()
+    };
+
+    let mut pairs = Vec::new();
+    if !idle.is_zero() {
+        pairs.push((None, liquidity.clone()));
+    }
+    for source in direct.iter().filter(|position| {
+        position.position != liquidity.position && !position.deallocation_maximum.is_zero()
+    }) {
+        pairs.push((Some(source.clone()), liquidity.clone()));
+        for destination in direct.iter().filter(|destination| {
+            destination.active_destination
+                && destination.position != source.position
+                && !destination.allocation_maximum.is_zero()
+        }) {
+            pairs.push((Some(source.clone()), destination.clone()));
+        }
+    }
+    if !liquidity.deallocation_maximum.is_zero() {
+        for destination in direct.iter().filter(|destination| {
+            destination.active_destination
+                && destination.position != liquidity.position
+                && !destination.allocation_maximum.is_zero()
+        }) {
+            pairs.push((Some(liquidity.clone()), destination.clone()));
+        }
+    }
+
+    let Some(liquidity_assets) = base.position_expected_assets(liquidity.position) else {
+        certificate.search_complete = false;
+        return empty_result(certificate);
+    };
+    let deficits = [
+        vault
+            .minimum_deposit_headroom_assets
+            .saturating_sub(projection.vault.max_executable_deposit_assets),
+        vault
+            .minimum_atomic_exit_coverage_assets
+            .saturating_sub(projection.vault.atomic_exit_coverage_assets),
+        vault
+            .minimum_liquidity_adapter_assets
+            .saturating_sub(liquidity_assets),
+    ];
+    let mut best: Option<(
+        U256,
+        Vec<V2Action>,
+        crate::planner::simulator::SimulationState,
+    )> = None;
+    let mut evaluated = 0_u64;
+    let mut lattice_identity = Vec::new();
+    'search: for (source, destination) in pairs {
+        let source_maximum = source
+            .as_ref()
+            .map_or(idle, |endpoint| endpoint.deallocation_maximum);
+        let maximum = source_maximum.min(destination.allocation_maximum);
+        if maximum < vault.minimum_action_assets {
+            continue;
+        }
         let lattice = crate::planner::candidates::build_candidate_lattice(
             vault.minimum_action_assets,
-            desired,
-            &[deficit, idle],
+            maximum,
+            &[deficits[0], deficits[1], deficits[2], idle, maximum],
             solver.maximum_amount_candidates_per_position,
         );
+        lattice_identity.extend_from_slice(
+            source
+                .as_ref()
+                .map_or(B256::ZERO, |endpoint| endpoint.position.0)
+                .as_slice(),
+        );
+        lattice_identity.extend_from_slice(destination.position.0.as_slice());
+        lattice_identity.extend_from_slice(lattice.hash.as_slice());
         for amount in lattice
             .amounts
             .into_iter()
-            .rev()
             .filter(|amount| *amount >= vault.minimum_action_assets)
         {
-            let mut candidates = Vec::new();
-            let allocation = V2Action::Allocate {
-                position: destination.position_key,
-                adapter: destination.address,
-                data: alloy::primitives::Bytes::new(),
-                requested_assets: RequestedAssets(amount),
-            };
-            if amount <= idle {
-                candidates.push(vec![allocation.clone()]);
+            if evaluated >= solver.maximum_nodes {
+                certificate.search_complete = false;
+                break 'search;
             }
-            for source in vault.positions.iter().filter(|position| {
-                matches!(position.mode, MarketMode::Active | MarketMode::SourceOnly)
-            }) {
-                candidates.push(vec![
-                    V2Action::Deallocate {
-                        position: source.position_key,
-                        adapter: source.adapter,
-                        data: crate::domain::encode_adapter_data(&source.market_params),
-                        requested_assets: RequestedAssets(amount),
-                    },
-                    allocation.clone(),
-                ]);
+            evaluated = evaluated.saturating_add(1);
+            if best
+                .as_ref()
+                .is_some_and(|(movement, _, _)| *movement <= amount)
+            {
+                continue;
             }
-            for actions in candidates {
-                let Ok(state) = crate::planner::simulator::simulate_actions(
-                    snapshot, projection, vault, &actions,
-                ) else {
-                    continue;
-                };
-                if state.immediate_loss_assets <= vault.maximum_immediate_rebalance_loss_assets
-                    && state.validate_service_constraints(snapshot, vault).is_ok()
-                {
-                    return LiquiditySolveResult {
-                        actions,
-                        state: Some(state),
-                    };
-                }
+            let mut actions = Vec::with_capacity(2);
+            if let Some(source) = &source {
+                actions.push(source.deallocate(amount));
             }
-        }
-        return LiquiditySolveResult {
-            actions: Vec::new(),
-            state: None,
-        };
-    }
-    let Some(destination) = vault
-        .positions
-        .iter()
-        .find(|position| position.adapter.0 == snapshot.parent.liquidity_adapter)
-    else {
-        return LiquiditySolveResult {
-            actions: Vec::new(),
-            state: None,
-        };
-    };
-    let Some(current) = projection
-        .vault
-        .position_expected_assets
-        .get(&destination.position_key)
-        .copied()
-    else {
-        return LiquiditySolveResult {
-            actions: Vec::new(),
-            state: None,
-        };
-    };
-    let deficit = vault
-        .minimum_liquidity_adapter_assets
-        .saturating_sub(current);
-    if deficit.is_zero()
-        && projection.deposit_headroom_satisfied
-        && projection.atomic_exit_coverage_satisfied
-        && projection.source_constraints_satisfied
-    {
-        return LiquiditySolveResult {
-            actions: Vec::new(),
-            state: None,
-        };
-    }
-    let base =
-        match crate::planner::simulator::SimulationState::from_projection(snapshot, projection) {
-            Ok(state) => state,
-            Err(_) => {
-                return LiquiditySolveResult {
-                    actions: Vec::new(),
-                    state: None,
-                };
-            }
-        };
-    let idle = match base.unreserved_idle() {
-        Ok(value) => value,
-        Err(_) => U256::ZERO,
-    };
-    let desired = deficit
-        .max(vault.minimum_action_assets)
-        .min(destination.maximum_action_assets);
-    let lattice = crate::planner::candidates::build_candidate_lattice(
-        vault.minimum_action_assets,
-        desired,
-        &[deficit, idle],
-        solver.maximum_amount_candidates_per_position,
-    );
-    for amount in lattice
-        .amounts
-        .into_iter()
-        .rev()
-        .filter(|amount| *amount >= vault.minimum_action_assets)
-    {
-        let mut candidates = Vec::new();
-        if amount <= idle {
-            candidates.push(vec![V2Action::Allocate {
-                position: destination.position_key,
-                adapter: destination.adapter,
-                data: crate::domain::encode_adapter_data(&destination.market_params),
-                requested_assets: RequestedAssets(amount),
-            }]);
-        }
-        for source in vault.positions.iter().filter(|position| {
-            position.position_key != destination.position_key
-                && matches!(position.mode, MarketMode::Active | MarketMode::SourceOnly)
-        }) {
-            candidates.push(vec![
-                V2Action::Deallocate {
-                    position: source.position_key,
-                    adapter: source.adapter,
-                    data: crate::domain::encode_adapter_data(&source.market_params),
-                    requested_assets: RequestedAssets(amount),
-                },
-                V2Action::Allocate {
-                    position: destination.position_key,
-                    adapter: destination.adapter,
-                    data: crate::domain::encode_adapter_data(&destination.market_params),
-                    requested_assets: RequestedAssets(amount),
-                },
-            ]);
-        }
-        for actions in candidates {
+            actions.push(destination.allocate(amount));
             let Ok(state) =
                 crate::planner::simulator::simulate_actions(snapshot, projection, vault, &actions)
             else {
+                certificate.reject(RejectionReason::Simulation);
                 continue;
             };
             if state.immediate_loss_assets > vault.maximum_immediate_rebalance_loss_assets {
+                certificate.reject(RejectionReason::ImmediateLoss);
                 continue;
             }
-            if state.validate_service_constraints(snapshot, vault).is_ok() {
-                return LiquiditySolveResult {
-                    actions,
-                    state: Some(state),
-                };
+            if state.validate_service_constraints(snapshot, vault).is_err() {
+                certificate.reject(RejectionReason::Service);
+                continue;
             }
+            best = Some((amount, actions, state));
         }
     }
-    LiquiditySolveResult {
-        actions: Vec::new(),
-        state: None,
+    certificate.nodes_evaluated = evaluated;
+    certificate.candidate_lattice_hash = keccak256(lattice_identity);
+    match best {
+        Some((_, actions, state)) => LiquiditySolveResult {
+            actions,
+            state: Some(state),
+            certificate,
+        },
+        None => empty_result(certificate),
     }
 }

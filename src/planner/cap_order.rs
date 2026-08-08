@@ -66,8 +66,8 @@ impl Search<'_> {
             self.complete = false;
             return;
         }
-        self.nodes += 1;
-        let mut encoded = Vec::with_capacity(prefix.len() * 8);
+        self.nodes = self.nodes.saturating_add(1);
+        let mut encoded = Vec::with_capacity(prefix.len().saturating_mul(8));
         for index in prefix.iter().copied() {
             let Ok(index) = u64::try_from(index) else {
                 self.complete = false;
@@ -80,7 +80,15 @@ impl Search<'_> {
         }
         if remaining.is_empty() {
             let mut actions = self.deallocations.to_vec();
-            actions.extend(prefix.iter().map(|index| self.allocations[*index].clone()));
+            let Some(allocations) = prefix
+                .iter()
+                .map(|index| self.allocations.get(*index).cloned())
+                .collect::<Option<Vec<_>>>()
+            else {
+                self.complete = false;
+                return;
+            };
+            actions.extend(allocations);
             if let Ok(state) =
                 simulate_actions(self.snapshot, self.projection, self.config, &actions)
             {

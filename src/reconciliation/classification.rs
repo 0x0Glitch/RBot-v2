@@ -41,8 +41,6 @@ pub enum TransactionFailureClass {
 pub enum FailureDisposition {
     /// Perform complete exact refresh and construct a semantically new plan if still needed.
     RefreshAndReplan,
-    /// Pause the affected vault and alert an operator.
-    PauseAndAlert,
 }
 
 /// Conservative evidence gathered at the failed transaction's parent block.
@@ -74,21 +72,13 @@ pub fn classify_revert(evidence: RevertEvidence) -> TransactionFailureClass {
     }
 }
 
-/// Only stale/read-related classes may autonomously produce a fresh semantic plan.
+/// A revert never authorizes blind resubmission and never permanently pauses by itself.
+///
+/// Every class returns to fresh exact canonical reads. Those reads may independently stop Execute
+/// for a lost role, unsupported runtime identity, or unavailable infrastructure.
 #[must_use]
-pub const fn disposition(class: TransactionFailureClass) -> FailureDisposition {
-    match class {
-        TransactionFailureClass::StaleState | TransactionFailureClass::RpcSimulationMismatch => {
-            FailureDisposition::RefreshAndReplan
-        }
-        TransactionFailureClass::ConfigurationChanged
-        | TransactionFailureClass::InsufficientLiquidity
-        | TransactionFailureClass::RoleLoss
-        | TransactionFailureClass::UnsupportedDependency
-        | TransactionFailureClass::ModelMismatch
-        | TransactionFailureClass::OutOfGas
-        | TransactionFailureClass::Unknown => FailureDisposition::PauseAndAlert,
-    }
+pub const fn disposition(_class: TransactionFailureClass) -> FailureDisposition {
+    FailureDisposition::RefreshAndReplan
 }
 
 /// Canonical inclusion/confirmation state advancement failure.
@@ -129,7 +119,7 @@ pub async fn observe_canonical_receipt(
         && pending.transaction_hash == Some(receipt.transaction_hash);
     let next_state = match receipt.status {
         Some(0) => TransactionState::Reverted,
-        Some(1) if cancellation_won => TransactionState::Failed,
+        Some(1) if cancellation_won => TransactionState::Cancelled,
         Some(1) => TransactionState::Included,
         _ => return Err(ReceiptTrackingError::Identity),
     };
@@ -194,7 +184,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_stale_or_read_disagreement_replans_automatically() {
+    fn every_revert_class_rebuilds_exact_state_before_any_new_plan() {
         assert_eq!(
             disposition(classify_revert(RevertEvidence {
                 state_advanced: true,
@@ -222,7 +212,7 @@ mod tests {
             TransactionFailureClass::OutOfGas,
             TransactionFailureClass::Unknown,
         ] {
-            assert_eq!(disposition(class), FailureDisposition::PauseAndAlert);
+            assert_eq!(disposition(class), FailureDisposition::RefreshAndReplan);
         }
     }
 }

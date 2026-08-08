@@ -2,12 +2,15 @@
 #![forbid(unsafe_code)]
 #![deny(
     clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
     clippy::float_arithmetic,
     clippy::panic,
     clippy::todo,
     clippy::unimplemented,
     clippy::unwrap_used
 )]
+#![cfg_attr(test, allow(clippy::arithmetic_side_effects, clippy::indexing_slicing))]
 
 pub mod api;
 pub mod chain;
@@ -15,7 +18,6 @@ pub mod cli;
 pub mod config;
 pub mod contracts;
 pub mod domain;
-pub mod error;
 pub mod morpho;
 pub mod planner;
 pub mod protocol_lock;

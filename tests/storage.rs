@@ -1,4 +1,5 @@
 //! Atomic JSON actor, durability, recovery, rewind, and backup tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,13 +13,16 @@ use morpho_v2_reallocator::domain::{
     RateGroupId, RateObjectiveBranch, SolverCertificate, StateContext, TransactionId, V2Action,
     V2Plan, VaultAddress, VaultCapabilities,
 };
-use morpho_v2_reallocator::planner::episodes::RateSignalEpisode;
+use morpho_v2_reallocator::planner::{
+    episodes::{IndependentRateEvent, RateSignalEpisode},
+    top_k_apy::TopKApyMemory,
+};
 use morpho_v2_reallocator::storage::StorageError;
 use morpho_v2_reallocator::storage::actor::StorageService;
 use morpho_v2_reallocator::storage::models::{
     CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
-    NonceReservation, ReconciliationRecord, SignedAttemptRecord, SignedTransactionRecord,
-    TransactionAttemptKind, TransactionState, TransactionTransition,
+    FinalPreflightRecord, NonceReservation, ReconciliationRecord, SignedAttemptRecord,
+    SignedTransactionRecord, TransactionAttemptKind, TransactionState, TransactionTransition,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -46,6 +50,7 @@ fn reservation(signer: Address) -> NonceReservation {
         max_fee_per_gas: U256::from(100_u64),
         max_priority_fee_per_gas: U256::from(2_u64),
         gas_limit: 500_000,
+        movement_assets: U256::from(10_u64),
         created_block: 1,
         created_at: 1_800_000_000,
     }
@@ -90,14 +95,58 @@ fn rate_episode(vault: VaultAddress, detection: BlockRef, salt: u8) -> RateSigna
         BTreeSet::from([source, destination]),
         BTreeSet::from([source]),
         BTreeSet::from([destination]),
-        Assets(U256::from(1_000_u64)),
-        2_500,
         detection.timestamp,
         detection.timestamp + 600,
     ) {
         Ok(episode) => episode,
         Err(error) => panic!("valid rate episode fixture: {error}"),
     }
+}
+
+#[tokio::test]
+async fn top_k_memory_is_durable_and_removed_when_its_observation_is_reorged()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("top-k-memory.json");
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let vault = VaultAddress(Address::with_last_byte(0x45));
+    let ancestor = block(10, 0x10, 0x09);
+    let observed = block(11, 0x11, 0x10);
+    for current in [ancestor, observed] {
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 999,
+                    block: current,
+                },
+                Vec::new(),
+                current.timestamp,
+            )
+            .await?;
+    }
+    let memory = TopKApyMemory {
+        last_observed_block: observed.number,
+        last_observed_timestamp: observed.timestamp,
+        generation: 1,
+        selected_markets: vec![MarketId(B256::repeat_byte(1))],
+        ..TopKApyMemory::default()
+    };
+    handle
+        .persist_top_k_apy_memory(vault, memory.clone(), observed.timestamp)
+        .await?;
+    assert_eq!(handle.load_top_k_apy_memory(vault).await?, Some(memory));
+    service.shutdown().await?;
+
+    let reopened = reopen(&path).await?;
+    let handle = reopened.handle();
+    assert!(handle.load_top_k_apy_memory(vault).await?.is_some());
+    handle
+        .rewind_to_ancestor(999, ancestor, ancestor.timestamp)
+        .await?;
+    assert_eq!(handle.load_top_k_apy_memory(vault).await?, None);
+    reopened.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -154,6 +203,55 @@ async fn rate_episode_is_durable_unique_and_reorg_reversible()
 }
 
 #[tokio::test]
+async fn rate_episode_discards_orphaned_independent_event_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let service = reopen(&directory.path().join("episode-events.json")).await?;
+    let handle = service.handle();
+    let vault = VaultAddress(Address::with_last_byte(0x45));
+    let detection = block(10, 0x10, 0x09);
+    let retained = block(11, 0x11, 0x10);
+    let orphaned = block(12, 0x12, 0x11);
+    for block in [detection, retained, orphaned] {
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 999,
+                    block,
+                },
+                Vec::new(),
+                block.timestamp,
+            )
+            .await?;
+    }
+    let mut episode = rate_episode(vault, detection, 0x61);
+    episode.confirm_short(detection, Assets(U256::from(1_000_u64)))?;
+    episode.record_independent_event(IndependentRateEvent {
+        transaction_hash: B256::repeat_byte(0x71),
+        block: retained,
+    })?;
+    episode.record_independent_event(IndependentRateEvent {
+        transaction_hash: B256::repeat_byte(0x72),
+        block: orphaned,
+    })?;
+    handle
+        .persist_rate_episode(episode.clone(), orphaned.timestamp)
+        .await?;
+
+    handle
+        .rewind_to_ancestor(999, retained, orphaned.timestamp + 1)
+        .await?;
+    let rewound = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("active episode was removed")?;
+    assert_eq!(rewound.independent_events.len(), 1);
+    assert_eq!(rewound.independent_events[0].block, retained);
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = directory.path().join("state.json");
@@ -161,7 +259,7 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
     service.shutdown().await?;
 
     let state = read_json(&path)?;
-    assert_eq!(state["format_version"], 2);
+    assert_eq!(state["format_version"], 4);
     assert_eq!(state["revision"], 0);
     assert_eq!(state["transactions"].as_array().map(Vec::len), Some(0));
 
@@ -197,7 +295,118 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
-async fn terminal_format_one_state_migrates_atomically_to_format_two()
+async fn exact_preflight_replay_is_idempotent_but_conflicts_fail_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let service = reopen(&directory.path().join("preflight-idempotence.json")).await?;
+    let handle = service.handle();
+    let snapshot = sample_snapshot();
+    let plan = sample_plan(&snapshot);
+    handle.persist_snapshot(snapshot.clone(), 100).await?;
+    handle.persist_plan(plan.clone(), 101).await?;
+    let record = FinalPreflightRecord {
+        preflight_id: B256::repeat_byte(0x71),
+        plan_id: plan.plan_id,
+        head: snapshot.context.block,
+        simulation_before_hash: B256::repeat_byte(0x72),
+        simulation_after_hash: B256::repeat_byte(0x73),
+        event_cursor_number: snapshot.context.block.number,
+        calldata_hash: B256::repeat_byte(0x74),
+        gas_estimate: 500_000,
+        signed_gas_limit: 575_000,
+        expected_actions: Vec::new(),
+        completed_monotonic_nanos: 10,
+        created_at: snapshot.context.block.timestamp,
+    };
+
+    handle.persist_final_preflight(record.clone()).await?;
+    handle.persist_final_preflight(record.clone()).await?;
+    let conflict = FinalPreflightRecord {
+        gas_estimate: record.gas_estimate.saturating_add(1),
+        ..record
+    };
+    assert!(matches!(
+        handle.persist_final_preflight(conflict).await,
+        Err(StorageError::Invariant("conflicting preflight identity"))
+    ));
+
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn signed_transaction_summaries_are_durable_and_current()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("transaction-summaries.json");
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let signer = Address::with_last_byte(0x42);
+    let nonce = reservation(signer);
+    let vault = nonce.vault;
+    let transaction_id = nonce.transaction_id;
+    handle.reserve_nonce(nonce).await?;
+    assert!(handle.load_transaction_summaries().await?.is_empty());
+
+    let raw = Bytes::from_static(&[0x02, 0x99, 0x44]);
+    let transaction_hash = alloy::primitives::keccak256(&raw);
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id,
+            transaction_hash,
+            raw_signed_transaction: raw,
+            updated_at: 1_800_000_001,
+        })
+        .await?;
+    let summaries = handle.load_transaction_summaries().await?;
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].vault, vault);
+    assert_eq!(summaries[0].transaction_hash, transaction_hash);
+    assert_eq!(summaries[0].state, TransactionState::Signed);
+    assert_eq!(summaries[0].included_block, None);
+
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(transaction_hash),
+            submitted_at: Some(1_800_000_002),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 1_800_000_002,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Submitted,
+            next_state: TransactionState::Included,
+            transaction_hash: Some(transaction_hash),
+            submitted_at: None,
+            included_block: Some(12),
+            included_block_hash: Some(B256::repeat_byte(0x12)),
+            updated_at: 1_800_000_003,
+        })
+        .await?;
+    assert_eq!(
+        handle.load_transaction_summaries().await?[0].state,
+        TransactionState::Included
+    );
+    service.shutdown().await?;
+
+    let reopened = reopen(&path).await?;
+    let summaries = reopened.handle().load_transaction_summaries().await?;
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].transaction_hash, transaction_hash);
+    assert_eq!(summaries[0].state, TransactionState::Included);
+    assert_eq!(summaries[0].included_block, Some(12));
+    reopened.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_format_one_state_migrates_atomically_to_current_format()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = directory.path().join("format-one.json");
@@ -225,7 +434,7 @@ async fn terminal_format_one_state_migrates_atomically_to_format_two()
 
     reopen(&path).await?.shutdown().await?;
     let migrated = read_json(&path)?;
-    assert_eq!(migrated["format_version"], 2);
+    assert_eq!(migrated["format_version"], 4);
     assert_eq!(migrated["canonical_blocks"][0]["block"]["gas_limit"], 0);
     Ok(())
 }
@@ -248,7 +457,7 @@ async fn rate_movement_and_nonce_are_reserved_and_released_atomically()
         Some(snapshot.clone())
     );
     let mut episode = rate_episode(vault, snapshot.context.block, 0x41);
-    episode.confirm_short(snapshot.context.block)?;
+    episode.confirm_short(snapshot.context.block, Assets(U256::from(1_000_u64)))?;
     handle.persist_rate_episode(episode.clone(), 101).await?;
     let mut plan = sample_plan(&snapshot);
     plan.reason = PlanReason::RateRebalance;
@@ -263,8 +472,8 @@ async fn rate_movement_and_nonce_are_reserved_and_released_atomically()
     let movement = handle
         .reserve_rate_movement_and_nonce(nonce, episode.episode_id, plan.projection.movement_assets)
         .await?;
-    assert_eq!(movement.budget_before, U256::from(250_u64));
-    assert_eq!(movement.budget_after, U256::from(150_u64));
+    assert_eq!(movement.budget_before, U256::from(1_000_u64));
+    assert_eq!(movement.budget_after, U256::from(900_u64));
     let active = handle
         .load_active_rate_episode(vault, episode.rate_group)
         .await?
@@ -288,12 +497,347 @@ async fn rate_movement_and_nonce_are_reserved_and_released_atomically()
         .await?
         .ok_or("rate episode disappeared after release")?;
     assert_eq!(active.pending_movement.0, U256::ZERO);
-    assert_eq!(active.available_budget()?, U256::from(250_u64));
+    assert_eq!(active.available_budget()?, U256::from(1_000_u64));
     service.shutdown().await?;
 
     let state = read_json(&path)?;
     assert_eq!(state["rate_movement_reservations"][0]["state"], "released");
     reopen(&path).await?.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_post_state_reconciliation_releases_rate_budget_for_fresh_planning()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("post-state-recovery.json");
+    let signer = Address::with_last_byte(0x72);
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let snapshot = sample_snapshot();
+    let included = block(13, 0x13, 0x12);
+    let confirmed = block(14, 0x14, 0x13);
+    for canonical in [snapshot.context.block, included, confirmed] {
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 999,
+                    block: canonical,
+                },
+                Vec::new(),
+                canonical.timestamp,
+            )
+            .await?;
+    }
+    handle
+        .persist_snapshot(snapshot.clone(), snapshot.context.block.timestamp)
+        .await?;
+    let mut episode = rate_episode(vault, snapshot.context.block, 0x41);
+    episode.confirm_short(snapshot.context.block, Assets(U256::from(1_000_u64)))?;
+    handle
+        .persist_rate_episode(episode.clone(), snapshot.context.block.timestamp)
+        .await?;
+    let mut plan = sample_plan(&snapshot);
+    plan.reason = PlanReason::RateRebalance;
+    plan.plan_id = PlanId(B256::repeat_byte(0xbc));
+    plan.episode_id = Some(episode.episode_id);
+    plan.solver_certificate.rate_episode_id = Some(episode.episode_id.0);
+    plan.solver_certificate.objective_branch = Some(episode.objective_branch);
+    plan.projection.movement_assets = U256::from(100_u64);
+    handle
+        .persist_plan(plan.clone(), snapshot.context.block.timestamp)
+        .await?;
+    let mut nonce = reservation(signer);
+    nonce.plan_id = Some(plan.plan_id);
+    handle
+        .reserve_rate_movement_and_nonce(nonce, episode.episode_id, U256::from(100_u64))
+        .await?;
+    let raw = Bytes::from_static(&[0x02, 0x45]);
+    let hash = alloy::primitives::keccak256(&raw);
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            transaction_hash: hash,
+            raw_signed_transaction: raw,
+            updated_at: snapshot.context.block.timestamp,
+        })
+        .await?;
+    for transition in [
+        TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(hash),
+            submitted_at: Some(snapshot.context.block.timestamp),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: snapshot.context.block.timestamp,
+        },
+        TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::Submitted,
+            next_state: TransactionState::Included,
+            transaction_hash: Some(hash),
+            submitted_at: None,
+            included_block: Some(included.number),
+            included_block_hash: Some(included.hash),
+            updated_at: included.timestamp,
+        },
+        TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::Included,
+            next_state: TransactionState::Confirmed,
+            transaction_hash: None,
+            submitted_at: None,
+            included_block: None,
+            included_block_hash: None,
+            updated_at: confirmed.timestamp,
+        },
+    ] {
+        handle.transition_transaction(transition).await?;
+    }
+    handle
+        .persist_conformance(ConformanceRecord {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            transaction_hash: hash,
+            block_number: included.number,
+            block_hash: included.hash,
+            action_count: 1,
+            movement_assets: U256::from(100_u64),
+            positive_loss_assets: U256::ZERO,
+            report_hash: B256::repeat_byte(0xc1),
+            validated_at: confirmed.timestamp,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::ConformanceValidated,
+            next_state: TransactionState::Failed,
+            transaction_hash: Some(hash),
+            submitted_at: None,
+            included_block: Some(included.number),
+            included_block_hash: Some(included.hash),
+            updated_at: confirmed.timestamp,
+        })
+        .await?;
+
+    assert!(handle.load_unresolved(signer).await?.is_none());
+    let active = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("rate episode disappeared after recoverable mismatch")?;
+    assert_eq!(active.pending_movement.0, U256::ZERO);
+    assert_eq!(active.available_budget()?, U256::from(1_000_u64));
+    service.shutdown().await?;
+    assert_eq!(
+        read_json(&path)?["rate_movement_reservations"][0]["state"],
+        "released"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciled_rate_movement_reopens_and_reconciles_after_reorg()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("reconciled-rate-reorg.json");
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let signer = Address::with_last_byte(0x72);
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    let ancestor = sample_snapshot().context.block;
+    for canonical in [ancestor, block(13, 0x13, 0x12), block(14, 0x14, 0x13)] {
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 999,
+                    block: canonical,
+                },
+                Vec::new(),
+                canonical.timestamp,
+            )
+            .await?;
+    }
+    let snapshot = sample_snapshot();
+    handle
+        .persist_snapshot(snapshot.clone(), ancestor.timestamp)
+        .await?;
+    let mut episode = rate_episode(vault, ancestor, 0x41);
+    episode.confirm_short(ancestor, Assets(U256::from(1_000_u64)))?;
+    handle
+        .persist_rate_episode(episode.clone(), ancestor.timestamp)
+        .await?;
+    let mut plan = sample_plan(&snapshot);
+    plan.reason = PlanReason::RateRebalance;
+    plan.plan_id = PlanId(B256::repeat_byte(0xbc));
+    plan.episode_id = Some(episode.episode_id);
+    plan.solver_certificate.rate_episode_id = Some(episode.episode_id.0);
+    plan.solver_certificate.objective_branch = Some(episode.objective_branch);
+    plan.projection.movement_assets = U256::from(100_u64);
+    handle
+        .persist_plan(plan.clone(), ancestor.timestamp)
+        .await?;
+    let mut nonce = reservation(signer);
+    nonce.plan_id = Some(plan.plan_id);
+    handle
+        .reserve_rate_movement_and_nonce(nonce, episode.episode_id, U256::from(100_u64))
+        .await?;
+    let raw = Bytes::from_static(&[0x02, 0x44]);
+    let hash = alloy::primitives::keccak256(&raw);
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            transaction_hash: hash,
+            raw_signed_transaction: raw,
+            updated_at: ancestor.timestamp,
+        })
+        .await?;
+    for transition in [
+        TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(hash),
+            submitted_at: Some(ancestor.timestamp),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: ancestor.timestamp,
+        },
+        TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::Submitted,
+            next_state: TransactionState::Included,
+            transaction_hash: Some(hash),
+            submitted_at: None,
+            included_block: Some(13),
+            included_block_hash: Some(B256::repeat_byte(0x13)),
+            updated_at: block(13, 0x13, 0x12).timestamp,
+        },
+        TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::Included,
+            next_state: TransactionState::Confirmed,
+            transaction_hash: None,
+            submitted_at: None,
+            included_block: None,
+            included_block_hash: None,
+            updated_at: block(14, 0x14, 0x13).timestamp,
+        },
+    ] {
+        handle.transition_transaction(transition).await?;
+    }
+    let conformance = ConformanceRecord {
+        transaction_id: TransactionId(B256::repeat_byte(0x71)),
+        transaction_hash: hash,
+        block_number: 13,
+        block_hash: B256::repeat_byte(0x13),
+        action_count: 1,
+        movement_assets: U256::from(100_u64),
+        positive_loss_assets: U256::ZERO,
+        report_hash: B256::repeat_byte(0xc1),
+        validated_at: block(14, 0x14, 0x13).timestamp,
+    };
+    handle.persist_conformance(conformance).await?;
+    let mut confirmed_episode = episode.clone();
+    confirmed_episode.reserve_pending(U256::from(100_u64))?;
+    confirmed_episode.confirm_pending(U256::from(100_u64))?;
+    let mut reconciled_snapshot = sample_snapshot();
+    reconciled_snapshot.context.block = block(14, 0x14, 0x13);
+    handle
+        .persist_reconciliation(
+            ReconciliationRecord {
+                transaction_id: TransactionId(B256::repeat_byte(0x71)),
+                snapshot_hash: reconciled_snapshot.snapshot_hash,
+                block: reconciled_snapshot.context.block,
+                current_rate_spread: U256::ONE,
+                service_constraints_met: true,
+                next_plan_needed: true,
+                pending_deployment_resolved: false,
+                report_hash: B256::repeat_byte(0xd1),
+                reconciled_at: reconciled_snapshot.context.block.timestamp,
+            },
+            reconciled_snapshot,
+            Some(confirmed_episode),
+        )
+        .await?;
+
+    handle
+        .rewind_to_ancestor(999, ancestor, ancestor.timestamp)
+        .await?;
+    let orphaned = handle
+        .load_unresolved(signer)
+        .await?
+        .ok_or("reconciled transaction was not reopened")?;
+    assert_eq!(orphaned.state, TransactionState::Orphaned);
+    let reopened = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("rate episode disappeared")?;
+    assert_eq!(reopened.confirmed_movement.0, U256::ZERO);
+    assert_eq!(reopened.pending_movement.0, U256::from(100_u64));
+
+    let reincluded = block(13, 0x23, 0x12);
+    let reconfirmed = block(14, 0x24, 0x23);
+    for canonical in [reincluded, reconfirmed] {
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 999,
+                    block: canonical,
+                },
+                Vec::new(),
+                canonical.timestamp,
+            )
+            .await?;
+    }
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id: orphaned.transaction_id,
+            expected_state: TransactionState::Orphaned,
+            next_state: TransactionState::Included,
+            transaction_hash: Some(hash),
+            submitted_at: None,
+            included_block: Some(reincluded.number),
+            included_block_hash: Some(reincluded.hash),
+            updated_at: reincluded.timestamp,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id: orphaned.transaction_id,
+            expected_state: TransactionState::Included,
+            next_state: TransactionState::Confirmed,
+            transaction_hash: None,
+            submitted_at: None,
+            included_block: None,
+            included_block_hash: None,
+            updated_at: reconfirmed.timestamp,
+        })
+        .await?;
+    handle
+        .persist_conformance(ConformanceRecord {
+            transaction_id: orphaned.transaction_id,
+            transaction_hash: hash,
+            block_number: reincluded.number,
+            block_hash: reincluded.hash,
+            action_count: 1,
+            movement_assets: U256::from(100_u64),
+            positive_loss_assets: U256::ZERO,
+            report_hash: B256::repeat_byte(0xe1),
+            validated_at: reconfirmed.timestamp,
+        })
+        .await?;
+    let context = handle
+        .load_pending_reconciliation_context(orphaned.transaction_id)
+        .await?
+        .ok_or("re-included rate transaction lost reconciliation context")?;
+    assert_eq!(
+        context.rate_movement.map(|movement| movement.state),
+        Some(morpho_v2_reallocator::storage::models::RateMovementReservationState::Pending)
+    );
+    service.shutdown().await?;
     Ok(())
 }
 
@@ -317,7 +861,7 @@ async fn corrupt_and_unknown_json_formats_fail_reopen() -> Result<(), Box<dyn st
         error,
         StorageError::FormatVersion {
             actual: 999,
-            expected: 2
+            expected: 4
         }
     ));
 
@@ -711,9 +1255,23 @@ async fn signer_lane_and_transition_graph_fail_closed() -> Result<(), Box<dyn st
     let directory = TempDir::new()?;
     let path = directory.path().join("lane.json");
     let signer = Address::with_last_byte(0x66);
+    let vault = reservation(signer).vault;
     let service = reopen(&path).await?;
     let handle = service.handle();
+    assert_eq!(handle.count_transactions_since(signer, 0).await?, 0);
     handle.reserve_nonce(reservation(signer)).await?;
+    assert_eq!(handle.count_transactions_since(signer, 0).await?, 0);
+    assert_eq!(
+        handle
+            .count_transactions_since(signer, 1_800_000_001)
+            .await?,
+        0
+    );
+    assert_eq!(handle.movement_since(vault, 0).await?, U256::ZERO);
+    assert_eq!(
+        handle.movement_since(vault, 1_800_000_001).await?,
+        U256::ZERO
+    );
     let mut second = reservation(signer);
     second.transaction_id = TransactionId(B256::repeat_byte(0x73));
     second.nonce = 8;
@@ -736,6 +1294,41 @@ async fn signer_lane_and_transition_graph_fail_closed() -> Result<(), Box<dyn st
             .await,
         Err(StorageError::InvalidTransition { .. })
     ));
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::NonceReserved,
+            next_state: TransactionState::AbortedBeforeSigning,
+            transaction_hash: None,
+            submitted_at: None,
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 2,
+        })
+        .await?;
+    let second_vault = VaultAddress(Address::with_last_byte(0x12));
+    let mut second_vault_reservation = reservation(signer);
+    second_vault_reservation.transaction_id = TransactionId(B256::repeat_byte(0x74));
+    second_vault_reservation.vault = second_vault;
+    second_vault_reservation.nonce = 8;
+    second_vault_reservation.movement_assets = U256::from(7_u8);
+    handle.reserve_nonce(second_vault_reservation).await?;
+    assert_eq!(handle.movement_since(vault, 0).await?, U256::ZERO);
+    assert_eq!(handle.movement_since(second_vault, 0).await?, U256::ZERO);
+    let signed_bytes = Bytes::from_static(&[0x02, 0x99]);
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id: TransactionId(B256::repeat_byte(0x74)),
+            transaction_hash: alloy::primitives::keccak256(&signed_bytes),
+            raw_signed_transaction: signed_bytes,
+            updated_at: 3,
+        })
+        .await?;
+    assert_eq!(handle.count_transactions_since(signer, 0).await?, 1);
+    assert_eq!(
+        handle.movement_since(second_vault, 0).await?,
+        U256::from(7_u8)
+    );
     service.shutdown().await?;
     Ok(())
 }
@@ -797,7 +1390,7 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
         .load_unresolved(signer)
         .await?
         .ok_or("replacement must remain unresolved")?;
-    assert_eq!(recovered.state, TransactionState::Submitted);
+    assert_eq!(recovered.state, TransactionState::ReplacementSigned);
     assert_eq!(recovered.transaction_hash, Some(replacement_hash));
     assert_eq!(recovered.raw_signed_transaction, Some(replacement_raw));
     assert_eq!(recovered.current_max_fee_per_gas, U256::from(120_u64));
@@ -817,7 +1410,7 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
     handle
         .transition_transaction(TransactionTransition {
             transaction_id,
-            expected_state: TransactionState::Submitted,
+            expected_state: TransactionState::ReplacementSigned,
             next_state: TransactionState::Replaced,
             transaction_hash: Some(replacement_hash),
             submitted_at: Some(13),
@@ -845,7 +1438,7 @@ async fn replacement_and_cancellation_bytes_survive_every_boundary()
     handle
         .transition_transaction(TransactionTransition {
             transaction_id,
-            expected_state: TransactionState::Replaced,
+            expected_state: TransactionState::CancellationSigned,
             next_state: TransactionState::CancellationSubmitted,
             transaction_hash: Some(cancellation_hash),
             submitted_at: Some(15),
@@ -963,6 +1556,7 @@ fn sample_snapshot() -> ExactVaultSnapshot {
     let context = StateContext {
         chain_id: 999,
         block: block(12, 0x12, 0x11),
+        evm_timestamp: block(12, 0x12, 0x11).timestamp,
         block_hash_binding: BlockHashBinding::Proven,
         static_config_revision: B256::repeat_byte(0xc1),
         dynamic_topology_revision: B256::repeat_byte(0xd1),
@@ -999,6 +1593,7 @@ fn sample_snapshot() -> ExactVaultSnapshot {
             required_dead_shares: U256::from(1_u64),
         },
         adapters: BTreeMap::new(),
+        enabled_adapters: BTreeSet::new(),
         liquidity_adapter: None,
         positions: BTreeMap::new(),
         markets: BTreeMap::new(),
@@ -1029,6 +1624,9 @@ fn sample_plan(snapshot: &ExactVaultSnapshot) -> V2Plan {
         snapshot: snapshot.context.clone(),
         config_revision: snapshot.context.static_config_revision,
         topology_revision: snapshot.context.dynamic_topology_revision,
+        read_set_revision: 0,
+        latest_relevant_event_block: snapshot.context.block.number,
+        planner_generation: 0,
         actions: vec![V2Action::Allocate {
             position: morpho_v2_reallocator::domain::PositionKey(B256::repeat_byte(0x31)),
             adapter: morpho_v2_reallocator::domain::AdapterAddress(Address::with_last_byte(0x20)),
@@ -1041,6 +1639,7 @@ fn sample_plan(snapshot: &ExactVaultSnapshot) -> V2Plan {
             after_spread: U256::from(1_u64),
             immediate_loss_assets: U256::ZERO,
             terminal_value_delta_assets: I256::ZERO,
+            expected_gain_assets: U256::ZERO,
         },
         solver_certificate: SolverCertificate {
             candidate_lattice_hash: B256::repeat_byte(0xcc),
@@ -1146,5 +1745,21 @@ async fn segmented_journal_recovers_partial_tail_and_restored_backup()
         Some(block(130, 130, 129))
     );
     restored.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_mailbox_exposes_bounded_queue_telemetry() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("state.json"), 4, 1)?;
+    let handle = service.handle();
+    assert_eq!(handle.queue_stats().depth, 0);
+    let _ = handle.load_cursor(1).await?;
+    let stats = handle.queue_stats();
+    assert_eq!(stats.depth, 0);
+    assert_eq!(stats.oldest_age_millis, 0);
+    assert!(stats.high_water >= 1);
+    service.shutdown().await?;
     Ok(())
 }

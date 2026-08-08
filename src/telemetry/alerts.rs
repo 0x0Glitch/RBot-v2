@@ -30,6 +30,17 @@ pub enum AlertSeverity {
     P2,
 }
 
+impl AlertSeverity {
+    /// Returns whether an external operator transport should deliver this severity.
+    ///
+    /// P2 events remain available in bounded API history and structured logs, but are routine
+    /// lifecycle information rather than incidents requiring an operator notification.
+    #[must_use]
+    pub const fn operator_actionable(self) -> bool {
+        matches!(self, Self::P0 | Self::P1)
+    }
+}
+
 /// Bounded alert kind suitable for deduplication and metric labels.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,7 +118,10 @@ impl Alert {
         if summary.is_empty() || detail.is_empty() || summary.len() > 160 || detail.len() > 2_000 {
             return Err(AlertError::InvalidPayload);
         }
-        let identity = serde_json::to_vec(&(kind, vault, &summary, state_hash))
+        // The exact state hash is evidence, not incident identity. Including it here would turn
+        // one persistent paused condition into a new Telegram/PagerDuty alert on every block.
+        // Severity is part of identity so a warning cannot suppress a later critical escalation.
+        let identity = serde_json::to_vec(&(severity, kind, vault, &summary))
             .map_err(|_| AlertError::InvalidPayload)?;
         Ok(Self {
             dedup_key: keccak256(identity),
@@ -208,9 +222,15 @@ impl AlertDispatcher {
             }
             state.history.push_back(alert.clone());
         }
+        if !alert.severity.operator_actionable() {
+            return Ok(true);
+        }
         let mut failed = false;
         for transport in &self.transports {
-            if transport.send(&alert).await.is_err() {
+            let delivery =
+                tokio::time::timeout(std::time::Duration::from_secs(12), transport.send(&alert))
+                    .await;
+            if !matches!(delivery, Ok(Ok(()))) {
                 failed = true;
             }
         }
@@ -224,5 +244,121 @@ impl AlertDispatcher {
     /// Returns bounded alert history in creation order.
     pub async fn history(&self) -> Vec<Alert> {
         self.state.lock().await.history.iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use alloy::primitives::B256;
+    use async_trait::async_trait;
+
+    use super::{
+        Alert, AlertDispatcher, AlertKind, AlertSeverity, AlertTransport, AlertTransportError,
+    };
+
+    struct CountingTransport(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl AlertTransport for CountingTransport {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        async fn send(&self, _alert: &Alert) -> Result<(), AlertTransportError> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    fn alert(
+        severity: AlertSeverity,
+        summary: &str,
+        state_hash: B256,
+        created_at: u64,
+    ) -> Result<Alert, super::AlertError> {
+        Alert::new(
+            severity,
+            AlertKind::CanonicalChainStopped,
+            None,
+            summary.to_owned(),
+            "stable redacted incident detail".to_owned(),
+            Some(state_hash),
+            created_at,
+        )
+    }
+
+    #[tokio::test]
+    async fn external_delivery_is_actionable_stable_and_rate_limited()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let dispatcher = AlertDispatcher::new(
+            vec![Arc::new(CountingTransport(Arc::clone(&deliveries)))],
+            3_600,
+        )?;
+
+        assert!(
+            dispatcher
+                .emit(alert(
+                    AlertSeverity::P1,
+                    "Canonical RPC is unavailable",
+                    B256::repeat_byte(1),
+                    10_000,
+                )?)
+                .await?
+        );
+        assert!(
+            !dispatcher
+                .emit(alert(
+                    AlertSeverity::P1,
+                    "Canonical RPC is unavailable",
+                    B256::repeat_byte(2),
+                    10_060,
+                )?)
+                .await?
+        );
+        assert_eq!(deliveries.load(Ordering::Acquire), 1);
+
+        assert!(
+            dispatcher
+                .emit(alert(
+                    AlertSeverity::P2,
+                    "Routine informational event",
+                    B256::repeat_byte(3),
+                    10_120,
+                )?)
+                .await?
+        );
+        assert_eq!(deliveries.load(Ordering::Acquire), 1);
+        assert_eq!(dispatcher.history().await.len(), 2);
+
+        assert!(
+            dispatcher
+                .emit(alert(
+                    AlertSeverity::P1,
+                    "Canonical RPC is unavailable",
+                    B256::repeat_byte(4),
+                    13_600,
+                )?)
+                .await?
+        );
+        assert_eq!(deliveries.load(Ordering::Acquire), 2);
+
+        assert!(
+            dispatcher
+                .emit(alert(
+                    AlertSeverity::P0,
+                    "Canonical RPC is unavailable",
+                    B256::repeat_byte(5),
+                    13_601,
+                )?)
+                .await?
+        );
+        assert_eq!(deliveries.load(Ordering::Acquire), 3);
+        Ok(())
     }
 }

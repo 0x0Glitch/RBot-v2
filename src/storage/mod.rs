@@ -31,6 +31,9 @@ pub enum StorageError {
     /// Bounded actor is unavailable.
     #[error("storage actor stopped")]
     ActorStopped,
+    /// A bounded command send or durability acknowledgment exceeded its deadline.
+    #[error("storage actor command timed out")]
+    CommandTimeout,
     /// Dedicated actor thread panicked.
     #[error("storage actor panicked")]
     ActorPanicked,

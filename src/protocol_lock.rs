@@ -58,8 +58,21 @@ pub enum IdentityKind {
 pub enum ProxyPolicy {
     /// Runtime must be a direct immutable deployment.
     RejectProxy,
-    /// Runtime is an immutable proxy with pinned implementation and storage slots.
-    PinnedImmutableProxy,
+    /// Runtime is a proxy whose implementation slot, address and runtime are pinned.
+    #[serde(rename = "pinned_proxy", alias = "pinned_immutable_proxy")]
+    PinnedProxy,
+}
+
+/// Exact mutable-proxy implementation identity verified continuously before planning/signing.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyImplementationIdentity {
+    /// Storage slot containing a canonically left-padded implementation address.
+    pub storage_slot: String,
+    /// Expected current implementation address.
+    pub address: String,
+    /// Keccak-256 runtime bytecode hash of the implementation.
+    pub runtime_code_hash: String,
 }
 
 /// Raw deployed contract identity and its exact reviewed source profile.
@@ -90,6 +103,9 @@ pub struct ContractIdentity {
     pub constructor_immutables: BTreeMap<String, String>,
     /// Explicit proxy policy.
     pub proxy_policy: ProxyPolicy,
+    /// Required implementation identity when `proxy_policy` is `pinned_proxy`.
+    #[serde(default)]
+    pub proxy_implementation: Option<ProxyImplementationIdentity>,
     /// Stable reviewed behavior profile.
     pub behavior_profile: String,
 }
@@ -148,8 +164,21 @@ pub struct ValidatedContractIdentity {
     pub constructor_immutables: BTreeMap<String, String>,
     /// Proxy policy.
     pub proxy_policy: ProxyPolicy,
+    /// Parsed implementation identity for a pinned proxy.
+    pub proxy_implementation: Option<ValidatedProxyImplementationIdentity>,
     /// Behavior profile.
     pub behavior_profile: String,
+}
+
+/// Parsed proxy storage and implementation runtime identity.
+#[derive(Clone, Debug, Serialize)]
+pub struct ValidatedProxyImplementationIdentity {
+    /// Exact implementation storage slot.
+    pub storage_slot: B256,
+    /// Expected implementation address stored in that slot.
+    pub address: Address,
+    /// Expected implementation runtime hash.
+    pub runtime_code_hash: B256,
 }
 
 /// Protocol lock parsing or fail-closed validation failure.
@@ -209,6 +238,23 @@ impl ProtocolLock {
             for (name, value) in &contract.constructor_immutables {
                 if is_unset(value) {
                     missing.push(format!("{prefix}.constructor_immutables.{name}"));
+                }
+            }
+            if contract.proxy_policy == ProxyPolicy::PinnedProxy {
+                match &contract.proxy_implementation {
+                    Some(proxy) => {
+                        if is_unset(&proxy.storage_slot) {
+                            missing.push(format!("{prefix}.proxy_implementation.storage_slot"));
+                        }
+                        if is_unset(&proxy.address) {
+                            missing.push(format!("{prefix}.proxy_implementation.address"));
+                        }
+                        if is_unset(&proxy.runtime_code_hash) {
+                            missing
+                                .push(format!("{prefix}.proxy_implementation.runtime_code_hash"));
+                        }
+                    }
+                    None => missing.push(format!("{prefix}.proxy_implementation")),
                 }
             }
         }
@@ -290,6 +336,57 @@ impl ProtocolLock {
                 ));
             }
             kinds.insert(item.kind);
+            let proxy_implementation = match (item.proxy_policy, item.proxy_implementation) {
+                (ProxyPolicy::RejectProxy, None) => None,
+                (ProxyPolicy::RejectProxy, Some(_)) => {
+                    return Err(invalid(
+                        "contract.proxy_implementation",
+                        "direct deployments cannot declare a proxy implementation",
+                    ));
+                }
+                (ProxyPolicy::PinnedProxy, None) => {
+                    return Err(invalid(
+                        "contract.proxy_implementation",
+                        "pinned proxies require slot, address and implementation hash",
+                    ));
+                }
+                (ProxyPolicy::PinnedProxy, Some(proxy)) => {
+                    let storage_slot = B256::from_str(&proxy.storage_slot).map_err(|_| {
+                        invalid(
+                            "contract.proxy_implementation.storage_slot",
+                            "invalid storage slot",
+                        )
+                    })?;
+                    let implementation = Address::from_str(&proxy.address).map_err(|_| {
+                        invalid(
+                            "contract.proxy_implementation.address",
+                            "invalid implementation address",
+                        )
+                    })?;
+                    let implementation_hash =
+                        B256::from_str(&proxy.runtime_code_hash).map_err(|_| {
+                            invalid(
+                                "contract.proxy_implementation.runtime_code_hash",
+                                "invalid implementation runtime hash",
+                            )
+                        })?;
+                    if storage_slot.is_zero()
+                        || implementation.is_zero()
+                        || implementation == address
+                        || implementation_hash.is_zero()
+                    {
+                        return Err(invalid(
+                            "contract.proxy_implementation",
+                            "slot, distinct implementation and runtime hash must be nonzero",
+                        ));
+                    }
+                    Some(ValidatedProxyImplementationIdentity {
+                        storage_slot,
+                        address: implementation,
+                        runtime_code_hash: implementation_hash,
+                    })
+                }
+            };
             contracts.push(ValidatedContractIdentity {
                 name: item.name,
                 kind: item.kind,
@@ -303,6 +400,7 @@ impl ProtocolLock {
                 optimizer_runs: item.optimizer_runs,
                 constructor_immutables: item.constructor_immutables,
                 proxy_policy: item.proxy_policy,
+                proxy_implementation,
                 behavior_profile: item.behavior_profile,
             });
         }
@@ -313,7 +411,6 @@ impl ProtocolLock {
             IdentityKind::DirectAdapter,
             IdentityKind::Multicall3,
             IdentityKind::AssetToken,
-            IdentityKind::AdapterRegistry,
         ] {
             if !kinds.contains(&required) {
                 return Err(invalid(

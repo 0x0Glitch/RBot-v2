@@ -90,12 +90,12 @@ impl RemoteRoutineSigner {
             .json(&request)
             .send()
             .await
-            .map_err(|error| SignerError::Transport(error.to_string()))?
+            .map_err(|_| SignerError::Transport)?
             .error_for_status()
-            .map_err(|error| SignerError::Transport(error.to_string()))?
+            .map_err(|_| SignerError::Transport)?
             .json::<RemoteResponse>()
             .await
-            .map_err(|error| SignerError::Transport(error.to_string()))?;
+            .map_err(|_| SignerError::Transport)?;
         if response.request_id != request.request_id {
             return Err(SignerError::Mutation);
         }

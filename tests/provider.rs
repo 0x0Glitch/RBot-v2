@@ -1,12 +1,15 @@
 //! HTTP provider capability and role-boundary tests.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use std::collections::BTreeSet;
 
 use alloy::primitives::{Address, B256, Bytes};
 use morpho_v2_reallocator::chain::provider::{
-    CapabilityProbe, ChainDataProvider, HttpProvider, ProviderError, ProviderRole, RpcErrorCategory,
+    CapabilityProbe, ChainDataProvider, FeeQuoteProvider, HttpProvider, ProviderError,
+    ProviderRole, RpcErrorCategory,
 };
+use morpho_v2_reallocator::config::BlockOpportunityPolicy;
 use serde_json::{Value, json};
 use url::Url;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
@@ -38,6 +41,8 @@ impl Respond for RpcResponder {
                 "eth_getCode" => json!("0x6000"),
                 "eth_getStorageAt" => json!(B256::ZERO),
                 "eth_getTransactionCount" => json!("0x7"),
+                "eth_gasPrice" => json!("0x5f5e100"),
+                "eth_maxPriorityFeePerGas" => json!("0x0"),
                 "eth_getTransactionByHash" | "eth_getTransactionReceipt" => Value::Null,
                 "eth_usingBigBlocks" => json!(false),
                 _ => return ResponseTemplate::new(200).set_body_json(json!({
@@ -95,11 +100,14 @@ async fn capability_probe_covers_required_methods_with_one_latest_header_call()
                 signer: Address::with_last_byte(2),
                 known_transaction_hash: B256::repeat_byte(3),
             },
+            BlockOpportunityPolicy::HyperEvmFastBlocks {
+                gas_limit: 2_000_000,
+            },
         )
         .await?;
     assert_eq!(capabilities.chain_id, 999);
     assert_eq!(capabilities.latest_head.number, 10);
-    assert!(!capabilities.signer_uses_big_blocks);
+    assert_eq!(capabilities.signer_uses_big_blocks, Some(false));
 
     let requests = server.received_requests().await.unwrap();
     let methods = requests
@@ -121,6 +129,8 @@ async fn capability_probe_covers_required_methods_with_one_latest_header_call()
         "eth_getCode",
         "eth_getStorageAt",
         "eth_getTransactionCount",
+        "eth_gasPrice",
+        "eth_maxPriorityFeePerGas",
         "eth_getTransactionByHash",
         "eth_getTransactionReceipt",
         "eth_usingBigBlocks",
@@ -135,6 +145,52 @@ async fn capability_probe_covers_required_methods_with_one_latest_header_call()
         1
     );
     assert!(!methods.iter().any(|method| method == "eth_blockNumber"));
+    let quote = provider.fee_quote().await?;
+    assert_eq!(
+        quote.gas_price,
+        alloy::primitives::U256::from(100_000_000_u64)
+    );
+    assert_eq!(
+        quote.max_priority_fee_per_gas,
+        alloy::primitives::U256::ZERO
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn standard_evm_capability_probe_skips_hyperevm_only_rpc()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(RpcResponder)
+        .mount(&server)
+        .await;
+    let provider = HttpProvider::new("test".to_owned(), Url::parse(&server.uri())?, all_roles())?;
+    let capabilities = provider
+        .probe_capabilities(
+            999,
+            &CapabilityProbe {
+                read_target: Address::with_last_byte(1),
+                read_calldata: Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]),
+                signer: Address::with_last_byte(2),
+                known_transaction_hash: B256::repeat_byte(3),
+            },
+            BlockOpportunityPolicy::EveryCanonicalBlock,
+        )
+        .await?;
+    assert_eq!(capabilities.signer_uses_big_blocks, None);
+
+    let requests = server.received_requests().await.unwrap();
+    let methods = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| {
+            body.get("method")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert!(!methods.iter().any(|method| method == "eth_usingBigBlocks"));
     Ok(())
 }
 
@@ -188,6 +244,47 @@ async fn forbidden_optional_block_receipts_are_treated_as_unsupported()
         })
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transport_rate_limit_and_server_failures_are_retryable_and_secret_safe()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (status, expected) in [
+        (429_u16, RpcErrorCategory::RateLimited),
+        (503_u16, RpcErrorCategory::ServerUnavailable),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let provider = HttpProvider::new(
+            "outage".to_owned(),
+            Url::parse(&server.uri())?,
+            BTreeSet::from([ProviderRole::Head]),
+        )?;
+        let error = match provider.latest_header().await {
+            Ok(_) => panic!("HTTP outage must reject the read"),
+            Err(error) => error,
+        };
+        assert_eq!(error.rpc_category(), expected);
+        assert!(error.is_transient_outage());
+        assert!(!error.to_string().contains(&server.uri()));
+    }
+
+    let provider = HttpProvider::new(
+        "transport".to_owned(),
+        Url::parse("http://127.0.0.1:1")?,
+        BTreeSet::from([ProviderRole::Head]),
+    )?;
+    let error = match provider.latest_header().await {
+        Ok(_) => panic!("unreachable transport must reject the read"),
+        Err(error) => error,
+    };
+    assert_eq!(error.rpc_category(), RpcErrorCategory::TransportUnavailable);
+    assert!(error.is_transient_outage());
+    assert!(!error.to_string().contains("127.0.0.1"));
     Ok(())
 }
 

@@ -43,7 +43,9 @@ pub fn accrue_market(
     if stored.total_borrow_assets > stored.total_supply_assets || stored.fee > WAD {
         return Err(MathError::Invariant);
     }
-    let elapsed = timestamp - stored.last_update;
+    let elapsed = timestamp
+        .checked_sub(stored.last_update)
+        .ok_or(MathError::TimestampRegression)?;
     let (average_rate, ending_rate_at_target) = if elapsed == 0 {
         (U256::ZERO, irm.stored_rate_at_target)
     } else {
