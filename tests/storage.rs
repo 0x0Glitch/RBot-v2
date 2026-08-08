@@ -21,8 +21,8 @@ use morpho_v2_reallocator::storage::StorageError;
 use morpho_v2_reallocator::storage::actor::StorageService;
 use morpho_v2_reallocator::storage::models::{
     CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
-    NonceReservation, ReconciliationRecord, SignedAttemptRecord, SignedTransactionRecord,
-    TransactionAttemptKind, TransactionState, TransactionTransition,
+    FinalPreflightRecord, NonceReservation, ReconciliationRecord, SignedAttemptRecord,
+    SignedTransactionRecord, TransactionAttemptKind, TransactionState, TransactionTransition,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -291,6 +291,46 @@ async fn json_format_and_reopen_are_stable() -> Result<(), Box<dyn std::error::E
     std::fs::write(&path, serde_json::to_vec_pretty(&additive_upgrade)?)?;
     reopen(&path).await?.shutdown().await?;
     assert!(read_json(&path)?["transaction_attempts"].is_array());
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_preflight_replay_is_idempotent_but_conflicts_fail_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let service = reopen(&directory.path().join("preflight-idempotence.json")).await?;
+    let handle = service.handle();
+    let snapshot = sample_snapshot();
+    let plan = sample_plan(&snapshot);
+    handle.persist_snapshot(snapshot.clone(), 100).await?;
+    handle.persist_plan(plan.clone(), 101).await?;
+    let record = FinalPreflightRecord {
+        preflight_id: B256::repeat_byte(0x71),
+        plan_id: plan.plan_id,
+        head: snapshot.context.block,
+        simulation_before_hash: B256::repeat_byte(0x72),
+        simulation_after_hash: B256::repeat_byte(0x73),
+        event_cursor_number: snapshot.context.block.number,
+        calldata_hash: B256::repeat_byte(0x74),
+        gas_estimate: 500_000,
+        signed_gas_limit: 575_000,
+        expected_actions: Vec::new(),
+        completed_monotonic_nanos: 10,
+        created_at: snapshot.context.block.timestamp,
+    };
+
+    handle.persist_final_preflight(record.clone()).await?;
+    handle.persist_final_preflight(record.clone()).await?;
+    let conflict = FinalPreflightRecord {
+        gas_estimate: record.gas_estimate.saturating_add(1),
+        ..record
+    };
+    assert!(matches!(
+        handle.persist_final_preflight(conflict).await,
+        Err(StorageError::Invariant("conflicting preflight identity"))
+    ));
+
+    service.shutdown().await?;
     Ok(())
 }
 

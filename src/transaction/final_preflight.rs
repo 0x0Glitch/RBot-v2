@@ -16,7 +16,7 @@ use crate::{
         TransactionSimulationProvider,
     },
     config::{SnapshotMode, ValidatedConfig, ValidatedVaultConfig, VaultStrategy},
-    domain::{BlockRef, PlanReason, RateObjectiveBranch, TransactionId},
+    domain::{BlockRef, PlanId, PlanReason, RateObjectiveBranch, TransactionId},
     morpho::blue_math::{WAD, mul_div_up},
     storage::{
         StorageError,
@@ -479,11 +479,14 @@ pub async fn execute_one_head_preflight(
         .await?;
     let elapsed_nanos =
         u64::try_from(started.elapsed().as_nanos()).map_err(|_| PreflightError::ClockRange)?;
-    let preflight_id = context_hash(&[
-        plan.plan().plan_id.0.as_slice(),
-        head.hash.as_slice(),
-        calldata_hash.as_slice(),
-    ]);
+    let preflight_id = final_preflight_id(
+        request.transaction_id,
+        plan.plan().plan_id,
+        head,
+        calldata_hash,
+        simulation_before_hash,
+        simulation_after_hash,
+    );
     storage
         .persist_final_preflight(FinalPreflightRecord {
             preflight_id,
@@ -565,17 +568,21 @@ pub async fn execute_one_head_preflight(
         || gate_nonce != request.nonce
         || u128::from(elapsed_millis) > config.app.snapshot.maximum_snapshot_to_sign_latency_millis
     {
+        let latency_exceeded = u128::from(elapsed_millis)
+            > config.app.snapshot.maximum_snapshot_to_sign_latency_millis;
         tracing::debug!(
             stage = "signing_gate",
             elapsed_ms = elapsed_millis,
+            strict_context_changed,
+            invalidation_queued,
+            nonce_changed = gate_nonce != request.nonce,
+            latency_exceeded,
             "same-head preflight deferred"
         );
         abort_unsigned_rebalance(storage, &durable, head.timestamp).await?;
         return Err(if gate_nonce != request.nonce {
             PreflightError::NonceChanged
-        } else if elapsed_millis as u128
-            > config.app.snapshot.maximum_snapshot_to_sign_latency_millis
-        {
+        } else if latency_exceeded {
             PreflightError::Latency
         } else {
             PreflightError::RefreshAndReplan
@@ -864,6 +871,24 @@ fn context_hash(parts: &[&[u8]]) -> B256 {
     keccak256(bytes)
 }
 
+fn final_preflight_id(
+    transaction_id: TransactionId,
+    plan_id: PlanId,
+    head: BlockRef,
+    calldata_hash: B256,
+    simulation_before_hash: B256,
+    simulation_after_hash: B256,
+) -> B256 {
+    context_hash(&[
+        transaction_id.0.as_slice(),
+        plan_id.0.as_slice(),
+        head.hash.as_slice(),
+        calldata_hash.as_slice(),
+        simulation_before_hash.as_slice(),
+        simulation_after_hash.as_slice(),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -872,9 +897,13 @@ mod tests {
 
     use super::{
         ExecutionReservationManager, InclusionScenarioKind, PreflightError, ReservationError,
-        inclusion_assumptions, require_head, require_top_k_gain, required_top_k_gain_assets,
+        final_preflight_id, inclusion_assumptions, require_head, require_top_k_gain,
+        required_top_k_gain_assets,
     };
-    use crate::{config::AppConfig, domain::BlockRef};
+    use crate::{
+        config::AppConfig,
+        domain::{BlockRef, PlanId, TransactionId},
+    };
 
     fn head(timestamp: u64) -> BlockRef {
         BlockRef {
@@ -934,6 +963,33 @@ mod tests {
             require_head(moved, expected),
             Err(PreflightError::RefreshAndReplan)
         ));
+    }
+
+    #[test]
+    fn preflight_identity_is_unique_per_transaction_attempt() {
+        let canonical = head(1_900_000_000);
+        let plan_id = PlanId(B256::repeat_byte(0x11));
+        let calldata_hash = B256::repeat_byte(0x22);
+        let simulation_before_hash = B256::repeat_byte(0x33);
+        let simulation_after_hash = B256::repeat_byte(0x44);
+        let first = final_preflight_id(
+            TransactionId(B256::repeat_byte(0x51)),
+            plan_id,
+            canonical,
+            calldata_hash,
+            simulation_before_hash,
+            simulation_after_hash,
+        );
+        let retry = final_preflight_id(
+            TransactionId(B256::repeat_byte(0x52)),
+            plan_id,
+            canonical,
+            calldata_hash,
+            simulation_before_hash,
+            simulation_after_hash,
+        );
+
+        assert_ne!(first, retry);
     }
 
     #[test]

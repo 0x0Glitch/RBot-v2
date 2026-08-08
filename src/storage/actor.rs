@@ -1878,12 +1878,16 @@ fn run_actor(
                     {
                         return Err(StorageError::Invariant("preflight references unknown plan"));
                     }
-                    if state
+                    if let Some(existing) = state
                         .final_preflights
                         .iter()
-                        .any(|entry| entry.preflight_id == record.preflight_id)
+                        .find(|entry| entry.preflight_id == record.preflight_id)
                     {
-                        return Err(StorageError::Invariant("duplicate preflight identity"));
+                        return if existing == &record {
+                            Ok(())
+                        } else {
+                            Err(StorageError::Invariant("conflicting preflight identity"))
+                        };
                     }
                     state.final_preflights.push(record);
                     Ok(())

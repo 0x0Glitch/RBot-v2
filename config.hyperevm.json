@@ -369,7 +369,7 @@
       "maximum_signing_snapshot_age_blocks": 0,
       "maximum_snapshot_retries": 5,
       "maximum_evm_timestamp_lag_seconds": 1,
-      "maximum_snapshot_to_sign_latency": "750ms",
+      "maximum_snapshot_to_sign_latency": "10s",
       "maximum_sign_to_broadcast_latency": "5s"
     },
     "execution": {
