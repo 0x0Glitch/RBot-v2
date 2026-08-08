@@ -220,6 +220,7 @@ advanced:
       entry_score_wad: "50000000000000000" # Rebalance when >5% of direct capital must move.
       target_score_wad: "10000000000000000" # Stop at or below 1% target distance.
       minimum_improvement_score_wad: "10000000000000000" # Require at least 1% improvement.
+      enforce_gas_economic_gate: true # Require projected 24-hour gain to cover conservative gas cost.
       minimum_net_gain_assets: "0" # Asset units remaining after gas, loss, and safety multiplier.
       gas_cost_multiplier: 3
       native_token_price_ceiling_asset_wad: "0" # Must be set for Execute; vault asset per native token.

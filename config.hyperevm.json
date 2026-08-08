@@ -3,7 +3,7 @@
   "normal": {
     "node": {
       "instance_id": "morpho-v2-reallocator-hyperevm",
-      "mode": "shadow",
+      "mode": "execute",
       "data_dir": "./data/hyperevm"
     },
     "chain": {
@@ -435,6 +435,7 @@
         "entry_score_wad": "50000000000000000",
         "target_score_wad": "10000000000000000",
         "minimum_improvement_score_wad": "10000000000000000",
+        "enforce_gas_economic_gate": false,
         "minimum_net_gain_assets": "1000",
         "gas_cost_multiplier": 3,
         "native_token_price_ceiling_asset_wad": "100000000000000000000",

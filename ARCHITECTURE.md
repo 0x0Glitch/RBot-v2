@@ -6,7 +6,7 @@
 - Review branch: `agent/production-runtime`
 - Live chain: HyperEVM, chain ID `999`
 - Live Vault V2: `0x51254785367d73A10a2Ea7d44B8e97b749BfbE8b`
-- Checked-in operating mode: Shadow
+- Checked-in operating mode: Execute
 - Storage: durable JSON checkpoint plus checksummed segmented journal
 - Primary strategy in the checked-in HyperEVM configuration: Top-K APY diversification
 - Last updated: 2026-08-08

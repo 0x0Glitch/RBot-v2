@@ -692,6 +692,9 @@ fn validate_top_k_economic_gate(
         return Ok(());
     }
     let settings = &config.app.strategy.top_k_apy;
+    if !settings.enforce_gas_economic_gate {
+        return Ok(());
+    }
     if settings.native_token_price_ceiling_asset_wad.is_zero() {
         return Err(PreflightError::EconomicGate);
     }
@@ -702,11 +705,15 @@ fn validate_top_k_economic_gate(
         settings,
         plan.plan().projection.immediate_loss_assets,
     )?;
-    let gain = plan.plan().projection.expected_gain_assets;
+    require_top_k_gain(plan.plan().projection.expected_gain_assets, required)
+}
+
+fn require_top_k_gain(gain: U256, required: U256) -> Result<(), PreflightError> {
     if gain < required {
-        return Err(PreflightError::EconomicGate);
+        Err(PreflightError::EconomicGate)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 fn required_top_k_gain_assets(
@@ -865,7 +872,7 @@ mod tests {
 
     use super::{
         ExecutionReservationManager, InclusionScenarioKind, PreflightError, ReservationError,
-        inclusion_assumptions, require_head, required_top_k_gain_assets,
+        inclusion_assumptions, require_head, require_top_k_gain, required_top_k_gain_assets,
     };
     use crate::{config::AppConfig, domain::BlockRef};
 
@@ -965,5 +972,11 @@ mod tests {
             U256::ZERO,
         );
         assert_eq!(required.ok(), Some(U256::from(301_000_u64)));
+        assert!(!config.app.strategy.top_k_apy.enforce_gas_economic_gate);
+        assert!(require_top_k_gain(U256::from(301_000_u64), U256::from(301_000_u64)).is_ok());
+        assert!(matches!(
+            require_top_k_gain(U256::from(300_999_u64), U256::from(301_000_u64)),
+            Err(PreflightError::EconomicGate)
+        ));
     }
 }

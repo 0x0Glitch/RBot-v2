@@ -84,7 +84,9 @@ fn checked_in_hyperevm_vault_configuration_is_exact_and_complete() {
         alloy::primitives::U256::ZERO
     );
     assert_eq!(validated.app.strategy.immediate_tranche_bps, 9_000);
+    assert_eq!(validated.app.node.mode, RuntimeMode::Execute);
     assert_eq!(vault.strategy, VaultStrategy::TopKApyDiversified);
+    assert!(!validated.app.strategy.top_k_apy.enforce_gas_economic_gate);
     assert_eq!(validated.app.strategy.top_k_apy.tick_interval_seconds, 300);
     assert_eq!(
         validated.app.strategy.top_k_apy.enter_apy_wad,

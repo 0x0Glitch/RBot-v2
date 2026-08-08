@@ -75,6 +75,11 @@ at least 100 APY bps of post-probe replacement improvement. APY comparisons use
 the exact compounded annual yield derived from native per-second rates. The
 separate fourth-market diversification gaps are 50 bps to enter and 100 bps to
 remain selected. Strategy memory is durable across restarts and reorg-aware.
+`enforce_gas_economic_gate` is an advanced profitability policy: when enabled,
+projected 24-hour recoverable gain must cover the configured conservative gas
+charge before signing. Disabling it permits curator-approved small-TVL operation
+but does not disable loss ceilings, caps, role/code checks, calldata validation,
+nonce ownership, simulation, receipt conformance, or post-state reconciliation.
 
 Every policy is evaluated after relevant canonical events and on a mandatory
 five-minute canonical-time tick. The tick refreshes exact rates even when there
@@ -133,8 +138,9 @@ configured HyperEVM Vault V2 deployment and pinned official Morpho contracts.
 The included HyperEVM vault selects `top_k_apy_diversified`. The older rate and
 utilization equalization paths remain available by changing the vault strategy
 back to `spread_equalization` and choosing the desired objective.
-The checked-in mode is `shadow`, so it cannot submit transactions until the
-operator deliberately changes it to `execute` after validation.
+The checked-in HyperEVM mode is `execute`. Its profitability gate is explicitly
+disabled for the curator-approved small-TVL deployment; all transaction and
+principal-safety checks remain enabled.
 
 Create an ignored `.env` file containing chain-999 endpoints and the exclusive
 allocator key:

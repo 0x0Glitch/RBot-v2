@@ -530,6 +530,8 @@ pub struct TopKApyConfig {
     pub target_score_wad: String,
     /// Minimum score improvement required from one plan, in WAD units.
     pub minimum_improvement_score_wad: String,
+    /// Require projected recoverable gain to cover conservative gas cost before signing.
+    pub enforce_gas_economic_gate: bool,
     /// Minimum net 24-hour gain after conservative gas and immediate-loss charges.
     pub minimum_net_gain_assets: String,
     /// Conservative multiplier applied to native transaction cost.
@@ -558,6 +560,7 @@ impl Default for TopKApyConfig {
             entry_score_wad: "50000000000000000".to_owned(),
             target_score_wad: "10000000000000000".to_owned(),
             minimum_improvement_score_wad: "10000000000000000".to_owned(),
+            enforce_gas_economic_gate: true,
             minimum_net_gain_assets: "0".to_owned(),
             gas_cost_multiplier: 3,
             native_token_price_ceiling_asset_wad: "0".to_owned(),
@@ -1128,6 +1131,8 @@ pub struct ValidatedTopKApyConfig {
     pub target_score_wad: U256,
     /// Minimum score improvement.
     pub minimum_improvement_score_wad: U256,
+    /// Whether the conservative gas-versus-gain policy is enforced before signing.
+    pub enforce_gas_economic_gate: bool,
     /// Minimum net gain in vault asset units.
     pub minimum_net_gain_assets: U256,
     /// Conservative native gas-cost multiplier.
@@ -1609,6 +1614,7 @@ impl AppConfig {
                     "strategy.top_k_apy.minimum_improvement_score_wad",
                     &self.strategy.top_k_apy.minimum_improvement_score_wad,
                 )?,
+                enforce_gas_economic_gate: self.strategy.top_k_apy.enforce_gas_economic_gate,
                 minimum_net_gain_assets: parse_u256(
                     "strategy.top_k_apy.minimum_net_gain_assets",
                     &self.strategy.top_k_apy.minimum_net_gain_assets,
