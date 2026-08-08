@@ -2,34 +2,37 @@
 
 use std::{
     collections::BTreeSet,
+    future::Future,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
 };
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use async_trait::async_trait;
+use futures::{StreamExt, stream};
 use thiserror::Error;
 
 use crate::{
     api::ApiDataStore,
     chain::{
-        logs::{RawEventLog, StateInvalidation, decode_watched_event},
         multicall::AtomicSnapshotProvider,
         provider::{
             AccountFundingProvider, AccountNonceProvider, ChainDataProvider, FeeQuoteProvider,
-            NonceRecoveryProvider, ProviderError, RpcErrorCategory, SignedTransactionSubmitter,
-            TransactionLookupProvider, TransactionSimulationProvider, parse_quantity,
+            NonceRecoveryProvider, ProviderError, RpcErrorCategory, RpcReceipt, RpcTransaction,
+            SignedTransactionSubmitter, TransactionLookupProvider, TransactionSimulationProvider,
+            parse_quantity,
         },
+        provider_consensus::{OptionalViewSelectionError, query_consistent_optional_views},
         receipts::validate_receipt,
     },
     config::ValidatedConfig,
-    domain::{BlockRef, PlanReason, RewardPolicy, TransactionId, V2Action, VaultAddress},
-    planner::objective::strategy_value,
+    domain::{BlockRef, PlanReason, TransactionId, VaultAddress},
     reconciliation::{
         classification::{
-            ReceiptTrackingError, confirm_canonical_inclusion, observe_canonical_receipt,
+            ReceiptTrackingError, canonical_receipt_outcome, confirm_canonical_inclusion,
+            persist_canonical_receipt_outcome,
         },
         conformance::{
             ConformanceError, ConformanceReport, ReceiptReconciliationError,
@@ -44,9 +47,8 @@ use crate::{
         identity::RuntimeIdentities,
         planning_service::{PlanningServiceError, refresh_priority_plan},
         preflight_source::LiveRatePreflightSource,
-        state_service::{EventSourceRegistry, desired_runtime_state, runtime_reason},
+        state_service::{desired_runtime_state, runtime_reason},
     },
-    state::projection::project_snapshot_to_head,
     storage::{
         StorageError,
         actor::StorageHandle,
@@ -59,10 +61,10 @@ use crate::{
     transaction::{
         fees::initial_fee_quote,
         final_preflight::{
-            ExecutePreflightRequest, ExecutionReservationManager, PreflightError,
+            ExecutePreflightRequest, ExecutionReservationManager, PreflightError, ReservationError,
             execute_one_head_preflight,
         },
-        firewall::{RoutineTransactionFields, validate_plan, validate_routine_transaction},
+        firewall::{RoutineTransactionFields, validate_historical_routine_transaction},
         pending::{
             CancellationReason, InclusionOpportunity, PendingAttemptOutcome, PendingAttemptRequest,
             PendingClock, PendingDecision, PendingPolicyError, PendingSafetySignals,
@@ -166,6 +168,18 @@ impl ExecutionServiceError {
                     reason: SignerQuarantineReason::DurabilityOrIdentity,
                 }
             }
+            Self::Preflight(PreflightError::Reservation(ReservationError::Poisoned)) => {
+                // The in-memory resource set may be partially mutated and the restart factory
+                // deliberately reuses this execution owner. Continuing would defer every future
+                // transaction forever, so require a clean process reconstruction.
+                FailureDisposition::FatalProcessIntegrity
+            }
+            Self::Conformance(
+                ReceiptReconciliationError::Provider(_)
+                | ReceiptReconciliationError::TransactionUnavailable,
+            ) => FailureDisposition::Retry {
+                backoff: std::time::Duration::from_secs(2),
+            },
             Self::Conformance(_) => FailureDisposition::QuarantineVault {
                 reason: VaultQuarantineReason::AccountingUnavailable,
             },
@@ -270,6 +284,7 @@ pub struct LiveExecutionService<P> {
     provider_ready: Arc<AtomicBool>,
     alerts: Option<Arc<AlertDispatcher>>,
     consecutive_provider_failures: AtomicU32,
+    next_vault_index: AtomicUsize,
 }
 
 impl<P> LiveExecutionService<P> {
@@ -301,6 +316,7 @@ impl<P> LiveExecutionService<P> {
             provider_ready,
             alerts: None,
             consecutive_provider_failures: AtomicU32::new(0),
+            next_vault_index: AtomicUsize::new(0),
         }
     }
 
@@ -329,110 +345,68 @@ where
     /// agree. A temporarily unavailable provider is retried by the controller; disagreement is a
     /// signer quarantine condition and never permits a new reservation.
     async fn confirmed_nonce(&self, signer: Address) -> Result<u64, ExecutionServiceError> {
-        let mut observed = None;
-        let mut first_error = None;
-        for provider in &self.recovery_providers {
-            match provider.account_nonce(signer).await {
-                Ok(nonce) if observed.is_some_and(|current| current != nonce) => {
-                    self.pause_signer_account(
-                        signer,
-                        "confirmed nonce recovery providers disagree",
-                    )
-                    .await?;
-                    return Err(ExecutionServiceError::ProviderDisagreement);
-                }
-                Ok(nonce) => observed = Some(nonce),
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
-            }
+        let result = self
+            .consistent_recovery_view(move |provider| async move {
+                provider.account_nonce(signer).await.map(Some)
+            })
+            .await;
+        if matches!(result, Err(ExecutionServiceError::ProviderDisagreement)) {
+            self.pause_signer_account(signer, "confirmed nonce recovery providers disagree")
+                .await?;
         }
-        match observed {
-            Some(nonce) => Ok(nonce),
-            None => Err(first_error
-                .map(ExecutionServiceError::Provider)
-                .unwrap_or(ExecutionServiceError::Recovery)),
-        }
+        result?.ok_or(ExecutionServiceError::Recovery)
+    }
+
+    /// Returns the one consistent optional value reported by the recovery-provider set.
+    ///
+    /// A matching response remains usable when another provider is temporarily unavailable. If
+    /// nobody reports a value, a provider failure takes precedence over `None` so recovery never
+    /// treats an outage as proof of absence. Conflicting non-null views fail closed.
+    async fn consistent_recovery_view<T, F, Fut>(
+        &self,
+        query: F,
+    ) -> Result<Option<T>, ExecutionServiceError>
+    where
+        T: PartialEq,
+        F: Fn(Arc<dyn NonceRecoveryProvider>) -> Fut,
+        Fut: Future<Output = Result<Option<T>, ProviderError>>,
+    {
+        map_recovery_provider_view(
+            query_consistent_optional_views(self.recovery_providers.iter().cloned(), query).await,
+        )
     }
 
     async fn recovery_transaction_by_hash(
         &self,
         hash: B256,
-    ) -> Result<Option<crate::chain::provider::RpcTransaction>, ExecutionServiceError> {
-        let mut observed = None;
-        let mut first_error = None;
-        for provider in &self.recovery_providers {
-            match provider.transaction_by_hash(hash).await {
-                Ok(Some(transaction))
-                    if observed
-                        .as_ref()
-                        .is_some_and(|current| current != &transaction) =>
-                {
-                    return Err(ExecutionServiceError::ProviderDisagreement);
-                }
-                Ok(Some(transaction)) => observed = Some(transaction),
-                Ok(None) => {}
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
-            }
-        }
-        if observed.is_some() || first_error.is_none() {
-            Ok(observed)
-        } else {
-            Err(first_error
-                .map(ExecutionServiceError::Provider)
-                .unwrap_or(ExecutionServiceError::Recovery))
-        }
+    ) -> Result<Option<RpcTransaction>, ExecutionServiceError> {
+        self.consistent_recovery_view(move |provider| async move {
+            provider.transaction_by_hash(hash).await
+        })
+        .await
     }
 
     async fn recovery_receipt_by_hash(
         &self,
         hash: B256,
-    ) -> Result<Option<crate::chain::provider::RpcReceipt>, ExecutionServiceError> {
-        let mut observed = None;
-        let mut first_error = None;
-        for provider in &self.recovery_providers {
-            match provider.receipt_by_hash(hash).await {
-                Ok(Some(receipt))
-                    if observed.as_ref().is_some_and(|current| current != &receipt) =>
-                {
-                    return Err(ExecutionServiceError::ProviderDisagreement);
-                }
-                Ok(Some(receipt)) => observed = Some(receipt),
-                Ok(None) => {}
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
-            }
-        }
-        if observed.is_some() || first_error.is_none() {
-            Ok(observed)
-        } else {
-            Err(first_error
-                .map(ExecutionServiceError::Provider)
-                .unwrap_or(ExecutionServiceError::Recovery))
-        }
+    ) -> Result<Option<RpcReceipt>, ExecutionServiceError> {
+        self.consistent_recovery_view(move |provider| async move {
+            provider.receipt_by_hash(hash).await
+        })
+        .await
     }
 
     async fn recovery_header_by_number(
         &self,
         number: u64,
     ) -> Result<BlockRef, ExecutionServiceError> {
-        let mut observed = None;
-        let mut first_error = None;
-        for provider in &self.recovery_providers {
-            match provider.header_by_number(number).await {
-                Ok(block) if observed.as_ref().is_some_and(|current| current != &block) => {
-                    return Err(ExecutionServiceError::ProviderDisagreement);
-                }
-                Ok(block) => observed = Some(block),
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
-            }
-        }
-        observed.ok_or_else(|| {
-            first_error
-                .map(ExecutionServiceError::Provider)
-                .unwrap_or(ExecutionServiceError::Recovery)
+        self.consistent_recovery_view(move |provider| async move {
+            ChainDataProvider::header_by_number(provider.as_ref(), number)
+                .await
+                .map(Some)
         })
+        .await?
+        .ok_or(ExecutionServiceError::Recovery)
     }
 
     async fn recovery_transaction_by_sender_nonce_in_block(
@@ -440,39 +414,23 @@ where
         signer: Address,
         nonce: u64,
         block: BlockRef,
-    ) -> Result<Option<crate::chain::provider::RpcTransaction>, ExecutionServiceError> {
-        let mut observed = None;
-        let mut first_error = None;
-        for provider in &self.recovery_providers {
-            match provider
+    ) -> Result<Option<RpcTransaction>, ExecutionServiceError> {
+        self.consistent_recovery_view(move |provider| async move {
+            provider
                 .transaction_by_sender_nonce_in_block(signer, nonce, block)
                 .await
-            {
-                Ok(Some(transaction))
-                    if observed
-                        .as_ref()
-                        .is_some_and(|current| current != &transaction) =>
-                {
-                    return Err(ExecutionServiceError::ProviderDisagreement);
-                }
-                Ok(Some(transaction)) => observed = Some(transaction),
-                Ok(None) => {}
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
-            }
-        }
-        if observed.is_some() || first_error.is_none() {
-            Ok(observed)
-        } else {
-            Err(first_error
-                .map(ExecutionServiceError::Provider)
-                .unwrap_or(ExecutionServiceError::Recovery))
-        }
+        })
+        .await
     }
 
     /// Advances every signer lane once, with bounded infrastructure-failure escalation.
     pub async fn tick(&self) -> Result<(), ExecutionServiceError> {
         let result = self.tick_once().await;
+        if let Err(error) = &result
+            && let FailureDisposition::QuarantineSigner { reason } = error.disposition()
+        {
+            self.enforce_signer_quarantine(reason).await?;
+        }
         match &result {
             Ok(()) => {
                 self.consecutive_provider_failures
@@ -532,12 +490,96 @@ where
         result
     }
 
+    async fn enforce_signer_quarantine(
+        &self,
+        reason: SignerQuarantineReason,
+    ) -> Result<(), ControllerError> {
+        let detail = match reason {
+            SignerQuarantineReason::UnknownNonceConsumption => {
+                "exclusive allocator nonce ownership is ambiguous"
+            }
+            SignerQuarantineReason::InvalidReservation => {
+                "durable allocator nonce reservation is internally inconsistent"
+            }
+            SignerQuarantineReason::ProviderDisagreement => {
+                "independent nonce recovery providers disagree"
+            }
+            SignerQuarantineReason::DurabilityOrIdentity => {
+                "allocator signing durability or signer identity is unavailable"
+            }
+        };
+        let signers = self
+            .config
+            .app
+            .vaults
+            .iter()
+            .map(|vault| vault.signer_address)
+            .collect::<BTreeSet<_>>();
+        for signer in signers {
+            self.pause_signer_account(signer, detail).await?;
+        }
+        Ok(())
+    }
+
     /// Advances every signer lane once, or releases one newly eligible exact rate plan.
     async fn tick_once(&self) -> Result<(), ExecutionServiceError> {
         if !self.provider_ready.load(Ordering::Acquire) {
             return Ok(());
         }
         let mut processed_signers = BTreeSet::new();
+        // Recover durable lanes before consulting the current configuration for new work. This
+        // prevents a config edit from hiding already-signed bytes and freeing a nonce in memory.
+        for pending in self.storage.load_all_unresolved().await? {
+            processed_signers.insert(pending.signer);
+            let Some(vault) = self
+                .config
+                .app
+                .vaults
+                .iter()
+                .find(|vault| vault.address == pending.vault)
+            else {
+                self.pause_signer_account(
+                    pending.signer,
+                    "durable unresolved transaction references an unconfigured vault",
+                )
+                .await?;
+                self.emit_alert(
+                    AlertSeverity::P0,
+                    AlertKind::SignedTransactionAmbiguity,
+                    Some(pending.vault),
+                    "Unresolved signer lane is missing from configuration",
+                    "restore the signing-time vault configuration so the durable transaction can be recovered; no new nonce will be signed",
+                    None,
+                    runtime_unix_timestamp(),
+                )
+                .await;
+                continue;
+            };
+            if vault.signer_address != pending.signer {
+                self.pause_signer_account(
+                    pending.signer,
+                    "durable unresolved transaction signer differs from current vault config",
+                )
+                .await?;
+                self.pause_signer_account(
+                    vault.signer_address,
+                    "configured signer differs from the durable unresolved signer",
+                )
+                .await?;
+                self.emit_alert(
+                    AlertSeverity::P0,
+                    AlertKind::SignedTransactionAmbiguity,
+                    Some(pending.vault),
+                    "Unresolved signer identity changed in configuration",
+                    "restore the signing-time allocator identity so the durable nonce can be recovered; no new nonce will be signed",
+                    None,
+                    runtime_unix_timestamp(),
+                )
+                .await;
+                continue;
+            }
+            self.advance_pending(pending.vault, pending).await?;
+        }
         for signer in self
             .config
             .app
@@ -548,17 +590,21 @@ where
             if !processed_signers.insert(signer) {
                 continue;
             }
-            if let Some(pending) = self.storage.load_unresolved(signer).await? {
-                self.advance_pending(pending.vault, pending).await?;
-                continue;
-            }
-            for vault in self
+            let signer_vaults = self
                 .config
                 .app
                 .vaults
                 .iter()
                 .filter(|vault| vault.signer_address == signer)
-            {
+                .collect::<Vec<_>>();
+            let start = self.next_vault_index.load(Ordering::Acquire);
+            for offset in 0..signer_vaults.len() {
+                let Some(index) = round_robin_index(start, offset, signer_vaults.len()) else {
+                    break;
+                };
+                let Some(vault) = signer_vaults.get(index).copied() else {
+                    return Err(ExecutionServiceError::Recovery);
+                };
                 let status = self.runtime.get(vault.address).await;
                 let ready = status
                     .as_ref()
@@ -569,6 +615,13 @@ where
                 // execution on fast chains and provides no additional safety.
                 let plan_reason = self.api.plan(vault.address).await.map(|plan| plan.reason);
                 if ready && let Some(reason) = plan_reason {
+                    // Advance before the bounded attempt. A temporarily unexecutable first vault
+                    // must not monopolize the shared allocator lane across controller ticks.
+                    let next_index = index
+                        .checked_add(1)
+                        .and_then(|next| next.checked_rem(signer_vaults.len()))
+                        .ok_or(ExecutionServiceError::Recovery)?;
+                    self.next_vault_index.store(next_index, Ordering::Release);
                     self.execute(vault.address, reason).await?;
                     break;
                 }
@@ -758,23 +811,40 @@ where
             | TransactionState::CancellationSubmitted
             | TransactionState::Orphaned => {
                 if let Some(receipt) = self.canonical_receipt(&pending).await? {
-                    let next = observe_canonical_receipt(
-                        &self.storage,
-                        &pending,
-                        &receipt,
-                        head.timestamp,
-                    )
-                    .await?;
-                    if matches!(next, TransactionState::Reverted | TransactionState::Failed) {
+                    let next = canonical_receipt_outcome(&pending, &receipt)?;
+                    if matches!(
+                        next,
+                        TransactionState::Reverted | TransactionState::Cancelled
+                    ) {
                         self.recover_terminal_outcome(
                             vault,
                             pending.transaction_id,
                             head,
-                            RecoveryTrigger::Revert,
+                            if next == TransactionState::Cancelled {
+                                RecoveryTrigger::Cancellation
+                            } else {
+                                RecoveryTrigger::Revert
+                            },
+                        )
+                        .await?;
+                        persist_canonical_receipt_outcome(
+                            &self.storage,
+                            &pending,
+                            &receipt,
+                            next,
+                            head.timestamp,
                         )
                         .await?;
                         return Ok(());
                     }
+                    persist_canonical_receipt_outcome(
+                        &self.storage,
+                        &pending,
+                        &receipt,
+                        next,
+                        head.timestamp,
+                    )
+                    .await?;
                 } else if pending.state == TransactionState::Orphaned {
                     self.recover_orphaned(vault, &pending, head).await?;
                 } else if self
@@ -821,10 +891,31 @@ where
                 )
                 .await
                 {
+                    if matches!(error, ReceiptReconciliationError::MissingCanonicalAttempt) {
+                        // Reorg processing can atomically move the durable row away from
+                        // `Confirmed` after this tick loaded its earlier copy. That one bounded race
+                        // is harmless. If the same row is still confirmed, however, its canonical
+                        // receipt/attempt evidence is durably inconsistent and retrying forever
+                        // would silently monopolize the shared signer lane.
+                        let current = self.storage.load_unresolved(pending.signer).await?;
+                        if confirmed_attempt_was_superseded(
+                            current.as_ref().map(|row| (row.transaction_id, row.state)),
+                            pending.transaction_id,
+                        ) {
+                            return Ok(());
+                        }
+                    }
                     if receipt_reconciliation_is_retryable(&error) {
-                        return Ok(());
+                        return Err(error.into());
                     }
                     if receipt_reconciliation_is_state_drift(&error) {
+                        self.recover_terminal_outcome(
+                            vault,
+                            pending.transaction_id,
+                            head,
+                            RecoveryTrigger::PostStateMismatch,
+                        )
+                        .await?;
                         self.storage
                             .transition_transaction(TransactionTransition {
                                 transaction_id: pending.transaction_id,
@@ -837,13 +928,6 @@ where
                                 updated_at: head.timestamp,
                             })
                             .await?;
-                        self.recover_terminal_outcome(
-                            vault,
-                            pending.transaction_id,
-                            head,
-                            RecoveryTrigger::PostStateMismatch,
-                        )
-                        .await?;
                         return Ok(());
                     }
                     self.pause_reconciliation_failure(vault.address).await?;
@@ -898,6 +982,13 @@ where
                         ),
                     ) => return Err(error.into()),
                     Err(error) if current_state_failure_is_recoverable(&error) => {
+                        self.recover_terminal_outcome(
+                            vault,
+                            pending.transaction_id,
+                            head,
+                            RecoveryTrigger::PostStateMismatch,
+                        )
+                        .await?;
                         self.storage
                             .transition_transaction(TransactionTransition {
                                 transaction_id: pending.transaction_id,
@@ -910,13 +1001,6 @@ where
                                 updated_at: head.timestamp,
                             })
                             .await?;
-                        self.recover_terminal_outcome(
-                            vault,
-                            pending.transaction_id,
-                            head,
-                            RecoveryTrigger::PostStateMismatch,
-                        )
-                        .await?;
                         return Ok(());
                     }
                     Err(error) => {
@@ -1152,10 +1236,11 @@ where
             .plan
             .clone()
             .ok_or(ExecutionServiceError::Recovery)?;
-        let validated_plan =
-            validate_plan(plan, &self.config).map_err(|_| ExecutionServiceError::Recovery)?;
-        let original = validate_routine_transaction(
-            &validated_plan,
+        // A signed transaction owns the nonce across unrelated configuration revisions. Its plan
+        // remains bound to the signing-time revision stored in the plan and exact snapshot; the
+        // current revision must not make identical-calldata recovery structurally impossible.
+        let original = validate_historical_routine_transaction(
+            plan,
             RoutineTransactionFields {
                 chain_id: self.config.app.chain.chain_id,
                 from: pending.signer,
@@ -1169,9 +1254,8 @@ where
                 value: U256::ZERO,
                 calldata: pending.calldata.clone(),
             },
-            self.config.app.chain.chain_id,
+            &self.config,
             vault,
-            &self.config.app.execution,
         )
         .map_err(|_| ExecutionServiceError::Recovery)?;
         ValidatedPendingTransaction::from_recovered_attempt(
@@ -1306,18 +1390,23 @@ where
                 return Ok(());
             }
         }
-        for number in pending.created_block..=head.number {
-            let Some(block) = self
-                .storage
-                .load_canonical_block(self.config.app.chain.chain_id, number)
-                .await?
-            else {
-                continue;
-            };
-            let Some(transaction) = self
-                .recovery_transaction_by_sender_nonce_in_block(pending.signer, pending.nonce, block)
-                .await?
-            else {
+        let blocks = self
+            .storage
+            .load_canonical_blocks(
+                self.config.app.chain.chain_id,
+                pending.created_block,
+                head.number,
+            )
+            .await?;
+        let lookups = stream::iter(blocks).map(|block| async move {
+            self.recovery_transaction_by_sender_nonce_in_block(pending.signer, pending.nonce, block)
+                .await
+                .map(|transaction| (block, transaction))
+        });
+        futures::pin_mut!(lookups);
+        let mut lookups = lookups.buffered(4);
+        while let Some((block, transaction)) = lookups.next().await.transpose()? {
+            let Some(transaction) = transaction else {
                 continue;
             };
             if pending.known_transaction_hashes.contains(&transaction.hash) {
@@ -1575,10 +1664,6 @@ where
                 required_gas_limit,
             )
             .await?;
-        let invalidations = self
-            .pending_invalidations(pending.created_block, head.number)
-            .await?;
-        let signals = self.pending_safety_signals(vault, &plan, head).await?;
         let clock = PendingClock {
             reason: plan.reason,
             submitted_at: InclusionOpportunity(0),
@@ -1588,8 +1673,7 @@ where
         let mut decision = assess_pending(
             &clock,
             InclusionOpportunity(current),
-            &invalidations,
-            signals,
+            PendingSafetySignals::default(),
             &self.config.app.execution,
         )?;
         if decision == PendingDecision::Wait {
@@ -1705,103 +1789,6 @@ where
         } else {
             Ok(())
         }
-    }
-
-    async fn pending_invalidations(
-        &self,
-        from_exclusive: u64,
-        through: u64,
-    ) -> Result<Vec<StateInvalidation>, ExecutionServiceError> {
-        if from_exclusive >= through {
-            return Ok(Vec::new());
-        }
-        let sources = EventSourceRegistry::from_config(&self.config)
-            .map_err(|_| ExecutionServiceError::Recovery)?;
-        let logs = self
-            .storage
-            .load_canonical_logs(
-                self.config.app.chain.chain_id,
-                from_exclusive.saturating_add(1),
-                through,
-            )
-            .await?;
-        let mut invalidations = Vec::new();
-        for log in logs {
-            let Some(source) = sources.source(log.address) else {
-                continue;
-            };
-            let raw = RawEventLog {
-                address: log.address,
-                topics: log.topics.into_iter().flatten().collect(),
-                data: log.data,
-            };
-            let Some(decoded) =
-                decode_watched_event(source, &raw).map_err(|_| ExecutionServiceError::Recovery)?
-            else {
-                continue;
-            };
-            invalidations.extend(decoded.invalidations);
-        }
-        Ok(invalidations)
-    }
-
-    async fn pending_safety_signals(
-        &self,
-        vault: &crate::config::ValidatedVaultConfig,
-        plan: &crate::domain::V2Plan,
-        head: BlockRef,
-    ) -> Result<PendingSafetySignals, ExecutionServiceError> {
-        let Some(snapshot) = self
-            .api
-            .snapshot(vault.address)
-            .await
-            .filter(|snapshot| snapshot.context.block == head)
-        else {
-            return Ok(PendingSafetySignals {
-                provider_ambiguous: true,
-                ..PendingSafetySignals::default()
-            });
-        };
-        let reward_policy_expired =
-            vault
-                .positions
-                .iter()
-                .any(|position| match &position.reward_policy {
-                    RewardPolicy::NoMaterialRewards {
-                        valid_until_timestamp,
-                        ..
-                    }
-                    | RewardPolicy::Modeled {
-                        valid_until_timestamp,
-                        ..
-                    } => *valid_until_timestamp <= head.timestamp,
-                    RewardPolicy::IgnoreRewardsByCuratorMandate { .. }
-                    | RewardPolicy::FixedUntilModeled => false,
-                });
-        let direction_reversed = if plan.reason == PlanReason::RateRebalance {
-            let projection = project_snapshot_to_head(&snapshot, head, vault)
-                .map_err(|_| ExecutionServiceError::Recovery)?;
-            rate_direction_reversed(plan, vault, &projection, self.config.app.strategy.objective)
-                .ok_or(ExecutionServiceError::Recovery)?
-        } else {
-            false
-        };
-        Ok(PendingSafetySignals {
-            direction_reversed,
-            service_constraint_failed: !snapshot.capabilities.can_allocate,
-            reward_policy_expired,
-            signer_role_lost: !snapshot
-                .parent
-                .approved_allocators
-                .contains(&vault.signer_address),
-            provider_ambiguous: false,
-            external_idle_lock_created: snapshot
-                .idle_locks
-                .locks
-                .iter()
-                .any(|lock| !lock.remaining_assets.is_zero())
-                || !snapshot.idle_locks.unattributed_idle_assets.is_zero(),
-        })
     }
 
     async fn canonical_receipt(
@@ -1930,6 +1917,11 @@ where
                 "Post-transaction state was refreshed",
                 "the previous expected state was discarded; exact canonical state was fetched again and planning resumed from observed balances",
             ),
+            RecoveryTrigger::Cancellation => (
+                AlertKind::UnexpectedRevert,
+                "Cancelled rebalance was refreshed safely",
+                "the cancellation consumed the old nonce without moving vault funds; exact canonical state was fetched again and planning resumed",
+            ),
         };
         self.emit_alert(
             AlertSeverity::P1,
@@ -1977,7 +1969,7 @@ where
             tracing::error!("typed execution alert construction failed");
             return;
         };
-        if dispatcher.emit(alert).await.is_err() {
+        if dispatcher.dispatch(alert).is_err() {
             tracing::error!("typed execution alert delivery failed");
         }
     }
@@ -1997,10 +1989,34 @@ where
     }
 }
 
+fn map_recovery_provider_view<T>(
+    selection: Result<Option<T>, OptionalViewSelectionError<ProviderError>>,
+) -> Result<Option<T>, ExecutionServiceError> {
+    match selection {
+        Ok(view) => Ok(view),
+        Err(OptionalViewSelectionError::Disagreement) => {
+            Err(ExecutionServiceError::ProviderDisagreement)
+        }
+        Err(OptionalViewSelectionError::Unavailable(error)) => {
+            Err(ExecutionServiceError::Provider(error))
+        }
+    }
+}
+
+fn round_robin_index(start: usize, offset: usize, length: usize) -> Option<usize> {
+    if length == 0 || offset >= length {
+        return None;
+    }
+    start
+        .checked_add(offset)
+        .and_then(|index| index.checked_rem(length))
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RecoveryTrigger {
     Revert,
     PostStateMismatch,
+    Cancellation,
 }
 
 fn current_state_failure_is_recoverable(error: &CurrentStateError) -> bool {
@@ -2029,8 +2045,16 @@ fn receipt_reconciliation_is_retryable(error: &ReceiptReconciliationError) -> bo
         error,
         ReceiptReconciliationError::Provider(_)
             | ReceiptReconciliationError::TransactionUnavailable
-            | ReceiptReconciliationError::MissingCanonicalAttempt
     )
+}
+
+fn confirmed_attempt_was_superseded(
+    current: Option<(TransactionId, TransactionState)>,
+    expected: TransactionId,
+) -> bool {
+    current.is_none_or(|(transaction_id, state)| {
+        transaction_id != expected || state != TransactionState::Confirmed
+    })
 }
 
 fn receipt_reconciliation_is_state_drift(error: &ReceiptReconciliationError) -> bool {
@@ -2052,6 +2076,9 @@ fn provider_dependency_failed(error: &ExecutionServiceError) -> bool {
         | ExecutionServiceError::Preflight(PreflightError::Provider(error))
         | ExecutionServiceError::Conformance(ReceiptReconciliationError::Provider(error)) => {
             provider_error_is_outage(error)
+        }
+        ExecutionServiceError::Conformance(ReceiptReconciliationError::TransactionUnavailable) => {
+            true
         }
         ExecutionServiceError::Preflight(PreflightError::Source(
             crate::transaction::final_preflight::PreflightSourceError::ProviderOutageAt(_),
@@ -2234,31 +2261,6 @@ fn cancellation_fees(
     Ok((configured_maximum, configured_maximum))
 }
 
-fn rate_direction_reversed(
-    plan: &crate::domain::V2Plan,
-    vault: &crate::config::ValidatedVaultConfig,
-    projection: &crate::state::projection::ProjectedVaultView,
-    objective: crate::config::StrategyObjective,
-) -> Option<bool> {
-    let mut source_values = Vec::new();
-    let mut destination_values = Vec::new();
-    for action in &plan.actions {
-        let (position, values) = match action {
-            V2Action::Deallocate { position, .. } => (position, &mut source_values),
-            V2Action::Allocate { position, .. } => (position, &mut destination_values),
-        };
-        let market = vault
-            .positions
-            .iter()
-            .find(|configured| configured.position_key == *position)
-            .and_then(|configured| projection.markets.get(&configured.market_id))?;
-        values.push(strategy_value(market, objective));
-    }
-    let maximum_source = source_values.into_iter().max()?;
-    let minimum_destination = destination_values.into_iter().min()?;
-    Some(maximum_source >= minimum_destination)
-}
-
 fn conformance_report(record: ConformanceRecord) -> ConformanceReport {
     ConformanceReport {
         transaction_id: record.transaction_id,
@@ -2277,20 +2279,25 @@ mod tests {
     use alloy::primitives::{Address, B256, Bytes, U256};
 
     use super::{
-        ExecutionServiceError, contract_identity_failed, current_state_failure_is_recoverable,
+        ExecutionServiceError, confirmed_attempt_was_superseded, contract_identity_failed,
+        current_state_failure_is_recoverable, map_recovery_provider_view,
         provider_dependency_failed, provider_error_is_outage, receipt_matches_canonical_header,
         receipt_reconciliation_is_retryable, receipt_reconciliation_is_state_drift,
-        recovered_transaction_is_included,
+        recovered_transaction_is_included, round_robin_index,
     };
     use crate::{
-        chain::provider::{ProviderError, RpcErrorCategory, RpcReceipt, RpcTransaction},
-        domain::BlockRef,
+        chain::{
+            provider::{ProviderError, RpcErrorCategory, RpcReceipt, RpcTransaction},
+            provider_consensus::{OptionalViewSelectionError, select_consistent_optional_view},
+        },
+        domain::{BlockRef, TransactionId},
         reconciliation::{
             conformance::{ConformanceError, ReceiptReconciliationError},
             current_state::{CurrentStateError, CurrentStateSourceError},
         },
         runtime::failure::FailureDisposition,
-        transaction::final_preflight::{PreflightError, PreflightSourceError},
+        storage::models::TransactionState,
+        transaction::final_preflight::{PreflightError, PreflightSourceError, ReservationError},
     };
 
     fn transaction() -> RpcTransaction {
@@ -2327,6 +2334,53 @@ mod tests {
         let mut malformed = transaction();
         malformed.block_number = Some("0x6".to_owned());
         assert!(recovered_transaction_is_included(&malformed).is_err());
+    }
+
+    #[test]
+    fn shared_signer_vault_selection_rotates_without_starving_later_vaults() {
+        let order = (0..4)
+            .filter_map(|offset| round_robin_index(2, offset, 4))
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![2, 3, 0, 1]);
+        assert_eq!(round_robin_index(0, 0, 0), None);
+    }
+
+    #[test]
+    fn recovery_provider_views_require_consistent_evidence() {
+        assert_eq!(
+            map_recovery_provider_view(select_consistent_optional_view([
+                Ok(Some(7_u64)),
+                Err(ProviderError::Transport {
+                    method: "eth_getTransactionReceipt",
+                }),
+            ]))
+            .ok(),
+            Some(Some(7))
+        );
+        assert!(matches!(
+            map_recovery_provider_view(Err::<Option<u64>, _>(
+                OptionalViewSelectionError::Disagreement
+            )),
+            Err(ExecutionServiceError::ProviderDisagreement)
+        ));
+        assert!(matches!(
+            map_recovery_provider_view(Err::<Option<u64>, _>(
+                OptionalViewSelectionError::Unavailable(ProviderError::Transport {
+                    method: "eth_getTransactionReceipt",
+                })
+            )),
+            Err(ExecutionServiceError::Provider(ProviderError::Transport {
+                method: "eth_getTransactionReceipt"
+            }))
+        ));
+        assert_eq!(
+            map_recovery_provider_view(select_consistent_optional_view([
+                Ok::<Option<u64>, ProviderError>(None),
+                Ok(None),
+            ]))
+            .ok(),
+            Some(None)
+        );
     }
 
     #[test]
@@ -2368,6 +2422,13 @@ mod tests {
 
     #[test]
     fn preflight_dependency_failures_have_explicit_supervisor_policy() {
+        assert_eq!(
+            ExecutionServiceError::Preflight(PreflightError::Reservation(
+                ReservationError::Poisoned,
+            ))
+            .disposition(),
+            FailureDisposition::FatalProcessIntegrity
+        );
         assert!(matches!(
             ExecutionServiceError::Preflight(PreflightError::Source(
                 PreflightSourceError::FatalAt("storage"),
@@ -2465,9 +2526,27 @@ mod tests {
         assert!(receipt_reconciliation_is_retryable(
             &ReceiptReconciliationError::TransactionUnavailable
         ));
-        assert!(receipt_reconciliation_is_retryable(
+        assert!(!receipt_reconciliation_is_retryable(
             &ReceiptReconciliationError::MissingCanonicalAttempt
         ));
+        let unavailable =
+            ExecutionServiceError::Conformance(ReceiptReconciliationError::TransactionUnavailable);
+        assert!(matches!(
+            unavailable.disposition(),
+            FailureDisposition::Retry { .. }
+        ));
+        assert!(provider_dependency_failed(&unavailable));
+
+        let expected = TransactionId(B256::repeat_byte(0x44));
+        assert!(!confirmed_attempt_was_superseded(
+            Some((expected, TransactionState::Confirmed)),
+            expected,
+        ));
+        assert!(confirmed_attempt_was_superseded(
+            Some((expected, TransactionState::Orphaned)),
+            expected,
+        ));
+        assert!(confirmed_attempt_was_superseded(None, expected));
     }
 
     #[test]

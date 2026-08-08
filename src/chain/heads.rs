@@ -18,7 +18,10 @@ use crate::storage::actor::StorageHandle;
 use crate::storage::models::{CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord};
 
 use super::ChainError;
-use super::provider::{ChainDataProvider, ProviderError, ProviderRole, RpcLog, parse_quantity};
+use super::provider::{
+    ChainDataProvider, ProviderError, ProviderRole, RpcLog, RpcReceipt, parse_quantity,
+};
+use super::provider_consensus::{OptionalViewSelectionError, query_consistent_optional_views};
 use super::receipts::{validate_receipt, validate_standalone_log, watched_logs};
 use super::reorg::find_common_ancestor;
 
@@ -81,6 +84,7 @@ pub struct ChainService<P> {
     log_filter: Option<Arc<dyn CanonicalLogFilter>>,
     indexed_token_accounts: BTreeMap<Address, BTreeSet<Address>>,
     provider_ready: Option<Arc<AtomicBool>>,
+    progress: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<P: ChainDataProvider> ChainService<P> {
@@ -125,6 +129,7 @@ impl<P: ChainDataProvider> ChainService<P> {
             log_filter: None,
             indexed_token_accounts: BTreeMap::new(),
             provider_ready: None,
+            progress: None,
         })
     }
 
@@ -150,6 +155,22 @@ impl<P: ChainDataProvider> ChainService<P> {
     pub fn with_provider_readiness(mut self, ready: Arc<AtomicBool>) -> Self {
         self.provider_ready = Some(ready);
         self
+    }
+
+    /// Installs a nonblocking progress acknowledgement for long bounded catch-up operations.
+    #[must_use]
+    pub fn with_progress_callback<F>(mut self, progress: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.progress = Some(Arc::new(progress));
+        self
+    }
+
+    fn record_progress(&self) {
+        if let Some(progress) = &self.progress {
+            progress();
+        }
     }
 
     /// Publishes replaceable latest-head hints separately from ordered canonical event updates.
@@ -184,9 +205,30 @@ impl<P: ChainDataProvider> ChainService<P> {
 
     /// Uses exactly one latest-header request, then catches up all skipped heights.
     pub async fn poll_once(&self) -> Result<BlockRef, ChainError> {
+        let result = self.poll_once_inner().await;
+        // Checkpoint agreement is established before logs, receipts, durable persistence, and
+        // publication. Any later failure means canonical ingestion did not reach the selected
+        // head, so a readiness value set by the earlier checkpoint comparison must not survive.
+        // Final preflight shares this atomic gate and cannot sign from an old cached snapshot while
+        // the event cursor is broken.
+        if let Some(ready) = &self.provider_ready {
+            ready.store(result.is_ok(), Ordering::Release);
+        }
+        result
+    }
+
+    async fn poll_once_inner(&self) -> Result<BlockRef, ChainError> {
         let latest = self.primary.latest_header().await?;
-        self.compare_checkpoint(latest).await?;
+        self.record_progress();
         let cursor = self.storage.load_cursor(self.config.chain_id).await?;
+        if cursor != Some(latest)
+            && let Some(ready) = &self.provider_ready
+        {
+            // A newer or reorganized head is not execution-ready until every relevant log,
+            // receipt, durable write, and state notification for that exact head has completed.
+            ready.store(false, Ordering::Release);
+        }
+        self.compare_checkpoint(latest).await?;
         match cursor {
             None => {
                 let span = latest
@@ -249,12 +291,35 @@ impl<P: ChainDataProvider> ChainService<P> {
             .copied()
             .collect::<Vec<_>>();
         addresses.retain(|address| !self.indexed_token_accounts.contains_key(address));
-        let mut queries = Vec::new();
+        let address_query_count = addresses.len().div_ceil(ADDRESS_GROUP_SIZE);
+        let indexed_query_count = self
+            .indexed_token_accounts
+            .values()
+            .filter(|accounts| !accounts.is_empty())
+            .count()
+            .saturating_mul(2);
+        let queries_per_range = address_query_count.saturating_add(indexed_query_count);
+        let range_count = latest
+            .number
+            .saturating_sub(start)
+            .checked_div(self.config.maximum_log_range)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let total_queries = u64::try_from(queries_per_range)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(range_count);
+        let mut relevant_blocks = BTreeSet::new();
+        let mut completed_queries = 0_u64;
         let mut from = start;
         while from <= latest.number {
             let to = from
                 .saturating_add(self.config.maximum_log_range.saturating_sub(1))
                 .min(latest.number);
+            // Materialize only one provider-bounded block range at a time. Building every query
+            // for the complete historical gap before issuing the first request made memory grow
+            // with `gap / maximum_log_range` and could OOM a latest-only bootstrap when a provider
+            // requires small ranges. Concurrency remains bounded within this single range.
+            let mut queries = Vec::with_capacity(queries_per_range);
             for group in addresses.chunks(ADDRESS_GROUP_SIZE) {
                 queries.push((from, to, group.to_vec(), Vec::new()));
             }
@@ -285,36 +350,59 @@ impl<P: ChainDataProvider> ChainService<P> {
                     ));
                 }
             }
+            let results = stream::iter(queries)
+                .map(|(from, to, addresses, topics)| async move {
+                    let logs = self
+                        .logs_with_bounded_retry(from, to, &addresses, &topics)
+                        .await?;
+                    Ok::<_, ChainError>((from, to, logs))
+                })
+                .buffered(MAX_CATCH_UP_CONCURRENCY);
+            futures::pin_mut!(results);
+            while let Some(result) = results.next().await {
+                let (query_from, query_to, logs) = result?;
+                completed_queries = completed_queries.saturating_add(1);
+                self.record_progress();
+                for log in logs {
+                    if let Some(number) = self.retained_log_hint(query_from, query_to, &log)? {
+                        relevant_blocks.insert(number);
+                    }
+                }
+                if completed_queries == total_queries || completed_queries.is_multiple_of(100) {
+                    tracing::info!(
+                        completed_queries,
+                        total_queries,
+                        relevant_blocks = relevant_blocks.len(),
+                        "canonical bootstrap scan progress"
+                    );
+                }
+            }
             from = to.saturating_add(1);
         }
 
-        let total_queries = queries.len();
-        let results = stream::iter(queries)
-            .map(|(from, to, addresses, topics)| async move {
-                let logs = self
-                    .logs_with_bounded_retry(from, to, &addresses, &topics)
-                    .await?;
-                Ok::<_, ChainError>((from, to, logs))
-            })
-            .buffered(MAX_CATCH_UP_CONCURRENCY);
-        futures::pin_mut!(results);
-        let mut relevant_blocks = BTreeSet::new();
-        let mut completed_queries = 0_usize;
-        while let Some(result) = results.next().await {
-            let (from, to, logs) = result?;
-            completed_queries = completed_queries.saturating_add(1);
-            for log in logs {
-                if let Some(number) = self.retained_log_hint(from, to, &log)? {
-                    relevant_blocks.insert(number);
+        // A reverted routine call or same-nonce cancellation emits no watched protocol log. Its
+        // block would otherwise be omitted by sparse latest-only catch-up once it falls outside
+        // the recent reorg window, leaving the durable nonce lane waiting forever for a canonical
+        // inclusion header that this scanner had intentionally skipped. Known signed hashes are
+        // finite and durable, so pin their observed receipt blocks independently of log discovery.
+        let mut unresolved_receipts = Vec::new();
+        for pending in self.storage.load_all_unresolved().await? {
+            for hash in pending.known_transaction_hashes {
+                let Some(receipt) = self.known_receipt_by_hash(hash).await? else {
+                    self.record_progress();
+                    continue;
+                };
+                self.record_progress();
+                if receipt.transaction_hash != hash {
+                    return Err(ChainError::InvalidBundle(
+                        "known transaction receipt hash mismatch",
+                    ));
                 }
-            }
-            if completed_queries == total_queries || completed_queries.is_multiple_of(100) {
-                tracing::info!(
-                    completed_queries,
-                    total_queries,
-                    relevant_blocks = relevant_blocks.len(),
-                    "canonical bootstrap scan progress"
-                );
+                let number = parse_quantity("receipt.block_number", &receipt.block_number)?;
+                if (start..=latest.number).contains(&number) {
+                    relevant_blocks.insert(number);
+                    unresolved_receipts.push(receipt);
+                }
             }
         }
 
@@ -343,6 +431,7 @@ impl<P: ChainDataProvider> ChainService<P> {
         let mut previous_recent: Option<BlockRef> = None;
         while let Some(bundle) = bundles.next().await {
             let (block, receipts, logs) = bundle?;
+            self.record_progress();
             if block.number >= recent_start {
                 if let Some(previous) = previous_recent
                     && (block.number != previous.number.saturating_add(1)
@@ -355,6 +444,7 @@ impl<P: ChainDataProvider> ChainService<P> {
                 previous_recent = Some(block);
             }
             self.persist_bundle(block, &receipts, logs).await?;
+            self.record_progress();
         }
 
         // A newer head may exist now, but the exact head selected at the start must still be
@@ -364,7 +454,56 @@ impl<P: ChainDataProvider> ChainService<P> {
                 "selected latest head was reorganized during catch-up",
             ));
         }
+        for receipt in unresolved_receipts {
+            let number = parse_quantity("receipt.block_number", &receipt.block_number)?;
+            let block = self
+                .storage
+                .load_canonical_block(self.config.chain_id, number)
+                .await?
+                .ok_or(ChainError::InvalidBundle(
+                    "known transaction receipt block was not retained",
+                ))?;
+            let validated = validate_receipt(self.config.chain_id, block, receipt)?;
+            self.storage
+                .persist_canonical_receipt(CanonicalReceiptRecord {
+                    chain_id: self.config.chain_id,
+                    transaction_hash: validated.transaction_hash,
+                    block_number: validated.block_number,
+                    block_hash: validated.block_hash,
+                    transaction_index: validated.transaction_index,
+                    status: validated.status,
+                    gas_used: validated.gas_used,
+                    logs: validated.logs,
+                })
+                .await?;
+        }
         Ok(())
+    }
+
+    /// Reads a durably known transaction hash from both independent receipt views. A sparse
+    /// latest-only catch-up gets only one chance to pin an old logless inclusion block; treating a
+    /// temporary `None` from the primary as authoritative can therefore strand the nonce lane
+    /// forever even when the checkpoint provider has the receipt. Any available matching receipt
+    /// is sufficient because its block identity is subsequently checked against the primary
+    /// canonical header and the full receipt validator. Conflicting receipts fail closed.
+    async fn known_receipt_by_hash(&self, hash: B256) -> Result<Option<RpcReceipt>, ChainError> {
+        let providers = std::iter::once(Arc::clone(&self.primary)).chain(
+            self.checkpoint
+                .as_ref()
+                .filter(|provider| provider.has_role(ProviderRole::Receipt))
+                .map(Arc::clone),
+        );
+        match query_consistent_optional_views(providers, move |provider| async move {
+            provider.receipt_by_hash(hash).await
+        })
+        .await
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(OptionalViewSelectionError::Disagreement) => {
+                Err(ChainError::ProviderViewInconsistent)
+            }
+            Err(OptionalViewSelectionError::Unavailable(error)) => Err(error.into()),
+        }
     }
 
     async fn logs_with_bounded_retry(
@@ -485,6 +624,7 @@ impl<P: ChainDataProvider> ChainService<P> {
         futures::pin_mut!(bundles);
         while let Some(bundle) = bundles.next().await {
             let (block, receipts, logs) = bundle?;
+            self.record_progress();
             if let Some(parent) = previous
                 && (block.number != parent.number.saturating_add(1)
                     || block.parent_hash != parent.hash)
@@ -494,6 +634,7 @@ impl<P: ChainDataProvider> ChainService<P> {
                 ));
             }
             self.persist_bundle(block, &receipts, logs.clone()).await?;
+            self.record_progress();
             if publish_blocks {
                 self.send_update(ChainUpdate::CanonicalBlock {
                     block,
@@ -575,12 +716,13 @@ impl<P: ChainDataProvider> ChainService<P> {
         &self,
         block: BlockRef,
     ) -> Result<(Vec<ReceiptRecord>, Vec<CanonicalLogRecord>), ChainError> {
-        let addresses = self
+        let mut addresses = self
             .config
             .watched_addresses
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        addresses.retain(|address| !self.indexed_token_accounts.contains_key(address));
         let mut queried_logs = Vec::new();
         for group in addresses.chunks(ADDRESS_GROUP_SIZE) {
             for log in self.primary.logs(block.number, block.number, group).await? {
@@ -595,7 +737,57 @@ impl<P: ChainDataProvider> ChainService<P> {
                 }
             }
         }
+        for (token, accounts) in &self.indexed_token_accounts {
+            let account_topics = accounts
+                .iter()
+                .map(|account| B256::left_padding_from(account.as_slice()))
+                .collect::<Vec<_>>();
+            if account_topics.is_empty() {
+                continue;
+            }
+            for topics in [
+                vec![
+                    Some(vec![IERC20::Transfer::SIGNATURE_HASH]),
+                    Some(account_topics.clone()),
+                ],
+                vec![
+                    Some(vec![IERC20::Transfer::SIGNATURE_HASH]),
+                    None,
+                    Some(account_topics.clone()),
+                ],
+            ] {
+                for log in self
+                    .primary
+                    .logs_with_topics(block.number, block.number, &[*token], &topics)
+                    .await?
+                {
+                    let converted = validate_standalone_log(self.config.chain_id, block, log)?;
+                    if converted.address != *token {
+                        return Err(ChainError::InvalidBundle(
+                            "indexed token query returned a different address",
+                        ));
+                    }
+                    if self.retain_log(&converted)? {
+                        queried_logs.push(converted);
+                    }
+                }
+            }
+        }
         queried_logs.sort_by_key(|log| (log.transaction_index, log.log_index));
+        let mut deduplicated: Vec<CanonicalLogRecord> = Vec::with_capacity(queried_logs.len());
+        for log in queried_logs {
+            if let Some(previous) = deduplicated.last()
+                && previous.transaction_index == log.transaction_index
+                && previous.log_index == log.log_index
+            {
+                if previous != &log {
+                    return Err(ChainError::ProviderViewInconsistent);
+                }
+                continue;
+            }
+            deduplicated.push(log);
+        }
+        let queried_logs = deduplicated;
         reject_duplicate_logs(&queried_logs)?;
 
         let transaction_hashes = queried_logs
@@ -654,9 +846,6 @@ impl<P: ChainDataProvider> ChainService<P> {
 
     async fn compare_checkpoint(&self, latest: BlockRef) -> Result<(), ChainError> {
         let Some(checkpoint) = self.checkpoint.as_ref() else {
-            if let Some(ready) = &self.provider_ready {
-                ready.store(true, Ordering::Release);
-            }
             return Ok(());
         };
         let candidate = match checkpoint.header_by_number(latest.number).await {
@@ -687,9 +876,6 @@ impl<P: ChainDataProvider> ChainService<P> {
             return Err(ChainError::ProviderDisagreement {
                 block_number: latest.number,
             });
-        }
-        if let Some(ready) = &self.provider_ready {
-            ready.store(true, Ordering::Release);
         }
         Ok(())
     }

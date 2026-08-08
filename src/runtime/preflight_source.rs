@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use crate::{
     api::ApiDataStore,
     chain::{
+        logs::{RawEventLog, decode_watched_event},
         multicall::{AtomicSnapshotProvider, MulticallError},
         provider::TransactionLookupProvider,
     },
@@ -26,6 +27,7 @@ use crate::{
     runtime::{
         identity::{RuntimeIdentities, RuntimeIdentityError},
         idle_ledger_service::{IdleLedgerServiceError, rebuild_idle_ledger},
+        planning_revision::DirtyAccumulator,
         planning_service::{
             build_validated_capital_plan, build_validated_liquidity_plan,
             build_validated_rate_plan, build_validated_top_k_capital_plan,
@@ -114,7 +116,10 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> ExactPreflightSource
         let result = self.rebuild_at_head(head, scenarios).await;
         match &result {
             Ok(prepared) => {
-                *self.rebuilding_head.write().await = Some(prepared.plan.plan().snapshot.block);
+                *self.rebuilding_head.write().await = prepared
+                    .scenarios
+                    .first()
+                    .map(|scenario| scenario.canonical_block);
             }
             Err(_) => {
                 *self.rebuilding_head.write().await = None;
@@ -130,10 +135,24 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> ExactPreflightSource
         let Some(expected) = *self.rebuilding_head.read().await else {
             return Ok(true);
         };
-        if self.config.app.snapshot.mode == SnapshotMode::AtomicLatest {
+        let current = self.event_cursor().await?;
+        if current == expected {
             return Ok(false);
         }
-        Ok(self.event_cursor().await? != expected)
+        if current.number <= expected.number {
+            return Ok(true);
+        }
+        let vault = self
+            .config
+            .app
+            .vaults
+            .iter()
+            .find(|vault| vault.address == self.vault)
+            .ok_or(PreflightSourceError::FailedAt("configured_vault"))?;
+        let sources = EventSourceRegistry::from_config(&self.config)
+            .map_err(|_| PreflightSourceError::FatalAt("event_source_registry"))?;
+        self.relevant_event_between(&sources, vault, expected.number, current.number)
+            .await
     }
 }
 
@@ -144,10 +163,6 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
         scenarios: &[InclusionAssumption; 3],
     ) -> Result<PreparedPreflightPlan, PreflightSourceError> {
         let started = Instant::now();
-        self.identities
-            .verify_proxy_links(self.provider.as_ref())
-            .await
-            .map_err(classify_identity_error)?;
         let vault = self
             .config
             .app
@@ -155,6 +170,10 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             .iter()
             .find(|vault| vault.address == self.vault)
             .ok_or(PreflightSourceError::FailedAt("configured_vault"))?;
+        self.identities
+            .verify_proxy_links_for_vault(self.provider.as_ref(), vault, None)
+            .await
+            .map_err(classify_identity_error)?;
         let sources = EventSourceRegistry::from_config(&self.config)
             .map_err(|_| PreflightSourceError::FatalAt("event_source_registry"))?;
         let replay_head = if self.config.app.snapshot.mode == SnapshotMode::AtomicLatest {
@@ -218,10 +237,35 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                 .await
                 .map_err(classify_snapshot_error)?
         };
-        let head = snapshot.context.block;
+        let snapshot_head = snapshot.context.block;
+        let topology_revision = topology
+            .revision()
+            .map_err(|_| PreflightSourceError::FailedAt("topology_revision"))?;
+        if self.config.app.snapshot.mode == SnapshotMode::AtomicLatest {
+            let canonical_snapshot = self
+                .storage
+                .load_canonical_block(self.config.app.chain.chain_id, snapshot_head.number)
+                .await
+                .map_err(|_| PreflightSourceError::FatalAt("snapshot_header_load"))?;
+            if snapshot_head.number > replay_head.number
+                || canonical_snapshot != Some(snapshot_head)
+                || snapshot.context.static_config_revision != self.config.revision
+                || snapshot.context.dynamic_topology_revision != topology_revision
+                || self
+                    .relevant_event_between(
+                        &sources,
+                        vault,
+                        snapshot_head.number,
+                        replay_head.number,
+                    )
+                    .await?
+            {
+                return Err(PreflightSourceError::ContextChanged);
+            }
+        }
         let scenarios = if self.config.app.snapshot.mode == SnapshotMode::AtomicLatest {
             inclusion_assumptions(
-                head,
+                replay_head,
                 self.config.app.execution.expected_inclusion_opportunities,
                 self.config.app.execution.maximum_inclusion_opportunities,
                 scenarios[0].max_fee_per_gas,
@@ -230,13 +274,10 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
         } else {
             *scenarios
         };
-        let topology_revision = topology
-            .revision()
-            .map_err(|_| PreflightSourceError::FailedAt("topology_revision"))?;
         if episode.as_ref().is_some_and(|episode| {
             episode.config_revision != self.config.revision
                 || episode.topology_revision != topology_revision
-                || head.timestamp >= episode.expires_at
+                || replay_head.timestamp >= episode.expires_at
         }) {
             return Err(PreflightSourceError::Failed);
         }
@@ -247,7 +288,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
         );
         let durable_snapshot = self
             .storage
-            .load_exact_snapshot(vault.address, head)
+            .load_exact_snapshot(vault.address, snapshot_head)
             .await
             .map_err(|_| PreflightSourceError::FatalAt("idle_ledger_checkpoint_load"))?;
         let idle_locks = if let Some(durable) = durable_snapshot.filter(|durable| {
@@ -264,7 +305,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                     &self.config,
                     &sources,
                     vault,
-                    head,
+                    snapshot_head,
                     snapshot.parent.idle_assets,
                 )
                 .await
@@ -277,13 +318,17 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
         bind_idle_lock_ledger(&mut snapshot, &blueprint, idle_locks)
             .map_err(|_| PreflightSourceError::FailedAt("idle_ledger_bind"))?;
         self.identities
+            .verify_proxy_links_for_vault(self.provider.as_ref(), vault, Some(&snapshot))
+            .await
+            .map_err(classify_identity_error)?;
+        self.identities
             .validate_snapshot(&snapshot)
             .map_err(|_| PreflightSourceError::FatalAt("snapshot_identity"))?;
         if !snapshot.capabilities.can_allocate {
             return Err(PreflightSourceError::FailedAt("allocation_capability"));
         }
         self.storage
-            .persist_snapshot(snapshot.clone(), head.timestamp)
+            .persist_snapshot(snapshot.clone(), snapshot_head.timestamp)
             .await
             .map_err(|_| PreflightSourceError::FatalAt("snapshot_persist"))?;
         self.api.record_snapshot(snapshot.clone()).await;
@@ -413,6 +458,45 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             action_projections: prepared.action_projections,
             scenarios,
         })
+    }
+
+    async fn relevant_event_between(
+        &self,
+        sources: &EventSourceRegistry,
+        vault: &crate::config::ValidatedVaultConfig,
+        from_exclusive: u64,
+        to_inclusive: u64,
+    ) -> Result<bool, PreflightSourceError> {
+        if from_exclusive >= to_inclusive {
+            return Ok(false);
+        }
+        let logs = self
+            .storage
+            .load_canonical_logs(
+                self.config.app.chain.chain_id,
+                from_exclusive.saturating_add(1),
+                to_inclusive,
+            )
+            .await
+            .map_err(|_| PreflightSourceError::FatalAt("canonical_log_load"))?;
+        let mut dirty = DirtyAccumulator::default();
+        for log in logs {
+            let Some(source) = sources.source(log.address) else {
+                continue;
+            };
+            let raw = RawEventLog {
+                address: log.address,
+                topics: log.topics.into_iter().flatten().collect(),
+                data: log.data,
+            };
+            let Some(decoded) = decode_watched_event(source, &raw)
+                .map_err(|_| PreflightSourceError::FatalAt("canonical_log_decode"))?
+            else {
+                continue;
+            };
+            dirty.merge_invalidations(&self.config, log.block_number, decoded.invalidations);
+        }
+        Ok(dirty.is_vault_dirty(vault.address))
     }
 }
 

@@ -102,6 +102,18 @@ pub async fn observe_canonical_receipt(
     receipt: &CanonicalReceiptRecord,
     observed_at: u64,
 ) -> Result<TransactionState, ReceiptTrackingError> {
+    let next_state = canonical_receipt_outcome(pending, receipt)?;
+    persist_canonical_receipt_outcome(storage, pending, receipt, next_state, observed_at).await?;
+    Ok(next_state)
+}
+
+/// Validates one canonical known-attempt receipt without advancing durable lifecycle state.
+/// Runtime recovery uses this split boundary so a temporary exact-state failure cannot make a
+/// reverted or cancelled transaction disappear from the retry queue.
+pub fn canonical_receipt_outcome(
+    pending: &UnresolvedTransaction,
+    receipt: &CanonicalReceiptRecord,
+) -> Result<TransactionState, ReceiptTrackingError> {
     if !pending
         .known_transaction_hashes
         .contains(&receipt.transaction_hash)
@@ -123,6 +135,20 @@ pub async fn observe_canonical_receipt(
         Some(1) => TransactionState::Included,
         _ => return Err(ReceiptTrackingError::Identity),
     };
+    Ok(next_state)
+}
+
+/// Persists a previously validated canonical receipt outcome.
+pub async fn persist_canonical_receipt_outcome(
+    storage: &StorageHandle,
+    pending: &UnresolvedTransaction,
+    receipt: &CanonicalReceiptRecord,
+    next_state: TransactionState,
+    observed_at: u64,
+) -> Result<(), ReceiptTrackingError> {
+    if canonical_receipt_outcome(pending, receipt)? != next_state {
+        return Err(ReceiptTrackingError::Identity);
+    }
     storage
         .transition_transaction(TransactionTransition {
             transaction_id: pending.transaction_id,
@@ -130,14 +156,15 @@ pub async fn observe_canonical_receipt(
             next_state,
             transaction_hash: Some(receipt.transaction_hash),
             submitted_at: None,
-            included_block: (next_state == TransactionState::Included)
-                .then_some(receipt.block_number),
-            included_block_hash: (next_state == TransactionState::Included)
-                .then_some(receipt.block_hash),
+            // Reverted and cancellation receipts consume the nonce just as a successful routine
+            // transaction does. Persist their exact canonical location so a later reorg can
+            // reopen the nonce lane instead of leaving a now-orphaned terminal outcome behind.
+            included_block: Some(receipt.block_number),
+            included_block_hash: Some(receipt.block_hash),
             updated_at: observed_at,
         })
         .await?;
-    Ok(next_state)
+    Ok(())
 }
 
 /// Advances an included transaction only after its block remains canonical at required depth.

@@ -184,6 +184,27 @@ pub fn validate_historical_plan(
     validate_plan_integrity(plan, vault, config.app.execution.maximum_actions)
 }
 
+/// Rebuilds the restricted routine transaction wrapper for an already-durable nonce lane.
+///
+/// The semantic plan stays bound to its signing-time revision while the envelope is checked
+/// against the current chain, vault identity and execution ceiling. This function cannot create
+/// different calldata and is used only for byte-identical replacement or cancellation recovery.
+pub fn validate_historical_routine_transaction(
+    plan: V2Plan,
+    fields: RoutineTransactionFields,
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+) -> Result<ValidatedRoutineTransaction, FirewallError> {
+    let validated = validate_historical_plan(plan, config)?;
+    validate_routine_transaction(
+        &validated,
+        fields,
+        config.app.chain.chain_id,
+        vault,
+        &config.app.execution,
+    )
+}
+
 fn validate_plan_integrity(
     plan: V2Plan,
     vault: &ValidatedVaultConfig,

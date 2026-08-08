@@ -16,6 +16,10 @@ use crate::domain::{
     derive_liquidity_position_key, derive_market_id, derive_position_key,
 };
 
+mod top_k;
+
+pub use top_k::{TopKApyConfig, ValidatedTopKApyConfig};
+
 /// Configuration schema supported by this binary.
 pub const CONFIG_SCHEMA_VERSION: u32 = 6;
 /// Exact simple-APR time basis in seconds.
@@ -45,50 +49,6 @@ const fn default_utilization_minimum_improvement_bps() -> u32 {
 
 const fn default_utilization_minimum_event_impact_bps() -> u32 {
     1
-}
-
-const fn default_top_k_enter_apy_bps() -> u32 {
-    200
-}
-
-const fn default_top_k_exit_apy_bps() -> u32 {
-    250
-}
-
-const fn default_top_k_replacement_apy_bps() -> u32 {
-    100
-}
-
-const fn default_top_k_fourth_market_entry_gap_apy_bps() -> u32 {
-    50
-}
-
-const fn default_top_k_fourth_market_exit_gap_apy_bps() -> u32 {
-    100
-}
-
-const fn default_top_k_upside_ema_alpha_bps() -> u32 {
-    2_000
-}
-
-const fn default_top_k_probe_allocation_bps() -> u32 {
-    500
-}
-
-fn default_top_k_membership_confirmation() -> Duration {
-    Duration::from_secs(1_800)
-}
-
-fn default_strategy_tick_interval() -> Duration {
-    Duration::from_secs(300)
-}
-
-fn default_top_k_three_market_weights_bps() -> Vec<u32> {
-    vec![4_000, 4_000, 2_000]
-}
-
-fn default_top_k_four_market_weights_bps() -> Vec<u32> {
-    vec![3_500, 3_500, 1_500, 1_500]
 }
 
 /// Strict on-disk configuration envelope separating operator inputs from policy tuning.
@@ -492,81 +452,6 @@ pub enum VaultStrategy {
     SpreadEqualization,
     /// Diversify direct capital across the best conservative native-supply-yield markets.
     TopKApyDiversified,
-}
-
-/// Raw top-K APY diversification policy.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TopKApyConfig {
-    /// A new target must improve annualized native supply yield by this many basis points.
-    pub enter_apy_bps: u32,
-    /// A selected position is exit-eligible only after this annualized underperformance.
-    pub exit_apy_bps: u32,
-    /// A replacement candidate must beat the outgoing market by this annualized margin.
-    pub replacement_apy_bps: u32,
-    /// Maximum third-to-fourth annualized yield gap when adding the diversification slot.
-    pub fourth_market_entry_gap_apy_bps: u32,
-    /// Maximum third-to-fourth annualized yield gap while retaining the diversification slot.
-    pub fourth_market_exit_gap_apy_bps: u32,
-    /// Slow-path weight applied to an upward rate observation.
-    pub upside_ema_alpha_bps: u32,
-    /// Direct-capital share used to test post-deposit rate compression.
-    pub probe_allocation_bps: u32,
-    /// Canonical-time confirmation required for a yield-driven membership change.
-    #[serde(with = "humantime_serde")]
-    pub membership_confirmation: Duration,
-    /// Mandatory canonical-time strategy evaluation interval.
-    #[serde(with = "humantime_serde")]
-    pub tick_interval: Duration,
-    /// Minimum direct assets before a fourth market may be selected.
-    pub minimum_direct_assets_for_four_markets: String,
-    /// Three-market target weights in basis points, ordered by conservative yield rank.
-    pub three_market_weights_bps: Vec<u32>,
-    /// Four-market target weights in basis points, ordered by conservative yield rank.
-    pub four_market_weights_bps: Vec<u32>,
-    /// Allocation-distance score that activates rebalancing, in WAD units.
-    pub entry_score_wad: String,
-    /// Desired terminal allocation-distance score, in WAD units.
-    pub target_score_wad: String,
-    /// Minimum score improvement required from one plan, in WAD units.
-    pub minimum_improvement_score_wad: String,
-    /// Require projected recoverable gain to cover conservative gas cost before signing.
-    pub enforce_gas_economic_gate: bool,
-    /// Minimum net 24-hour gain after conservative gas and immediate-loss charges.
-    pub minimum_net_gain_assets: String,
-    /// Conservative multiplier applied to native transaction cost.
-    pub gas_cost_multiplier: u32,
-    /// Curator-approved maximum native-token price in vault-asset WAD units.
-    pub native_token_price_ceiling_asset_wad: String,
-    /// Maximum annualized yield sacrificed for concentration repair.
-    pub maximum_diversification_cost_apy_bps: u32,
-}
-
-impl Default for TopKApyConfig {
-    fn default() -> Self {
-        Self {
-            enter_apy_bps: default_top_k_enter_apy_bps(),
-            exit_apy_bps: default_top_k_exit_apy_bps(),
-            replacement_apy_bps: default_top_k_replacement_apy_bps(),
-            fourth_market_entry_gap_apy_bps: default_top_k_fourth_market_entry_gap_apy_bps(),
-            fourth_market_exit_gap_apy_bps: default_top_k_fourth_market_exit_gap_apy_bps(),
-            upside_ema_alpha_bps: default_top_k_upside_ema_alpha_bps(),
-            probe_allocation_bps: default_top_k_probe_allocation_bps(),
-            membership_confirmation: default_top_k_membership_confirmation(),
-            tick_interval: default_strategy_tick_interval(),
-            minimum_direct_assets_for_four_markets: "0".to_owned(),
-            three_market_weights_bps: default_top_k_three_market_weights_bps(),
-            four_market_weights_bps: default_top_k_four_market_weights_bps(),
-            entry_score_wad: "50000000000000000".to_owned(),
-            target_score_wad: "10000000000000000".to_owned(),
-            minimum_improvement_score_wad: "10000000000000000".to_owned(),
-            enforce_gas_economic_gate: true,
-            minimum_net_gain_assets: "0".to_owned(),
-            gas_cost_multiplier: 3,
-            native_token_price_ceiling_asset_wad: "0".to_owned(),
-            maximum_diversification_cost_apy_bps: 25,
-        }
-    }
 }
 
 /// Raw strategy thresholds.
@@ -1098,51 +983,6 @@ pub struct ValidatedStrategyConfig {
     pub top_k_apy: ValidatedTopKApyConfig,
 }
 
-/// Canonical exact top-K APY diversification policy.
-#[derive(Clone, Debug, Serialize)]
-pub struct ValidatedTopKApyConfig {
-    /// Minimum conservative target APY improvement in WAD units.
-    pub enter_apy_wad: U256,
-    /// Minimum exact current-position APY underperformance in WAD units.
-    pub exit_apy_wad: U256,
-    /// Minimum post-probe replacement APY improvement in WAD units.
-    pub replacement_apy_wad: U256,
-    /// Maximum third-to-fourth entry APY gap in WAD units.
-    pub fourth_market_entry_gap_apy_wad: U256,
-    /// Maximum third-to-fourth exit APY gap in WAD units.
-    pub fourth_market_exit_gap_apy_wad: U256,
-    /// Upward EMA alpha in basis points.
-    pub upside_ema_alpha_bps: u32,
-    /// Probe allocation in basis points.
-    pub probe_allocation_bps: u32,
-    /// Membership confirmation duration in seconds.
-    pub membership_confirmation_seconds: u64,
-    /// Mandatory canonical strategy tick interval in seconds.
-    pub tick_interval_seconds: u64,
-    /// Minimum direct assets before a fourth market may be selected.
-    pub minimum_direct_assets_for_four_markets: U256,
-    /// Three-market target weights.
-    pub three_market_weights_bps: Vec<u32>,
-    /// Four-market target weights.
-    pub four_market_weights_bps: Vec<u32>,
-    /// Entry allocation-distance score.
-    pub entry_score_wad: U256,
-    /// Desired terminal allocation-distance score.
-    pub target_score_wad: U256,
-    /// Minimum score improvement.
-    pub minimum_improvement_score_wad: U256,
-    /// Whether the conservative gas-versus-gain policy is enforced before signing.
-    pub enforce_gas_economic_gate: bool,
-    /// Minimum net gain in vault asset units.
-    pub minimum_net_gain_assets: U256,
-    /// Conservative native gas-cost multiplier.
-    pub gas_cost_multiplier: u32,
-    /// Native-token price ceiling in vault-asset WAD units.
-    pub native_token_price_ceiling_asset_wad: U256,
-    /// Maximum annualized diversification sacrifice.
-    pub maximum_diversification_cost_apy_wad: U256,
-}
-
 impl ValidatedStrategyConfig {
     /// Entry threshold in the selected objective's native WAD domain.
     #[must_use]
@@ -1443,6 +1283,11 @@ impl AppConfig {
     /// Parses every address/amount, validates frozen invariants, sorts unordered inputs,
     /// and computes a canonical Keccak-256 configuration revision.
     pub fn validate(self) -> Result<ValidatedConfig, ConfigError> {
+        self.validate_at(current_unix_timestamp()?)
+    }
+
+    /// Performs deterministic validation against an explicitly supplied wall-clock timestamp.
+    fn validate_at(self, now: u64) -> Result<ValidatedConfig, ConfigError> {
         validate_top_level(&self)?;
 
         let mut rpc = self
@@ -1573,64 +1418,9 @@ impl AppConfig {
             extreme_spread_bypass_enabled: self.strategy.extreme_spread_bypass_enabled,
             benefit_horizon_seconds: self.strategy.benefit_horizon.as_secs(),
             maximum_daily_transactions: self.strategy.maximum_daily_transactions,
-            top_k_apy: ValidatedTopKApyConfig {
-                enter_apy_wad: utilization_bps_to_wad(self.strategy.top_k_apy.enter_apy_bps)?,
-                exit_apy_wad: utilization_bps_to_wad(self.strategy.top_k_apy.exit_apy_bps)?,
-                replacement_apy_wad: utilization_bps_to_wad(
-                    self.strategy.top_k_apy.replacement_apy_bps,
-                )?,
-                fourth_market_entry_gap_apy_wad: utilization_bps_to_wad(
-                    self.strategy.top_k_apy.fourth_market_entry_gap_apy_bps,
-                )?,
-                fourth_market_exit_gap_apy_wad: utilization_bps_to_wad(
-                    self.strategy.top_k_apy.fourth_market_exit_gap_apy_bps,
-                )?,
-                upside_ema_alpha_bps: self.strategy.top_k_apy.upside_ema_alpha_bps,
-                probe_allocation_bps: self.strategy.top_k_apy.probe_allocation_bps,
-                membership_confirmation_seconds: self
-                    .strategy
-                    .top_k_apy
-                    .membership_confirmation
-                    .as_secs(),
-                tick_interval_seconds: self.strategy.top_k_apy.tick_interval.as_secs(),
-                minimum_direct_assets_for_four_markets: parse_u256(
-                    "strategy.top_k_apy.minimum_direct_assets_for_four_markets",
-                    &self
-                        .strategy
-                        .top_k_apy
-                        .minimum_direct_assets_for_four_markets,
-                )?,
-                three_market_weights_bps: self.strategy.top_k_apy.three_market_weights_bps.clone(),
-                four_market_weights_bps: self.strategy.top_k_apy.four_market_weights_bps.clone(),
-                entry_score_wad: parse_u256(
-                    "strategy.top_k_apy.entry_score_wad",
-                    &self.strategy.top_k_apy.entry_score_wad,
-                )?,
-                target_score_wad: parse_u256(
-                    "strategy.top_k_apy.target_score_wad",
-                    &self.strategy.top_k_apy.target_score_wad,
-                )?,
-                minimum_improvement_score_wad: parse_u256(
-                    "strategy.top_k_apy.minimum_improvement_score_wad",
-                    &self.strategy.top_k_apy.minimum_improvement_score_wad,
-                )?,
-                enforce_gas_economic_gate: self.strategy.top_k_apy.enforce_gas_economic_gate,
-                minimum_net_gain_assets: parse_u256(
-                    "strategy.top_k_apy.minimum_net_gain_assets",
-                    &self.strategy.top_k_apy.minimum_net_gain_assets,
-                )?,
-                gas_cost_multiplier: self.strategy.top_k_apy.gas_cost_multiplier,
-                native_token_price_ceiling_asset_wad: parse_u256(
-                    "strategy.top_k_apy.native_token_price_ceiling_asset_wad",
-                    &self.strategy.top_k_apy.native_token_price_ceiling_asset_wad,
-                )?,
-                maximum_diversification_cost_apy_wad: utilization_bps_to_wad(
-                    self.strategy.top_k_apy.maximum_diversification_cost_apy_bps,
-                )?,
-            },
+            top_k_apy: self.strategy.top_k_apy.canonical()?,
         };
 
-        let now = current_unix_timestamp()?;
         let required_reward_validity = now
             .checked_add(self.strategy.benefit_horizon.as_secs())
             .ok_or(ArithmeticError::Overflow)?;
@@ -1791,10 +1581,13 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "local-development Execute requires an explicit exact chain-ID authorization",
         ));
     }
-    if config.chain.maximum_log_range == 0 || config.chain.reorg_rescan_blocks == 0 {
+    if config.chain.maximum_log_range == 0
+        || config.chain.reorg_rescan_blocks == 0
+        || config.chain.reorg_rescan_blocks > crate::storage::actor::MAX_DURABLE_REORG_RESCAN_BLOCKS
+    {
         return Err(validation(
             "chain",
-            "log range and reorg rescan must be positive",
+            "log range must be positive and reorg rescan must be within durable retention",
         ));
     }
     if config.snapshot.maximum_snapshot_retries == 0
@@ -2009,102 +1802,13 @@ fn validate_top_level(config: &AppConfig) -> Result<(), ConfigError> {
             "must be positive",
         ));
     }
-    let top_k = &config.strategy.top_k_apy;
-    if top_k.enter_apy_bps == 0
-        || top_k.exit_apy_bps < top_k.enter_apy_bps
-        || top_k.replacement_apy_bps == 0
-        || top_k.replacement_apy_bps > top_k.exit_apy_bps
-        || top_k.exit_apy_bps > 10_000
-    {
-        return Err(validation(
-            "strategy.top_k_apy.hysteresis",
-            "enter must be positive, exit must be at least enter, and replacement must be in 1..=exit",
-        ));
-    }
-    if top_k.fourth_market_entry_gap_apy_bps > top_k.fourth_market_exit_gap_apy_bps
-        || top_k.fourth_market_exit_gap_apy_bps > 10_000
-    {
-        return Err(validation(
-            "strategy.top_k_apy.fourth_market_gap",
-            "fourth-market entry gap must be no greater than its exit gap and both must be at most 10000 bps",
-        ));
-    }
-    if !(1..=10_000).contains(&top_k.upside_ema_alpha_bps)
-        || !(1..=10_000).contains(&top_k.probe_allocation_bps)
-    {
-        return Err(validation(
-            "strategy.top_k_apy.smoothing",
-            "EMA alpha and probe allocation must be in 1..=10000",
-        ));
-    }
-    if top_k.membership_confirmation.is_zero() || top_k.tick_interval.as_secs() != 300 {
-        return Err(validation(
-            "strategy.top_k_apy.timing",
-            "membership confirmation must be positive and tick_interval must be exactly 5m",
-        ));
-    }
-    if top_k.three_market_weights_bps.len() != 3
-        || top_k.four_market_weights_bps.len() != 4
-        || top_k
-            .three_market_weights_bps
-            .iter()
-            .try_fold(0_u32, |sum, weight| sum.checked_add(*weight))
-            != Some(10_000)
-        || top_k
-            .four_market_weights_bps
-            .iter()
-            .try_fold(0_u32, |sum, weight| sum.checked_add(*weight))
-            != Some(10_000)
-        || top_k
-            .three_market_weights_bps
-            .windows(2)
-            .any(|pair| pair.first() < pair.get(1))
-        || top_k
-            .four_market_weights_bps
-            .windows(2)
-            .any(|pair| pair.first() < pair.get(1))
-    {
-        return Err(validation(
-            "strategy.top_k_apy.weights",
-            "three/four market weights must have the expected lengths, sum to 10000, and be non-increasing",
-        ));
-    }
-    let entry_score = parse_u256("strategy.top_k_apy.entry_score_wad", &top_k.entry_score_wad)?;
-    let target_score = parse_u256(
-        "strategy.top_k_apy.target_score_wad",
-        &top_k.target_score_wad,
-    )?;
-    let minimum_improvement = parse_u256(
-        "strategy.top_k_apy.minimum_improvement_score_wad",
-        &top_k.minimum_improvement_score_wad,
-    )?;
-    if entry_score > U256::from(WAD)
-        || target_score >= entry_score
-        || minimum_improvement.is_zero()
-        || minimum_improvement > entry_score
-        || top_k.gas_cost_multiplier == 0
-    {
-        return Err(validation(
-            "strategy.top_k_apy.score",
-            "scores must satisfy 0 <= target < entry <= WAD, improvement must be in 1..=entry, and gas multiplier must be positive",
-        ));
-    }
-    if config.node.mode == RuntimeMode::Execute
-        && config
+    config.strategy.top_k_apy.validate(
+        config.node.mode,
+        config
             .vault
             .iter()
-            .any(|vault| vault.strategy == VaultStrategy::TopKApyDiversified)
-        && parse_u256(
-            "strategy.top_k_apy.native_token_price_ceiling_asset_wad",
-            &top_k.native_token_price_ceiling_asset_wad,
-        )?
-        .is_zero()
-    {
-        return Err(validation(
-            "strategy.top_k_apy.native_token_price_ceiling_asset_wad",
-            "top-K Execute requires a nonzero curator-approved gas conversion ceiling",
-        ));
-    }
+            .any(|vault| vault.strategy == VaultStrategy::TopKApyDiversified),
+    )?;
     if config.node.mode == RuntimeMode::Execute
         && (config.strategy.extreme_spread_bypass_enabled
             || config.solver.allow_incomplete_rate_solver)
@@ -2242,6 +1946,12 @@ fn validate_vault(
         .iter()
         .map(|adapter| adapter.address)
         .collect::<BTreeSet<_>>();
+    if adapter_set.len() != adapters.len() {
+        return Err(validation(
+            "vault.adapter.address",
+            "direct adapter address is duplicated",
+        ));
+    }
 
     let liquidity_adapter = vault
         .liquidity_adapter
@@ -2404,6 +2114,26 @@ fn validate_vault(
         });
     }
     positions.sort_by_key(|position| position.position_key);
+    let position_keys = positions
+        .iter()
+        .map(|position| position.position_key)
+        .collect::<BTreeSet<_>>();
+    if position_keys.len() != positions.len() {
+        return Err(validation(
+            "vault.position",
+            "position identity is duplicated",
+        ));
+    }
+    let market_ids = positions
+        .iter()
+        .map(|position| position.market_id)
+        .collect::<BTreeSet<_>>();
+    if market_ids.len() != positions.len() {
+        return Err(validation(
+            "vault.position.market_id",
+            "one Morpho market may appear only once per managed vault",
+        ));
+    }
     let active_positions = positions
         .iter()
         .filter(|position| position.mode == MarketMode::Active)
@@ -2652,6 +2382,9 @@ fn validation_owned(field: &str, reason: &'static str) -> ConfigError {
 mod tests {
     use super::*;
 
+    const EXAMPLE_REWARD_EXPIRY: u64 = 4_102_444_800;
+    const EXAMPLE_BENEFIT_HORIZON_SECONDS: u64 = 21_600;
+
     #[test]
     fn apr_conversion_has_required_rounding() -> Result<(), ArithmeticError> {
         let up = apr_bps_to_rate_per_second_up(AprBps(30))?;
@@ -2684,6 +2417,22 @@ mod tests {
             utilization_bps_to_wad(25)?,
             U256::from(2_500_000_000_000_000_u64)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_validation_clock_has_an_exact_reward_boundary() -> Result<(), ConfigError> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
+        AppConfig::load(&path)?
+            .validate_at(EXAMPLE_REWARD_EXPIRY - EXAMPLE_BENEFIT_HORIZON_SECONDS)?;
+
+        let error = AppConfig::load(&path)?
+            .validate_at(EXAMPLE_REWARD_EXPIRY - EXAMPLE_BENEFIT_HORIZON_SECONDS + 1);
+        assert!(matches!(
+            error,
+            Err(ConfigError::Validation { field, .. })
+                if field == "vault.position.reward_policy.valid_until_timestamp"
+        ));
         Ok(())
     }
 }

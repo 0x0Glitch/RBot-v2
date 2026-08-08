@@ -22,7 +22,7 @@ use morpho_v2_reallocator::{
     telemetry::{
         alerts::{Alert, AlertDispatcher, AlertKind, AlertSeverity, AlertTransport},
         health::HealthState,
-        metrics::OperationalMetrics,
+        metrics::{OperationalGauge, OperationalMetrics},
         pagerduty::PagerDutyTransport,
         telegram::TelegramTransport,
     },
@@ -85,6 +85,7 @@ async fn runtime_state_and_readiness_are_fail_closed() -> Result<(), Box<dyn std
         storage_ready: true,
         exact_state_ready: true,
         signer_ready: false,
+        execution_scopes_ready: true,
         pending_transaction: false,
         operator_paused: false,
     });
@@ -121,12 +122,13 @@ async fn read_only_http_serves_health_metrics_and_rejects_posts()
             storage_ready: true,
             exact_state_ready: true,
             signer_ready: false,
+            execution_scopes_ready: true,
             pending_transaction: false,
             operator_paused: false,
         }))
         .await;
     let metrics = OperationalMetrics::new();
-    metrics.set("reallocator_up", 1)?;
+    metrics.set(OperationalGauge::Up, 1);
     let alerts = Arc::new(AlertDispatcher::new(Vec::new(), 60)?);
     assert!(alerts.emit(sample_alert()).await?);
     let state = ReadOnlyApiState {
@@ -331,5 +333,28 @@ async fn supervisor_restarts_a_panicked_worker_without_stopping_process_health()
     assert!(supervisor.run().await.is_ok());
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert!(!health.liveness().live);
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_restartable_worker_panic_fails_process_integrity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shutdown = ShutdownSignal::default();
+    let mut supervisor = Supervisor::new(shutdown, HealthState::default(), Duration::from_secs(1));
+    supervisor.spawn("state-owner", async {
+        panic!("deterministic non-restartable owner panic");
+        #[allow(unreachable_code)]
+        Ok(())
+    })?;
+    assert!(matches!(
+        supervisor.run().await,
+        Err(SupervisorError::FatalService {
+            name: "state-owner",
+            failure: ServiceFailure {
+                disposition: morpho_v2_reallocator::runtime::failure::FailureDisposition::FatalProcessIntegrity,
+                ..
+            },
+        })
+    ));
     Ok(())
 }

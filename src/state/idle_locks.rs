@@ -11,15 +11,28 @@ use crate::{
 
 /// Cause of an immutable idle lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(u8)]
 pub enum IdleLockKind {
     /// Native force-deallocation proceeds belong to the exiting supplier.
-    ForceExit,
+    ForceExit = 0,
     /// Sentinel or approved external allocator emergency proceeds.
-    ExternalEmergencyDeallocation,
+    ExternalEmergencyDeallocation = 1,
     /// Explicit operator-created emergency hold.
-    OperatorEmergency,
+    OperatorEmergency = 2,
     /// Safety hold whose origin cannot be proven.
-    UnattributedSafetyHold,
+    UnattributedSafetyHold = 3,
+}
+
+impl IdleLockKind {
+    /// Stable hash-domain code. Explicit matching prevents declaration order from changing IDs.
+    const fn stable_code(self) -> u8 {
+        match self {
+            Self::ForceExit => 0,
+            Self::ExternalEmergencyDeallocation => 1,
+            Self::OperatorEmergency => 2,
+            Self::UnattributedSafetyHold => 3,
+        }
+    }
 }
 
 /// Explicit release state for an idle lock.
@@ -136,7 +149,7 @@ impl IdleLockLedger {
         material.extend_from_slice(transaction.sender.as_slice());
         material.extend_from_slice(&transaction.block_number.to_be_bytes());
         material.extend_from_slice(&transaction.transaction_index.to_be_bytes());
-        material.push(kind as u8);
+        material.push(kind.stable_code());
         self.locks.push(IdleLock {
             lock_id: keccak256(material),
             vault: self.vault,
@@ -291,5 +304,18 @@ impl IdleLockLedger {
                 })?,
             verified: self.verified && locked <= self.exact_idle_assets,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IdleLockKind;
+
+    #[test]
+    fn idle_lock_hash_codes_are_stable() {
+        assert_eq!(IdleLockKind::ForceExit.stable_code(), 0);
+        assert_eq!(IdleLockKind::ExternalEmergencyDeallocation.stable_code(), 1);
+        assert_eq!(IdleLockKind::OperatorEmergency.stable_code(), 2);
+        assert_eq!(IdleLockKind::UnattributedSafetyHold.stable_code(), 3);
     }
 }

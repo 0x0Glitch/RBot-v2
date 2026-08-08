@@ -66,6 +66,31 @@ impl RuntimeVaultState {
         )
     }
 
+    /// Returns whether an ordinary chain/state refresh must preserve this quarantine.
+    ///
+    /// Snapshot-derived states such as unsupported live capabilities and uncertain idle-lock
+    /// accounting are deliberately excluded: a later exact snapshot can prove that those
+    /// conditions cleared. Signer, transaction, reconciliation and operator quarantines require
+    /// an explicit recovery transition and must not disappear merely because a new block arrived.
+    #[must_use]
+    pub const fn is_persistent_quarantine(self) -> bool {
+        matches!(
+            self,
+            Self::PausedByOperator
+                | Self::PausedSignerFailure
+                | Self::PausedTransactionFailure
+                | Self::PausedReconciliationFailure
+        )
+    }
+
+    /// Returns whether the runtime scope itself is ready for autonomous execution lifecycle work.
+    /// A pending transaction is healthy lifecycle ownership, but global readiness separately
+    /// reports it as busy and prevents reservation of another nonce.
+    #[must_use]
+    pub const fn execution_scope_ready(self) -> bool {
+        matches!(self, Self::Automatic | Self::PendingTransaction)
+    }
+
     fn permits(self, next: Self) -> bool {
         if self == next {
             return true;
@@ -139,9 +164,23 @@ impl RuntimeVaultState {
                     | Self::PausedUnsupportedConfiguration
                     | Self::PausedSignerFailure
             ),
-            Self::LockAccountingUncertain
-            | Self::PausedByOperator
-            | Self::PausedUnsupportedConfiguration
+            Self::LockAccountingUncertain | Self::PausedUnsupportedConfiguration => {
+                matches!(
+                    next,
+                    Self::Recovery
+                        | Self::CatchingUp
+                        | Self::Observe
+                        | Self::Shadow
+                        | Self::Automatic
+                        | Self::PendingTransaction
+                        | Self::PendingDeployment
+                        | Self::IdleLocksActive
+                        | Self::LockAccountingUncertain
+                        | Self::PausedUnsupportedConfiguration
+                        | Self::PausedSignerFailure
+                )
+            }
+            Self::PausedByOperator
             | Self::PausedSignerFailure
             | Self::PausedTransactionFailure
             | Self::PausedReconciliationFailure => {
@@ -365,5 +404,40 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn exact_snapshot_pauses_can_recover_but_incident_quarantines_cannot() {
+        let vault = VaultAddress(Address::with_last_byte(3));
+        for recoverable in [
+            RuntimeVaultState::LockAccountingUncertain,
+            RuntimeVaultState::PausedUnsupportedConfiguration,
+        ] {
+            let mut status = VaultRuntimeStatus::starting(vault);
+            assert!(
+                status
+                    .transition(RuntimeVaultState::CatchingUp, None)
+                    .is_ok()
+            );
+            assert!(status.transition(recoverable, None).is_ok());
+            assert!(
+                status
+                    .transition(RuntimeVaultState::Automatic, None)
+                    .is_ok()
+            );
+        }
+
+        for persistent in [
+            RuntimeVaultState::PausedByOperator,
+            RuntimeVaultState::PausedSignerFailure,
+            RuntimeVaultState::PausedTransactionFailure,
+            RuntimeVaultState::PausedReconciliationFailure,
+        ] {
+            assert!(persistent.is_persistent_quarantine());
+            assert!(!persistent.execution_scope_ready());
+        }
+        assert!(!RuntimeVaultState::PausedUnsupportedConfiguration.is_persistent_quarantine());
+        assert!(RuntimeVaultState::Automatic.execution_scope_ready());
+        assert!(RuntimeVaultState::PendingTransaction.execution_scope_ready());
     }
 }

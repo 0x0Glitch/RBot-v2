@@ -367,13 +367,16 @@ policy supports its separately configured entry and target thresholds.
 Spread equalization uses an episode that freezes direction long enough to avoid
 single-block noise. Top-K instead persists selected markets, smoothed rates, a
 pending membership set, its canonical confirmation timestamp, and generation.
-Its confirmed weights are 40/40/20 for three markets or 35/35/15/15 for four.
-For a yield-driven target transition, the checked-in policy requires at least
-200 APY bps of conservative ranking improvement, at least 250 APY bps of exact
-current-position underperformance before exit, and at least 100 APY bps of
-post-probe improvement. These are exact compounded-APY comparisons, not simple
-APR aliases. The separate fourth-market diversification gaps are 50 bps to enter
-and 100 bps to remain selected. Yield-driven membership changes require 1,800
+Its base weights are 50/30/20 for three markets or 40/30/20/10 for four. A
+fourth eligible, target-capable market is used exactly when the best-to-fourth
+conservative APY gap is at most 250 bps. If the best market is more than 200 APY
+bps above the average of the other selected markets, its target is boosted to
+the 70% cap and the remaining 30% preserves the base relative weights:
+70/18/12 or 70/15/10/5. For a yield-driven target transition, the checked-in
+policy requires at least 200 APY bps of conservative ranking improvement, at
+least 250 APY bps of exact current-position underperformance before exit, and at
+least 100 APY bps of post-probe improvement. These are exact compounded-APY
+comparisons, not simple APR aliases. Yield-driven membership changes require 1,800
 canonical seconds; an invalid market is removed immediately.
 
 Relevant events trigger exact refreshes. Independently, every 300 canonical
@@ -694,10 +697,11 @@ the final snapshot, the vault held 29 USDC total: 1.25 USDC in the configured
 liquidity adapter and 27.751493 USDC in direct positions. Direct assets were
 approximately 11.200597 USDC in each of the two leading markets, 5.070283 USDC
 in the third selected market, and 0.280016 USDC residual in the former market.
-The vault is below the configured 25,000 USDC threshold for a four-market set,
-so the active target is 40/40/20 across three markets. The remaining sub-USDC
-deviation is below the configured 1 USDC minimum action and correctly produced
-no further plan.
+That validation artifact used the previous 25,000 USDC fourth-market threshold
+and therefore targeted 40/40/20 across three markets. The current policy removes
+that TVL threshold and instead uses the single 250 bps best-to-fourth APY rule.
+The remaining sub-USDC deviation was below the configured 1 USDC minimum action
+and correctly produced no further plan under the tested release.
 
 The final selected-market native supply APYs were approximately 7.0911%,
 7.0343%, and 6.7943%; the residual former market supplied approximately 1.0058%.
@@ -916,7 +920,8 @@ market-to-market strategy and did not share its target policy.
 
 **Resolution:** `top_k_apy_diversified` owns one pure target policy used by both
 capital deployment and ongoing rebalancing. Liquidity maintenance remains first;
-fresh capital then fills confirmed 40/40/20 or 35/35/15/15 target deficits.
+fresh capital fills the same confirmed weighted-target deficits used by routine
+rebalancing.
 
 ### 20.16 Latest nonce could outrun canonical receipt ingestion
 
@@ -1113,8 +1118,11 @@ closed-form proof over every possible asset amount. This is likely acceptable
 for 5–20 second operation, but senior review should confirm that the lattice and
 90% tranche cannot systematically miss materially better movements.
 
-**Recommended test:** differential brute force on reduced domains and randomized
-multi-market cases, comparing chosen movement to every feasible integer amount.
+The current suite now differentially compares both utilization and rate solvers
+with every feasible integer movement in reduced domains, including exact cap
+boundaries and cumulative episode-budget behavior. Randomized larger
+multi-market differential testing remains useful independent assurance, but the
+previously missing exhaustive small-domain regression is no longer a code gap.
 
 ### 21.8 Live external-state stress coverage is incomplete
 
@@ -1260,3 +1268,223 @@ post-state reconciliation records. This closes the local-code, CI, deployment,
 small-value execution-liveness, restart, and same-host recovery gates. It does
 not remove the explicit economic-scale, signer-host, provider-independence,
 fresh-host recovery, or external-review risks listed above.
+
+## 24. Production Rust design review
+
+### 24.1 Review scope and behavior-preservation boundary
+
+The implementation was compared against two pinned Rust systems as engineering
+references only:
+
+- LambdaClass Ethrex commit
+  [`797df554`](https://github.com/lambdaclass/ethrex/tree/797df5540c7d35cafd69b6971a74b2a49c67d1dd),
+  inspected for resource ownership, storage boundaries, adversarial decoding,
+  error classification, stable encodings, supervision, and metrics APIs.
+- Anthias Labs `market-making-pm` commit
+  [`4aafee84`](https://github.com/anthias-labs/market-making-pm/tree/4aafee84e4d0c798ad43a94cb56bda53f9cb2470),
+  inspected for single-owner state publication, validated configuration groups,
+  clocks, bounded channels, durable writers, and lifecycle state machines.
+
+No execution-client, market-making, or strategy logic was copied. The focused
+cleanup described in this section preserves the already-modified working tree's
+allocation, transaction, recovery, and failure policy. The larger uncommitted
+working tree also contains intentional Top-K schema and strategy changes that
+predate this cleanup and are not being characterized as behavior-preserving here.
+Findings that would require another policy change are recorded below rather than
+silently folded into the cleanup.
+
+All improvements in this section are local working-tree changes. In particular,
+the new API binding, provider-consensus, and Top-K configuration modules must be
+included in a future reviewed commit; this section is not release evidence by
+itself.
+
+### 24.2 Behavior-preserving improvements applied
+
+**One provider-consensus primitive.** Receipt discovery and nonce/transaction
+recovery previously implemented the same optional-view truth table separately.
+`chain/provider_consensus.rs` now owns one generic pure selector:
+
+- matching non-null values agree;
+- a value remains usable beside a provider error or `None`;
+- conflicting non-null values fail closed;
+- all `None` means confirmed absence; and
+- with no value, the first error in configured provider order is retained.
+
+The pure helper also treats an empty iterator as absence to preserve its callers'
+previous behavior. Production callers guarantee at least one configured provider;
+empty input must not be used as independent evidence that a transaction is absent.
+
+Independent provider requests are issued concurrently and their completed
+results are still interpreted in configured order. This preserves the previous
+error semantics while bounding latency to the slowest provider instead of the
+sum of provider timeouts. Truth-table and delayed-provider tests cover the
+contract.
+
+**Owned API binding.** Startup previously bound a probe listener, dropped it,
+and later rebound the same address inside the supervised API worker. A second
+process could acquire the port in that interval. `ReadOnlyApiBinding` now owns
+the initially validated `TcpListener` until the first API worker takes it. A
+later call can rebind the resolved address; in the current serial supervisor flow,
+that happens only after the serving worker exits. The API routes, nonzero
+configured bind address, restart policy, and response schema are unchanged. When
+port zero is used in tests, the resolved OS-selected port is deliberately retained.
+
+**Configuration group ownership.** Top-K defaults, raw schema, validation, and
+canonical conversion now live together in `config/top_k.rs`. The parent config
+module delegates to that group instead of containing a second long sequence of
+field-specific rules and conversions. That extraction preserves the fields,
+defaults, validation order, exact units, and canonical revision of the
+already-modified Top-K working state; it does not claim equivalence to `HEAD`'s
+older Top-K policy.
+
+**Pure time-dependent config validation.** `AppConfig::validate()` obtains wall
+time only at its outer shell and delegates to deterministic `validate_at(now)`.
+An exact-boundary test proves reward evidence is accepted through its configured
+horizon and rejected one second later. EVM timestamps remain the only clock used
+for protocol projection; this refactor does not introduce wall time into planner
+math.
+
+**Typed operational metrics.** Runtime string lookup has been replaced by
+closed `OperationalGauge` and `OperationalCounter` enums backed by exhaustive
+typed handles. A misspelled metric can no longer become `UnknownMetric` and
+restart a worker. Prometheus names and output are unchanged and are checked by
+the complete-registration test.
+
+**Stable hash-domain enum codes.** `IdleLockKind` and `RateObjectiveBranch` now
+have explicit discriminants and exhaustive `stable_code()` mappings. Reordering
+or inserting a future enum variant cannot silently change lock or episode
+identity. Tests freeze every current code.
+
+**Explicit ownership warnings.** The RAII `ExecutionLease`, `ProcessGuards`, and
+bound API socket are `#[must_use]`. Accidentally dropping one now produces a
+compiler warning because dropping it releases a reservation, process guard, or
+bound listener.
+
+**Narrower implementation surface.** The internal storage command enum is no
+longer public, and unused hypothetical channel-capacity constants were removed.
+Only the channel that actually exists remains declared. `redundant_clone` also
+remains enabled repository-wide.
+
+**Shared existing workflows.** Exact post-confirmation and revert recovery use
+one current-strategy-state implementation, while provider recovery uses the
+same consensus primitive for nonce, header, receipt, and transaction views.
+Domain-specific callers still decide what absence or disagreement means.
+
+### 24.3 Strong patterns already present and retained
+
+The target already implements several reference ideas as well as or better than
+either source repository:
+
+- semantic assets, shares, rates, addresses, market IDs, plan IDs, and
+  transaction states instead of broad primitive aliases;
+- compile-fail type-boundary tests;
+- a pure planner with no RPC, signer, storage, environment, wall clock, or
+  telemetry dependency;
+- capability-specific provider traits rather than a generic JSON-RPC escape
+  hatch;
+- a signer API limited to a validated reallocation, identical-calldata fee
+  replacement, and known same-nonce cancellation;
+- strict raw-to-validated configuration with unknown-field rejection and a
+  canonical configuration revision;
+- deterministic `BTreeMap`/`BTreeSet` use where iteration affects hashes or
+  plans;
+- one bounded, timed, instrumented storage owner with durable-before-ack writes;
+- latest-value `watch` channels for replaceable heads/plans while canonical
+  events remain durable and ordered;
+- `JoinSet` supervision with retained task identities, panic detection, and
+  typed restart/quarantine/process dispositions;
+- bounded alert queues and bounded RPC retry policy;
+- no unsafe code, production panic/unwrap/expect, unchecked indexing, protocol
+  floating point, or unchecked arithmetic; and
+- release overflow checks and a curated Alloy feature set.
+
+These parts were not rewritten merely to resemble the references.
+
+### 24.4 Confirmed design findings intentionally not changed in this cleanup
+
+These are evidence-backed review items, not claims that a loss has occurred.
+They require an explicit behavior decision and corresponding end-to-end tests.
+
+**Preflight failure scope is represented by stage strings.** A failed
+authoritative snapshot subcall is vault-scoped and retryable in the normal state
+refresh path, but the final-preflight classifier currently maps it to
+`FatalAt("exact_snapshot")`. Execution maps any such fatal preflight stage to a
+shared-signer quarantine. With multiple vaults using one allocator, a temporary
+getter revert in one vault can therefore pause all of them until recovery or
+restart. Code-identity mismatch also reaches the broad fatal branch while the
+identity alert predicate recognizes different stage strings.
+
+The correct structural repair is a closed failure kind plus explicit scope,
+for example context race, provider outage, vault read unavailable, vault
+unsupported, signer ambiguity, and local durability failure. Each originating
+error variant should have a table-tested scope and disposition. That changes
+failure policy, so it is not part of this behavior-preserving pass.
+
+**`ApiDataStore` is a multi-writer coordination cache.** State refresh,
+preflight, and current-state recovery can all replace one vault snapshot, while
+planning/execution also read the cache. Snapshot replacement and plan clearing
+are unconditional. A slow block-N writer can overwrite block N+1, or a stale
+clear can remove a newer plan. Existing fingerprint and revision gates should
+reject stale signing, so the demonstrated risk is extra refresh/replanning or a
+missed planning wake-up rather than arbitrary execution.
+
+The appropriate redesign is one state-owned, monotonic, immutable per-vault
+artifact set containing generation, snapshot, rates, plan, and episode. Plan
+removal should compare the expected plan/generation. Preflight and reconciliation
+should return their exact state directly rather than republishing into the
+planning cache. That changes runtime ownership and must be delivered with race
+tests, so it is documented rather than partially implemented here.
+
+**Durable JSON readers have integrity checks but no input-size ceiling.** The
+checkpoint, manifest, and journal segment are read completely before parsing.
+Normal writers rotate journal segments, but a corrupt or externally restored
+oversized file can consume excessive memory before the health endpoint starts.
+A future hardening patch should check metadata limits, stream JSONL with line and
+record bounds, preserve partial-tail handling, and property-test arbitrary
+truncation/corruption. This changes accepted recovery input and therefore remains
+separate.
+
+### 24.5 Further structural cleanup that is safe but not urgent
+
+- Split the single storage owner without changing its commit point into state,
+  journal, migrations, commands, handle, and service modules. Do not replace it
+  with a generic database layer.
+- Continue splitting configuration into raw, validated, validation, canonical,
+  vault, and strategy groups. Make validated fields opaque only alongside
+  invariant-preserving test builders and revision recomputation.
+- Add a small lifecycle tracing context or spans carrying vault, block, snapshot,
+  plan, nonce, and transaction identifiers. Do not import either reference's
+  very large observability subsystem.
+- Consolidate the three Top-K load/observe/persist call sequences behind one
+  runtime state owner while leaving the pure strategy in `planner/`.
+- Add an ordered migration table with compile-time coverage for every supported
+  JSON format transition.
+- Share deterministic fixture builders across integration tests after the
+  validated-config surface is made opaque.
+
+### 24.6 Patterns deliberately rejected
+
+- Do not turn one deployable bot into Ethrex's or `market-making-pm`'s large
+  multi-crate workspace. Internal modules provide the required boundaries.
+- Do not copy either reference's giant source files, repeated specification
+  prose, TODO paths, catch-all string errors, permissive casts, or production
+  unwraps.
+- Do not copy Ethrex's architecture-specific CPU flags; the released binary must
+  remain portable across the supported Linux hosts.
+- Do not add floating-point duration/rate logic, global Prometheus registration,
+  or unbounded RPC/task channels.
+- Do not replace the current JSON owner with a generic pluggable database or the
+  market maker's WAL format. Its one-writer/checksum/fsync model is already
+  appropriate.
+- Do not globally prohibit hash collections. Canonical paths already use ordered
+  collections; membership-only sets do not need canonical iteration.
+- Do not replace object-safe provider/signer traits wholesale with RPITIT. Several
+  runtime boundaries intentionally use `dyn`; boxed-future overhead is expected
+  to be immaterial for these network-bound calls.
+- Do not introduce compile-time chain/provider features. Runtime configuration,
+  protocol locks, and code hashes are the required chain-neutral model.
+- Do not add hot-reload classes without an atomic configuration-revision reload
+  design.
+- Do not copy a global fence/sequencer or pervasive typestate framework. Durable
+  EVM event ordering, latest-wins planning, and existing startup gates already
+  represent the real state transitions.

@@ -215,6 +215,7 @@ pub enum ReservationError {
 }
 
 /// RAII lease that releases every resource on all return paths.
+#[must_use = "dropping the execution lease releases its resource reservation"]
 pub struct ExecutionLease {
     held: Arc<Mutex<BTreeSet<ExecutionResource>>>,
     resources: BTreeSet<ExecutionResource>,
@@ -393,11 +394,19 @@ pub async fn execute_one_head_preflight(
     );
     let scenarios = prepared.scenarios;
     let plan = prepared.plan;
-    let head = plan.plan().snapshot.block;
+    let snapshot_head = plan.plan().snapshot.block;
+    let planning_head = scenarios
+        .first()
+        .map(|scenario| scenario.canonical_block)
+        .ok_or(PreflightError::RefreshAndReplan)?;
     if scenarios
         .iter()
-        .any(|scenario| scenario.canonical_block != head)
+        .any(|scenario| scenario.canonical_block != planning_head)
         || plan.plan().vault != vault.address
+        || match config.app.snapshot.mode {
+            SnapshotMode::PinnedBlock => planning_head != snapshot_head,
+            SnapshotMode::AtomicLatest => planning_head.number < snapshot_head.number,
+        }
     {
         return Err(PreflightError::RefreshAndReplan);
     }
@@ -405,7 +414,7 @@ pub async fn execute_one_head_preflight(
         storage,
         vault,
         plan.plan().projection.movement_assets,
-        head.timestamp,
+        planning_head.timestamp,
     )
     .await?;
     let expected_actions = expected_action_records(&plan, &prepared.action_projections, vault)?;
@@ -413,7 +422,7 @@ pub async fn execute_one_head_preflight(
     let calldata_hash = keccak256(&calldata);
     let simulation_before_hash = context_hash(&[
         plan.plan().plan_hash.as_slice(),
-        head.hash.as_slice(),
+        planning_head.hash.as_slice(),
         calldata_hash.as_slice(),
     ]);
 
@@ -423,7 +432,7 @@ pub async fn execute_one_head_preflight(
     let simulation_head = if config.app.snapshot.mode == SnapshotMode::AtomicLatest {
         head_provider.latest_header().await?
     } else {
-        head
+        planning_head
     };
     let (call_output, gas_estimate) = tokio::try_join!(
         simulator.call_at(
@@ -475,14 +484,14 @@ pub async fn execute_one_head_preflight(
         &config.app.execution,
     )?;
     storage
-        .persist_plan(plan.plan().clone(), head.timestamp)
+        .persist_plan(plan.plan().clone(), planning_head.timestamp)
         .await?;
     let elapsed_nanos =
         u64::try_from(started.elapsed().as_nanos()).map_err(|_| PreflightError::ClockRange)?;
     let preflight_id = final_preflight_id(
         request.transaction_id,
         plan.plan().plan_id,
-        head,
+        planning_head,
         calldata_hash,
         simulation_before_hash,
         simulation_after_hash,
@@ -491,16 +500,16 @@ pub async fn execute_one_head_preflight(
         .persist_final_preflight(FinalPreflightRecord {
             preflight_id,
             plan_id: plan.plan().plan_id,
-            head,
+            head: planning_head,
             simulation_before_hash,
             simulation_after_hash,
-            event_cursor_number: head.number,
+            event_cursor_number: planning_head.number,
             calldata_hash,
             gas_estimate,
             signed_gas_limit: gas_limit,
             expected_actions,
             completed_monotonic_nanos: elapsed_nanos,
-            created_at: head.timestamp,
+            created_at: planning_head.timestamp,
         })
         .await?;
     tracing::debug!(
@@ -513,7 +522,8 @@ pub async fn execute_one_head_preflight(
         &plan,
         transaction,
         request.transaction_id,
-        head.timestamp,
+        planning_head.number,
+        planning_head.timestamp,
     )
     .await?;
     tracing::debug!(
@@ -562,7 +572,7 @@ pub async fn execute_one_head_preflight(
     let elapsed_millis =
         u64::try_from(started.elapsed().as_millis()).map_err(|_| PreflightError::ClockRange)?;
     let strict_context_changed = config.app.snapshot.mode == SnapshotMode::PinnedBlock
-        && (gate_head != head || require_cursor(gate_cursor, head).is_err());
+        && (gate_head != planning_head || require_cursor(gate_cursor, planning_head).is_err());
     if strict_context_changed
         || invalidation_queued
         || gate_nonce != request.nonce
@@ -579,7 +589,7 @@ pub async fn execute_one_head_preflight(
             latency_exceeded,
             "same-head preflight deferred"
         );
-        abort_unsigned_rebalance(storage, &durable, head.timestamp).await?;
+        abort_unsigned_rebalance(storage, &durable, planning_head.timestamp).await?;
         return Err(if gate_nonce != request.nonce {
             PreflightError::NonceChanged
         } else if latency_exceeded {
@@ -612,8 +622,8 @@ pub async fn execute_one_head_preflight(
         .record_attempt_broadcast(
             request.transaction_id,
             signed.transaction_hash,
-            head.timestamp,
-            head.number,
+            planning_head.timestamp,
+            planning_head.number,
         )
         .await?;
     let submitted_hash = submission?;
@@ -626,10 +636,10 @@ pub async fn execute_one_head_preflight(
             expected_state: TransactionState::Signed,
             next_state: TransactionState::Submitted,
             transaction_hash: Some(signed.transaction_hash),
-            submitted_at: Some(head.timestamp),
+            submitted_at: Some(planning_head.timestamp),
             included_block: None,
             included_block_hash: None,
-            updated_at: head.timestamp,
+            updated_at: planning_head.timestamp,
         })
         .await?;
     if sign_started.elapsed().as_millis()
@@ -639,9 +649,9 @@ pub async fn execute_one_head_preflight(
     }
     Ok(SubmittedPreflight {
         context: FinalPreflightContext {
-            snapshot_block_number: head.number,
-            snapshot_block_hash: head.hash,
-            snapshot_block_timestamp: head.timestamp,
+            snapshot_block_number: snapshot_head.number,
+            snapshot_block_hash: snapshot_head.hash,
+            snapshot_block_timestamp: snapshot_head.timestamp,
             simulation_before_hash,
             simulation_after_hash,
             signing_gate_hash,

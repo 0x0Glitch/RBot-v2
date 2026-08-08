@@ -29,6 +29,8 @@ pub enum DirtyReason {
     PostTransaction,
     /// Canonical five-minute strategy evaluation requires fresh exact rates and planning.
     StrategyTick,
+    /// An event-triggered spread episode needs its next canonical confirmation/rebalance pass.
+    StrategyContinuation,
 }
 
 /// Complete immutable key that makes stale plan publication structurally detectable.
@@ -69,6 +71,31 @@ impl PlanningRevision {
             && topology_revision == self.topology_revision
             && config_revision == self.config_revision
             && self.latest_relevant_event_block <= block.number
+    }
+
+    /// Rebinds an unprocessed event generation to a newer exact snapshot that contains it.
+    /// Ordinary canonical time can advance without creating a new relevant-event revision; a
+    /// restarted planner must still consume the durable trigger instead of waiting indefinitely
+    /// for another event. Read-set/topology/config identity may never be borrowed across this
+    /// boundary.
+    #[must_use]
+    pub fn rebind_to_covered_snapshot(
+        &self,
+        block: BlockRef,
+        fingerprint: B256,
+        topology_revision: B256,
+        config_revision: B256,
+    ) -> Option<Self> {
+        if self.latest_relevant_event_block > block.number
+            || self.topology_revision != topology_revision
+            || self.config_revision != config_revision
+        {
+            return None;
+        }
+        let mut rebound = self.clone();
+        rebound.snapshot_block = block;
+        rebound.snapshot_fingerprint = fingerprint;
+        Some(rebound)
     }
 }
 
@@ -120,6 +147,16 @@ impl DirtyAccumulator {
                 );
             }
         }
+    }
+
+    /// Schedules the next canonical observation of an already-triggered spread episode.
+    pub fn mark_strategy_continuation(&mut self, vault: VaultAddress, block_number: u64) {
+        self.mark(
+            vault,
+            block_number,
+            DirtyReason::StrategyContinuation,
+            false,
+        );
     }
 
     /// Merges every invalidation from one canonical block into affected vault state.
@@ -223,6 +260,13 @@ impl DirtyAccumulator {
         for vault in &config.app.vaults {
             self.mark(vault.address, block_number, DirtyReason::Reorg, true);
         }
+    }
+
+    /// Marks one vault dirty after any known allocator attempt is canonically included.
+    /// Successful routine calls, reverts, and cancellations all require an exact post-receipt
+    /// snapshot before the nonce lane may resume ordinary planning.
+    pub fn mark_post_transaction(&mut self, vault: VaultAddress, block_number: u64) {
+        self.mark(vault, block_number, DirtyReason::PostTransaction, false);
     }
 
     /// Returns whether any vault needs an exact snapshot/planning generation.
@@ -377,6 +421,22 @@ mod tests {
         event_above_snapshot.latest_relevant_event_block = 11;
         assert!(!event_above_snapshot.accepts_snapshot(block(10), fingerprint, topology, config));
         assert!(!revision.accepts_snapshot(block(10), fingerprint, B256::repeat_byte(8), config));
+        let rebound = revision
+            .rebind_to_covered_snapshot(block(12), B256::repeat_byte(7), topology, config)
+            .expect("newer exact snapshot covers the same event generation");
+        assert_eq!(rebound.snapshot_block, block(12));
+        assert_eq!(rebound.snapshot_fingerprint, B256::repeat_byte(7));
+        assert_eq!(rebound.planner_generation, revision.planner_generation);
+        assert!(
+            revision
+                .rebind_to_covered_snapshot(
+                    block(12),
+                    B256::repeat_byte(7),
+                    B256::repeat_byte(8),
+                    config,
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -424,5 +484,27 @@ mod tests {
             .expect("strategy tick revision");
         assert_eq!(revision.latest_relevant_event_block, 300);
         assert!(revision.dirty_reasons.contains(&DirtyReason::StrategyTick));
+    }
+
+    #[test]
+    fn active_episode_continuation_advances_on_the_next_canonical_head() {
+        let vault = VaultAddress(Address::with_last_byte(1));
+        let mut dirty = DirtyAccumulator::default();
+        dirty.mark_strategy_continuation(vault, 301);
+        let revision = dirty
+            .bind_snapshot(
+                vault,
+                B256::repeat_byte(2),
+                B256::repeat_byte(3),
+                block(301),
+                B256::repeat_byte(4),
+            )
+            .expect("continuation revision");
+        assert_eq!(revision.latest_relevant_event_block, 301);
+        assert!(
+            revision
+                .dirty_reasons
+                .contains(&DirtyReason::StrategyContinuation)
+        );
     }
 }

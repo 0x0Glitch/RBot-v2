@@ -8,20 +8,25 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
 use morpho_v2_reallocator::chain::ChainError;
-use morpho_v2_reallocator::chain::heads::{ChainService, ChainServiceConfig};
+use morpho_v2_reallocator::chain::heads::{CanonicalLogFilter, ChainService, ChainServiceConfig};
 use morpho_v2_reallocator::chain::provider::{
     ChainDataProvider, ProviderError, ProviderRole, RpcLog, RpcReceipt,
 };
-use morpho_v2_reallocator::domain::BlockRef;
+use morpho_v2_reallocator::domain::{BlockRef, TransactionId, VaultAddress};
 use morpho_v2_reallocator::runtime::messages::ChainUpdate;
 use morpho_v2_reallocator::storage::actor::StorageService;
+use morpho_v2_reallocator::storage::models::{
+    CanonicalLogRecord, NonceReservation, SignedTransactionRecord, TransactionState,
+    TransactionTransition,
+};
 use tempfile::TempDir;
 use tokio::sync::{RwLock, mpsc};
 
 const CHAIN_ID: u64 = 999;
+type LogQuery = (Vec<Address>, Vec<Option<Vec<B256>>>);
 
 #[derive(Clone)]
 struct FakeState {
@@ -36,6 +41,7 @@ struct FakeProvider {
     state: RwLock<FakeState>,
     header_reads: AtomicUsize,
     log_reads: AtomicUsize,
+    log_queries: RwLock<Vec<LogQuery>>,
     log_failures_remaining: AtomicUsize,
 }
 
@@ -58,24 +64,33 @@ impl FakeProvider {
             }),
             header_reads: AtomicUsize::new(0),
             log_reads: AtomicUsize::new(0),
+            log_queries: RwLock::new(Vec::new()),
             log_failures_remaining: AtomicUsize::new(0),
         }
     }
 
     fn checkpoint(blocks: Vec<BlockRef>) -> Self {
+        Self::checkpoint_with_receipts(blocks, Vec::new())
+    }
+
+    fn checkpoint_with_receipts(
+        blocks: Vec<BlockRef>,
+        receipts: Vec<(u64, Vec<RpcReceipt>)>,
+    ) -> Self {
         Self {
             name: "checkpoint".to_owned(),
-            roles: BTreeSet::from([ProviderRole::Checkpoint]),
+            roles: BTreeSet::from([ProviderRole::Checkpoint, ProviderRole::Receipt]),
             state: RwLock::new(FakeState {
                 blocks: blocks
                     .into_iter()
                     .map(|block| (block.number, block))
                     .collect(),
-                receipts: BTreeMap::new(),
+                receipts: receipts.into_iter().collect(),
                 block_receipts_supported: true,
             }),
             header_reads: AtomicUsize::new(0),
             log_reads: AtomicUsize::new(0),
+            log_queries: RwLock::new(Vec::new()),
             log_failures_remaining: AtomicUsize::new(0),
         }
     }
@@ -104,6 +119,55 @@ impl FakeProvider {
 
     fn log_reads(&self) -> usize {
         self.log_reads.load(Ordering::Relaxed)
+    }
+
+    async fn log_queries(&self) -> Vec<LogQuery> {
+        self.log_queries.read().await.clone()
+    }
+
+    async fn query_logs(
+        &self,
+        from: u64,
+        to: u64,
+        addresses: &[Address],
+        topics: &[Option<Vec<B256>>],
+    ) -> Result<Vec<RpcLog>, ProviderError> {
+        self.log_reads.fetch_add(1, Ordering::Relaxed);
+        self.log_queries
+            .write()
+            .await
+            .push((addresses.to_vec(), topics.to_vec()));
+        if self
+            .log_failures_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ProviderError::HttpStatus {
+                method: "eth_getLogs",
+                status: 429,
+            });
+        }
+        let state = self.state.read().await;
+        let address_set = addresses.iter().copied().collect::<BTreeSet<_>>();
+        Ok(state
+            .receipts
+            .range(from..=to)
+            .flat_map(|(_, receipts)| receipts)
+            .flat_map(|receipt| receipt.logs.iter())
+            .filter(|log| address_set.contains(&log.address))
+            .filter(|log| {
+                topics.iter().enumerate().all(|(index, accepted)| {
+                    accepted.as_ref().is_none_or(|accepted| {
+                        log.topics
+                            .get(index)
+                            .is_some_and(|observed| accepted.contains(observed))
+                    })
+                })
+            })
+            .cloned()
+            .collect())
     }
 }
 
@@ -158,29 +222,17 @@ impl ChainDataProvider for FakeProvider {
         to: u64,
         addresses: &[Address],
     ) -> Result<Vec<RpcLog>, ProviderError> {
-        self.log_reads.fetch_add(1, Ordering::Relaxed);
-        if self
-            .log_failures_remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return Err(ProviderError::HttpStatus {
-                method: "eth_getLogs",
-                status: 429,
-            });
-        }
-        let state = self.state.read().await;
-        let address_set = addresses.iter().copied().collect::<BTreeSet<_>>();
-        Ok(state
-            .receipts
-            .range(from..=to)
-            .flat_map(|(_, receipts)| receipts)
-            .flat_map(|receipt| receipt.logs.iter())
-            .filter(|log| address_set.contains(&log.address))
-            .cloned()
-            .collect())
+        self.query_logs(from, to, addresses, &[]).await
+    }
+
+    async fn logs_with_topics(
+        &self,
+        from: u64,
+        to: u64,
+        addresses: &[Address],
+        topics: &[Option<Vec<B256>>],
+    ) -> Result<Vec<RpcLog>, ProviderError> {
+        self.query_logs(from, to, addresses, topics).await
     }
 
     async fn receipt_by_hash(&self, hash: B256) -> Result<Option<RpcReceipt>, ProviderError> {
@@ -193,6 +245,21 @@ impl ChainDataProvider for FakeProvider {
             .flatten()
             .find(|receipt| receipt.transaction_hash == hash)
             .cloned())
+    }
+}
+
+struct TokenAccountFilter {
+    token: Address,
+    account: Address,
+}
+
+impl CanonicalLogFilter for TokenAccountFilter {
+    fn retain(&self, log: &CanonicalLogRecord) -> Result<bool, ChainError> {
+        let transfer = alloy::primitives::keccak256("Transfer(address,address,uint256)");
+        let account = B256::left_padding_from(self.account.as_slice());
+        Ok(log.address == self.token
+            && log.topics[0] == Some(transfer)
+            && (log.topics[1] == Some(account) || log.topics[2] == Some(account)))
     }
 }
 
@@ -260,6 +327,51 @@ fn receipt(block: BlockRef, tx: u8, address: Address) -> RpcReceipt {
             log_index: Some("0x0".to_owned()),
             removed: false,
         }],
+    }
+}
+
+fn reverted_receipt(block: BlockRef, transaction_hash: B256) -> RpcReceipt {
+    RpcReceipt {
+        transaction_hash,
+        block_hash: block.hash,
+        block_number: format!("0x{:x}", block.number),
+        transaction_index: "0x0".to_owned(),
+        status: Some("0x0".to_owned()),
+        gas_used: "0x5208".to_owned(),
+        logs: Vec::new(),
+    }
+}
+
+fn token_receipt(block: BlockRef, tx: u8, token: Address, relevant_account: Address) -> RpcReceipt {
+    let transfer = alloy::primitives::keccak256("Transfer(address,address,uint256)");
+    let topic = |address: Address| B256::left_padding_from(address.as_slice());
+    let transfer_log = |log_index: u8, from: Address, to: Address| RpcLog {
+        address: token,
+        topics: vec![transfer, topic(from), topic(to)],
+        data: Bytes::from(vec![0_u8; 32]),
+        block_number: Some(format!("0x{:x}", block.number)),
+        block_hash: Some(block.hash),
+        transaction_hash: Some(B256::repeat_byte(tx)),
+        transaction_index: Some("0x0".to_owned()),
+        log_index: Some(format!("0x{log_index:x}")),
+        removed: false,
+    };
+    RpcReceipt {
+        transaction_hash: B256::repeat_byte(tx),
+        block_hash: block.hash,
+        block_number: format!("0x{:x}", block.number),
+        transaction_index: "0x0".to_owned(),
+        status: Some("0x1".to_owned()),
+        gas_used: "0x5208".to_owned(),
+        logs: vec![
+            // Matching both indexed queries proves duplicate results are canonicalized once.
+            transfer_log(0, relevant_account, relevant_account),
+            transfer_log(
+                1,
+                Address::with_last_byte(0xe1),
+                Address::with_last_byte(0xe2),
+            ),
+        ],
     }
 }
 
@@ -450,13 +562,15 @@ async fn latest_only_log_retry_recovers_transiently_and_remains_bounded()
     let mut latest_config = config(watched, 4);
     latest_config.latest_only = true;
     latest_config.maximum_log_range = 1_000;
+    let provider_ready = Arc::new(AtomicBool::new(true));
     let chain = ChainService::new(
         Arc::clone(&unavailable),
         None,
         service.handle(),
         send,
         latest_config,
-    )?;
+    )?
+    .with_provider_readiness(Arc::clone(&provider_ready));
     assert!(matches!(
         chain.poll_once().await,
         Err(ChainError::Provider(ProviderError::HttpStatus {
@@ -465,6 +579,305 @@ async fn latest_only_log_retry_recovers_transiently_and_remains_bounded()
         }))
     ));
     assert_eq!(unavailable.log_reads(), 3);
+    assert!(
+        !provider_ready.load(Ordering::Acquire),
+        "any failed canonical poll must close the shared execution gate"
+    );
+    unavailable.fail_next_log_queries(0);
+    assert_eq!(chain.poll_once().await?.number, head.number);
+    assert!(
+        provider_ready.load(Ordering::Acquire),
+        "a complete recovered canonical poll must reopen the shared execution gate"
+    );
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn latest_only_catch_up_pins_a_logless_unresolved_receipt_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let watched = Address::with_last_byte(0x51);
+    let blocks = (10_u64..=100)
+        .map(|number| block(number, number as u8, number.saturating_sub(1) as u8))
+        .collect::<Vec<_>>();
+    let included = blocks
+        .iter()
+        .find(|block| block.number == 20)
+        .copied()
+        .ok_or("missing inclusion block fixture")?;
+    let raw = Bytes::from_static(&[0x02, 0x90, 0x01]);
+    let transaction_hash = alloy::primitives::keccak256(&raw);
+    let provider = Arc::new(FakeProvider::primary(
+        blocks,
+        vec![(20, vec![reverted_receipt(included, transaction_hash)])],
+    ));
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("logless-receipt.json"), 32, 1)?;
+    let handle = service.handle();
+    let transaction_id = TransactionId(B256::repeat_byte(0x71));
+    let signer = Address::with_last_byte(0x42);
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    let calldata = Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]);
+    handle
+        .reserve_nonce(NonceReservation {
+            transaction_id,
+            plan_id: None,
+            vault,
+            signer,
+            nonce: 7,
+            calldata_hash: alloy::primitives::keccak256(&calldata),
+            calldata,
+            max_fee_per_gas: U256::from(100_u64),
+            max_priority_fee_per_gas: U256::from(2_u64),
+            gas_limit: 500_000,
+            movement_assets: U256::from(10_u64),
+            created_block: 10,
+            created_at: 1_900_000_010,
+        })
+        .await?;
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id,
+            transaction_hash,
+            raw_signed_transaction: raw,
+            updated_at: 1_900_000_011,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(transaction_hash),
+            submitted_at: Some(1_900_000_012),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 1_900_000_012,
+        })
+        .await?;
+
+    let (send, _receive) = mpsc::channel(8);
+    let progress = Arc::new(AtomicUsize::new(0));
+    let recorded_progress = Arc::clone(&progress);
+    let mut latest_config = config(watched, 4);
+    latest_config.latest_only = true;
+    latest_config.maximum_log_range = 1_000;
+    let chain = ChainService::new(provider, None, handle.clone(), send, latest_config)?
+        .with_progress_callback(move || {
+            recorded_progress.fetch_add(1, Ordering::Relaxed);
+        });
+    chain.poll_once().await?;
+
+    assert_eq!(
+        handle.load_canonical_block(CHAIN_ID, 20).await?,
+        Some(included),
+        "a logless known receipt outside the recent window must pin its canonical header"
+    );
+    let persisted = handle
+        .load_canonical_receipt(CHAIN_ID, vec![transaction_hash])
+        .await?
+        .ok_or("known receipt was not persisted")?;
+    assert_eq!(persisted.status, Some(0));
+    assert!(
+        progress.load(Ordering::Relaxed) > 2,
+        "long catch-up must expose bounded progress before the complete poll returns"
+    );
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn latest_only_catch_up_uses_checkpoint_for_a_logless_unresolved_receipt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let watched = Address::with_last_byte(0x52);
+    let blocks = (10_u64..=100)
+        .map(|number| block(number, number as u8, number.saturating_sub(1) as u8))
+        .collect::<Vec<_>>();
+    let included = blocks
+        .iter()
+        .find(|block| block.number == 20)
+        .copied()
+        .ok_or("missing inclusion block fixture")?;
+    let raw = Bytes::from_static(&[0x02, 0x90, 0x02]);
+    let transaction_hash = alloy::primitives::keccak256(&raw);
+    let primary = Arc::new(FakeProvider::primary(blocks.clone(), Vec::new()));
+    let checkpoint = Arc::new(FakeProvider::checkpoint_with_receipts(
+        blocks,
+        vec![(20, vec![reverted_receipt(included, transaction_hash)])],
+    ));
+    let directory = TempDir::new()?;
+    let service = StorageService::start(
+        &directory.path().join("checkpoint-logless-receipt.json"),
+        32,
+        1,
+    )?;
+    let handle = service.handle();
+    let transaction_id = TransactionId(B256::repeat_byte(0x72));
+    let signer = Address::with_last_byte(0x42);
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    let calldata = Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]);
+    handle
+        .reserve_nonce(NonceReservation {
+            transaction_id,
+            plan_id: None,
+            vault,
+            signer,
+            nonce: 7,
+            calldata_hash: alloy::primitives::keccak256(&calldata),
+            calldata,
+            max_fee_per_gas: U256::from(100_u64),
+            max_priority_fee_per_gas: U256::from(2_u64),
+            gas_limit: 500_000,
+            movement_assets: U256::from(10_u64),
+            created_block: 10,
+            created_at: 1_900_000_010,
+        })
+        .await?;
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id,
+            transaction_hash,
+            raw_signed_transaction: raw,
+            updated_at: 1_900_000_011,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(transaction_hash),
+            submitted_at: Some(1_900_000_012),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 1_900_000_012,
+        })
+        .await?;
+
+    let (send, _receive) = mpsc::channel(8);
+    let mut latest_config = config(watched, 4);
+    latest_config.latest_only = true;
+    latest_config.maximum_log_range = 1_000;
+    let chain = ChainService::new(
+        primary,
+        Some(checkpoint),
+        handle.clone(),
+        send,
+        latest_config,
+    )?;
+    chain.poll_once().await?;
+
+    assert_eq!(
+        handle.load_canonical_block(CHAIN_ID, 20).await?,
+        Some(included),
+        "the independent receipt view must pin a logless inclusion omitted by the primary"
+    );
+    let persisted = handle
+        .load_canonical_receipt(CHAIN_ID, vec![transaction_hash])
+        .await?
+        .ok_or("checkpoint-only receipt was not persisted")?;
+    assert_eq!(persisted.status, Some(0));
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn conflicting_provider_receipts_fail_closed_without_canonical_persistence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let watched = Address::with_last_byte(0x53);
+    let blocks = (10_u64..=100)
+        .map(|number| block(number, number as u8, number.saturating_sub(1) as u8))
+        .collect::<Vec<_>>();
+    let included = blocks
+        .iter()
+        .find(|block| block.number == 20)
+        .copied()
+        .ok_or("missing inclusion block fixture")?;
+    let raw = Bytes::from_static(&[0x02, 0x90, 0x03]);
+    let transaction_hash = alloy::primitives::keccak256(&raw);
+    let primary_receipt = reverted_receipt(included, transaction_hash);
+    let mut checkpoint_receipt = primary_receipt.clone();
+    checkpoint_receipt.status = Some("0x1".to_owned());
+    let primary = Arc::new(FakeProvider::primary(
+        blocks.clone(),
+        vec![(20, vec![primary_receipt])],
+    ));
+    let checkpoint = Arc::new(FakeProvider::checkpoint_with_receipts(
+        blocks,
+        vec![(20, vec![checkpoint_receipt])],
+    ));
+    let directory = TempDir::new()?;
+    let service = StorageService::start(
+        &directory.path().join("conflicting-provider-receipts.json"),
+        32,
+        1,
+    )?;
+    let handle = service.handle();
+    let transaction_id = TransactionId(B256::repeat_byte(0x73));
+    let signer = Address::with_last_byte(0x42);
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    let calldata = Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]);
+    handle
+        .reserve_nonce(NonceReservation {
+            transaction_id,
+            plan_id: None,
+            vault,
+            signer,
+            nonce: 7,
+            calldata_hash: alloy::primitives::keccak256(&calldata),
+            calldata,
+            max_fee_per_gas: U256::from(100_u64),
+            max_priority_fee_per_gas: U256::from(2_u64),
+            gas_limit: 500_000,
+            movement_assets: U256::from(10_u64),
+            created_block: 10,
+            created_at: 1_900_000_010,
+        })
+        .await?;
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id,
+            transaction_hash,
+            raw_signed_transaction: raw,
+            updated_at: 1_900_000_011,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(transaction_hash),
+            submitted_at: Some(1_900_000_012),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 1_900_000_012,
+        })
+        .await?;
+
+    let (send, _receive) = mpsc::channel(8);
+    let mut latest_config = config(watched, 4);
+    latest_config.latest_only = true;
+    latest_config.maximum_log_range = 1_000;
+    let chain = ChainService::new(
+        primary,
+        Some(checkpoint),
+        handle.clone(),
+        send,
+        latest_config,
+    )?;
+
+    assert!(matches!(
+        chain.poll_once().await,
+        Err(ChainError::ProviderViewInconsistent)
+    ));
+    assert!(
+        handle
+            .load_canonical_receipt(CHAIN_ID, vec![transaction_hash])
+            .await?
+            .is_none(),
+        "conflicting provider evidence must not create a canonical receipt"
+    );
     service.shutdown().await?;
     Ok(())
 }
@@ -489,6 +902,55 @@ async fn unsupported_block_receipts_uses_checked_log_fallback()
     };
     assert_eq!(receipts.len(), 1);
     assert_eq!(logs.len(), 1);
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fallback_token_ingestion_uses_indexed_accounts_not_every_token_transfer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let token = Address::with_last_byte(0x51);
+    let account = Address::with_last_byte(0x52);
+    let head = block(10, 10, 9);
+    let provider = Arc::new(FakeProvider::primary(
+        vec![head],
+        vec![(10, vec![token_receipt(head, 0x53, token, account)])],
+    ));
+    provider.use_log_fallback().await;
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("token-fallback.json"), 32, 1)?;
+    let (send, mut receive) = mpsc::channel(8);
+    let chain = ChainService::new(
+        Arc::clone(&provider),
+        None,
+        service.handle(),
+        send,
+        config(token, 8),
+    )?
+    .with_log_filter(Arc::new(TokenAccountFilter { token, account }))
+    .with_indexed_token_accounts(BTreeMap::from([(token, BTreeSet::from([account]))]));
+
+    chain.poll_once().await?;
+    let Some(ChainUpdate::CanonicalBlock { receipts, logs, .. }) = receive.recv().await else {
+        return Err("missing indexed-token fallback block".into());
+    };
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].log_index, 0);
+
+    let queries = provider.log_queries().await;
+    assert_eq!(queries.len(), 2);
+    assert!(
+        queries
+            .iter()
+            .all(|(addresses, topics)| { addresses.as_slice() == [token] && !topics.is_empty() })
+    );
+    assert!(queries.iter().all(|(_, topics)| {
+        topics.first().and_then(Option::as_ref)
+            == Some(&vec![alloy::primitives::keccak256(
+                "Transfer(address,address,uint256)",
+            )])
+    }));
     service.shutdown().await?;
     Ok(())
 }

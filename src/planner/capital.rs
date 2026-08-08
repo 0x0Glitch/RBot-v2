@@ -23,6 +23,37 @@ use crate::{
     state::projection::ProjectedVaultView,
 };
 
+pub(crate) fn projected_cap_headroom(
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    reference: crate::domain::CapRef,
+) -> Option<U256> {
+    let cap = snapshot.caps.get(&reference)?;
+    if cap.absolute_cap.is_zero() || cap.relative_cap > WAD {
+        return Some(U256::ZERO);
+    }
+    let delta = projection
+        .vault
+        .cap_catch_up
+        .get(&reference)
+        .copied()
+        .unwrap_or(I256::ZERO);
+    let allocation = I256::try_from(cap.recorded_allocation)
+        .ok()?
+        .checked_add(delta)
+        .and_then(|value| U256::try_from(value).ok())?;
+    let relative_maximum = if cap.relative_cap < WAD {
+        mul_div_down(projection.vault.parent_total_assets, cap.relative_cap, WAD).ok()?
+    } else {
+        U256::MAX
+    };
+    Some(
+        cap.absolute_cap
+            .min(relative_maximum)
+            .saturating_sub(allocation),
+    )
+}
+
 pub(crate) fn cap_limited_allocation(
     snapshot: &ExactVaultSnapshot,
     projection: &ProjectedVaultView,
@@ -33,32 +64,67 @@ pub(crate) fn cap_limited_allocation(
         .affected_caps
         .iter()
         .try_fold(U256::MAX, |headroom, reference| {
-            let cap = snapshot.caps.get(reference)?;
-            if cap.absolute_cap.is_zero() || cap.relative_cap > WAD {
-                return Some(U256::ZERO);
-            }
-            let delta = projection
-                .vault
-                .cap_catch_up
-                .get(reference)
-                .copied()
-                .unwrap_or(I256::ZERO);
-            let allocation = I256::try_from(cap.recorded_allocation)
-                .ok()?
-                .checked_add(delta)
-                .and_then(|value| U256::try_from(value).ok())?;
-            let relative_maximum = if cap.relative_cap < WAD {
-                mul_div_down(projection.vault.parent_total_assets, cap.relative_cap, WAD).ok()?
-            } else {
-                U256::MAX
-            };
-            Some(
-                headroom.min(
-                    cap.absolute_cap
-                        .min(relative_maximum)
-                        .saturating_sub(allocation),
-                ),
-            )
+            Some(headroom.min(projected_cap_headroom(snapshot, projection, *reference)?))
+        })
+}
+
+pub(crate) fn allocation_cap_boundaries(
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    position: crate::domain::PositionKey,
+) -> Option<Vec<U256>> {
+    let stored = snapshot.positions.get(&position)?;
+    stored
+        .affected_caps
+        .iter()
+        .map(|reference| projected_cap_headroom(snapshot, projection, *reference))
+        .collect()
+}
+
+/// Returns conservative destination capacity for a market-to-market reallocation.
+///
+/// A direct adapter or collateral cap can be full while a net-zero reallocation is still valid:
+/// deallocating another position first releases the same shared cap before the destination is
+/// allocated. Net-new capital must use [`cap_limited_allocation`]; this helper additionally counts
+/// only assets that routine policy can release from other positions sharing each affected cap.
+pub fn reallocation_cap_limited_allocation(
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    vault: &ValidatedVaultConfig,
+    destination: crate::domain::PositionKey,
+) -> Option<U256> {
+    let stored = snapshot.positions.get(&destination)?;
+    stored
+        .affected_caps
+        .iter()
+        .try_fold(U256::MAX, |capacity, reference| {
+            let released = vault
+                .positions
+                .iter()
+                .filter(|configured| configured.position_key != destination)
+                .filter(|configured| {
+                    matches!(
+                        configured.mode,
+                        MarketMode::Active | MarketMode::SourceOnly | MarketMode::Disabled
+                    )
+                })
+                .filter(|configured| {
+                    snapshot
+                        .positions
+                        .get(&configured.position_key)
+                        .is_some_and(|position| position.affected_caps.contains(reference))
+                })
+                .try_fold(U256::ZERO, |total, configured| {
+                    let current = projection
+                        .vault
+                        .position_expected_assets
+                        .get(&configured.position_key)
+                        .copied()?;
+                    total.checked_add(current.saturating_sub(configured.minimum_position_assets))
+                })?;
+            let available =
+                projected_cap_headroom(snapshot, projection, *reference)?.checked_add(released)?;
+            Some(capacity.min(available))
         })
 }
 

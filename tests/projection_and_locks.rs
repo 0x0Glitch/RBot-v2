@@ -22,7 +22,7 @@ use morpho_v2_reallocator::{
     planner::{
         candidates::build_candidate_lattice,
         cap_order::search_allocation_orders,
-        capital::solve_capital_deployment,
+        capital::{reallocation_cap_limited_allocation, solve_capital_deployment},
         episodes::RateSignalEpisode,
         liquidity::{LiquidityError, SharedTokenLiquidity, solve_liquidity_maintenance},
         objective::{complete_strategy_spread, rate_spread},
@@ -31,6 +31,10 @@ use morpho_v2_reallocator::{
         simulator::{
             no_plan_terminal_existing_shareholder_assets, no_plan_terminal_real_assets,
             simulate_actions,
+        },
+        top_k_apy::{
+            TopKApyTarget, TopKDeployableCapital, TopKMarketEvidence, TopKSolveLimits,
+            solve_top_k_capital_deployment, solve_top_k_rebalance,
         },
     },
     state::{
@@ -682,6 +686,122 @@ fn rate_solver_matches_exhaustive_tiny_domain_and_episode_budget_never_rearms()
 }
 
 #[test]
+fn rate_solver_includes_an_exact_market_cap_boundary_in_its_sparse_lattice()
+-> Result<(), Box<dyn Error>> {
+    let (mut snapshot, mut vault, mut validated) = two_market_fixture()?;
+    vault.minimum_action_assets = U256::ONE;
+    vault.maximum_immediate_rebalance_loss_assets = U256::from(10_u8);
+    for position in &mut vault.positions {
+        position.maximum_action_assets = U256::from(10_000_000_u64);
+    }
+    validated
+        .app
+        .strategy
+        .minimum_portfolio_improvement_rate_per_second
+        .0 = U256::ZERO;
+    validated.app.strategy.immediate_tranche_bps = 10_000;
+    validated.app.solver.maximum_amount_candidates_per_position = 32;
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x19),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp,
+        gas_limit: snapshot.context.block.gas_limit,
+    };
+    let initial_projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let mut by_rate = initial_projection.markets.values().collect::<Vec<_>>();
+    by_rate.sort_by_key(|market| market.spot_borrow_rate);
+    let source_market = by_rate
+        .first()
+        .ok_or_else(|| std::io::Error::other("source market missing"))?
+        .market_id;
+    let destination_market = by_rate
+        .last()
+        .ok_or_else(|| std::io::Error::other("destination market missing"))?
+        .market_id;
+    let destination_position = snapshot
+        .positions
+        .values()
+        .find(|position| position.market_id == destination_market)
+        .ok_or_else(|| std::io::Error::other("destination position missing"))?;
+    let destination_market_cap = destination_position.affected_caps[2];
+    let exact_headroom = U256::from(7_000_003_u64);
+    let cap = snapshot
+        .caps
+        .get_mut(&destination_market_cap)
+        .ok_or_else(|| std::io::Error::other("destination market cap missing"))?;
+    cap.absolute_cap = cap
+        .recorded_allocation
+        .checked_add(exact_headroom)
+        .ok_or_else(|| std::io::Error::other("cap overflow"))?;
+    cap.relative_cap = U256::from(1_000_000_000_000_000_000_u64);
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let source_position = vault
+        .positions
+        .iter()
+        .find(|position| position.market_id == source_market)
+        .ok_or_else(|| std::io::Error::other("source config missing"))?;
+    let destination_position = vault
+        .positions
+        .iter()
+        .find(|position| position.market_id == destination_market)
+        .ok_or_else(|| std::io::Error::other("destination config missing"))?;
+    let mut episode = RateSignalEpisode::start(
+        vault.address,
+        vault.rate_group.id,
+        RateObjectiveBranch::Portfolio,
+        snapshot.context.block,
+        snapshot.context.static_config_revision,
+        snapshot.context.dynamic_topology_revision,
+        BTreeSet::from([source_market, destination_market]),
+        BTreeSet::from([source_market, destination_market]),
+        BTreeSet::from([source_market]),
+        BTreeSet::from([destination_market]),
+        head.timestamp,
+        head.timestamp + 1_000,
+    )?;
+    episode.confirm_short(head, Assets(U256::from(10_000_000_u64)))?;
+
+    let boundary_actions = vec![
+        V2Action::Deallocate {
+            position: source_position.position_key,
+            adapter: source_position.adapter,
+            data: encode_adapter_data(&source_position.market_params),
+            requested_assets: RequestedAssets(exact_headroom),
+        },
+        V2Action::Allocate {
+            position: destination_position.position_key,
+            adapter: destination_position.adapter,
+            data: encode_adapter_data(&destination_position.market_params),
+            requested_assets: RequestedAssets(exact_headroom),
+        },
+    ];
+    let boundary_state = simulate_actions(&snapshot, &projection, &vault, &boundary_actions)?;
+    let boundary_spread = complete_strategy_spread(
+        &BTreeSet::from([source_market, destination_market]),
+        &boundary_state.markets,
+        StrategyObjective::SpotBorrowRateSpread,
+    )
+    .ok_or_else(|| std::io::Error::other("boundary spread missing"))?;
+
+    let solved = solve_rate_rebalance(
+        &snapshot,
+        &projection,
+        &vault,
+        &validated.app.strategy,
+        &validated.app.solver,
+        &episode,
+    );
+    let best = solved
+        .best
+        .ok_or_else(|| std::io::Error::other("cap-boundary solver found no candidate"))?;
+    assert_eq!(best.objective.applicable_spread, boundary_spread);
+    assert!(best.objective.movement_assets >= exact_headroom - U256::ONE);
+    assert!(best.objective.movement_assets <= exact_headroom);
+    Ok(())
+}
+
+#[test]
 fn utilization_solver_matches_exhaustive_tiny_domain() -> Result<(), Box<dyn Error>> {
     let (snapshot, mut vault, mut validated) = two_market_fixture()?;
     vault.minimum_action_assets = U256::ONE;
@@ -782,6 +902,457 @@ fn utilization_solver_matches_exhaustive_tiny_domain() -> Result<(), Box<dyn Err
         exhaustive
     );
     assert!(best.objective.applicable_spread < best.before_spread);
+    Ok(())
+}
+
+#[test]
+fn top_k_reallocation_remains_live_when_the_shared_adapter_cap_is_full()
+-> Result<(), Box<dyn Error>> {
+    let (mut snapshot, mut vault, mut validated) = two_market_fixture()?;
+    vault.minimum_action_assets = U256::ONE;
+    vault.maximum_immediate_rebalance_loss_assets = U256::MAX;
+    vault.minimum_liquidity_adapter_assets = U256::ZERO;
+    vault.minimum_deposit_headroom_assets = U256::ZERO;
+    vault.minimum_atomic_exit_coverage_assets = U256::ZERO;
+    vault.minimum_source_token_liquidity_assets = U256::ZERO;
+    vault.rate_group.minimum_assets = U256::ZERO;
+    vault.rate_group.maximum_assets = U256::MAX;
+    for position in &mut vault.positions {
+        position.minimum_source_liquidity_assets = U256::ZERO;
+        position.maximum_source_utilization_wad = U256::from(1_000_000_000_000_000_000_u64);
+    }
+    let shared_adapter_cap = snapshot
+        .positions
+        .values()
+        .next()
+        .ok_or_else(|| std::io::Error::other("position missing"))?
+        .affected_caps[0];
+    let cap = snapshot
+        .caps
+        .get_mut(&shared_adapter_cap)
+        .ok_or_else(|| std::io::Error::other("shared adapter cap missing"))?;
+    cap.absolute_cap = cap.recorded_allocation;
+    cap.relative_cap = U256::from(1_000_000_000_000_000_000_u64);
+
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x31),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp,
+        gas_limit: snapshot.context.block.gas_limit,
+    };
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let mut ranked = projection.markets.values().collect::<Vec<_>>();
+    ranked.sort_by_key(|market| market.spot_supply_rate);
+    let source_market = ranked
+        .first()
+        .ok_or_else(|| std::io::Error::other("source market missing"))?
+        .market_id;
+    let destination_market = ranked
+        .last()
+        .ok_or_else(|| std::io::Error::other("destination market missing"))?
+        .market_id;
+    let source = vault
+        .positions
+        .iter()
+        .find(|position| position.market_id == source_market)
+        .ok_or_else(|| std::io::Error::other("source position missing"))?;
+    let destination = vault
+        .positions
+        .iter()
+        .find(|position| position.market_id == destination_market)
+        .ok_or_else(|| std::io::Error::other("destination position missing"))?;
+    let current = vault
+        .positions
+        .iter()
+        .map(|position| {
+            projection
+                .vault
+                .position_expected_assets
+                .get(&position.position_key)
+                .copied()
+                .map(|assets| (position.market_id, assets))
+        })
+        .collect::<Option<BTreeMap<_, _>>>()
+        .ok_or_else(|| std::io::Error::other("projected position missing"))?;
+    let source_assets = current[&source_market];
+    let destination_assets = current[&destination_market];
+    let movement = U256::from(100_000_000_u64)
+        .min(source_assets.saturating_sub(source.minimum_position_assets));
+    assert!(!movement.is_zero());
+
+    let destination_capacity = reallocation_cap_limited_allocation(
+        &snapshot,
+        &projection,
+        &vault,
+        destination.position_key,
+    )
+    .ok_or_else(|| std::io::Error::other("reallocation capacity missing"))?;
+    assert!(destination_capacity >= movement);
+
+    let target_assets = BTreeMap::from([
+        (source_market, source_assets - movement),
+        (destination_market, destination_assets + movement),
+    ]);
+    let evidence = projection
+        .markets
+        .values()
+        .map(|market| {
+            let configured = vault
+                .positions
+                .iter()
+                .find(|position| position.market_id == market.market_id)?;
+            let capacity = reallocation_cap_limited_allocation(
+                &snapshot,
+                &projection,
+                &vault,
+                configured.position_key,
+            )?;
+            Some((
+                market.market_id,
+                TopKMarketEvidence {
+                    market: market.market_id,
+                    current_rate: market.spot_supply_rate,
+                    post_probe_rate: market.spot_supply_rate,
+                    smoothed_rate: market.spot_supply_rate,
+                    ranking_rate: market.spot_supply_rate,
+                    destination_capacity: capacity,
+                },
+            ))
+        })
+        .collect::<Option<BTreeMap<_, _>>>()
+        .ok_or_else(|| std::io::Error::other("top-K evidence missing"))?;
+    let target = TopKApyTarget {
+        selected_markets: vec![destination_market, source_market],
+        target_assets_by_market: target_assets,
+        current_assets_by_market: current,
+        evidence_by_market: evidence,
+        target_direct_assets: source_assets + destination_assets,
+        current_score_wad: U256::from(1_000_000_000_000_000_000_u64),
+    };
+    validated.app.strategy.top_k_apy.entry_score_wad = U256::ZERO;
+    validated.app.strategy.top_k_apy.target_score_wad = U256::ZERO;
+    validated
+        .app
+        .strategy
+        .top_k_apy
+        .minimum_improvement_score_wad = U256::ZERO;
+    validated
+        .app
+        .strategy
+        .top_k_apy
+        .maximum_diversification_cost_apy_wad = U256::from(1_000_000_000_000_000_000_u64);
+    let solved = solve_top_k_rebalance(
+        &snapshot,
+        &projection,
+        &vault,
+        &validated.app.strategy.top_k_apy,
+        &target,
+        TopKSolveLimits {
+            immediate_tranche_bps: 10_000,
+            maximum_actions: 8,
+            maximum_nodes: 16,
+        },
+    )?;
+    let best = solved.best.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "full shared cap blocked a net-zero reallocation: reason={:?} rejections={:?}",
+            solved.no_action_reason, solved.certificate.rejection_counts
+        ))
+    })?;
+    assert_eq!(best.movement_assets, movement);
+    assert!(matches!(
+        best.actions.first(),
+        Some(V2Action::Deallocate { position, .. }) if *position == source.position_key
+    ));
+    assert!(matches!(
+        best.actions.get(1),
+        Some(V2Action::Allocate { position, .. }) if *position == destination.position_key
+    ));
+    Ok(())
+}
+
+#[test]
+fn top_k_capital_deployment_consumes_shared_cap_headroom_only_once() -> Result<(), Box<dyn Error>> {
+    let (mut snapshot, mut vault, _) = two_market_fixture()?;
+    vault.minimum_action_assets = U256::ONE;
+    vault.minimum_deposit_headroom_assets = U256::ZERO;
+    vault.minimum_atomic_exit_coverage_assets = U256::ZERO;
+    vault.minimum_liquidity_adapter_assets = U256::ZERO;
+    vault.rate_group.maximum_assets = U256::MAX;
+    let deposit = U256::from(100_000_000_u64);
+    snapshot.parent.idle_assets = deposit;
+    snapshot.parent.stored_total_assets = snapshot
+        .parent
+        .stored_total_assets
+        .checked_add(deposit)
+        .ok_or_else(|| std::io::Error::other("parent total overflow"))?;
+    let shared_adapter_cap = snapshot
+        .positions
+        .values()
+        .next()
+        .ok_or_else(|| std::io::Error::other("position missing"))?
+        .affected_caps[0];
+    let shared_headroom = U256::from(50_000_000_u64);
+    let cap = snapshot
+        .caps
+        .get_mut(&shared_adapter_cap)
+        .ok_or_else(|| std::io::Error::other("shared adapter cap missing"))?;
+    cap.absolute_cap = cap
+        .recorded_allocation
+        .checked_add(shared_headroom)
+        .ok_or_else(|| std::io::Error::other("shared cap overflow"))?;
+    cap.relative_cap = U256::from(1_000_000_000_000_000_000_u64);
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x39),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp,
+        gas_limit: snapshot.context.block.gas_limit,
+    };
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    let current = vault
+        .positions
+        .iter()
+        .map(|position| {
+            projection
+                .vault
+                .position_expected_assets
+                .get(&position.position_key)
+                .copied()
+                .map(|assets| (position.market_id, assets))
+        })
+        .collect::<Option<BTreeMap<_, _>>>()
+        .ok_or_else(|| std::io::Error::other("projected position missing"))?;
+    let per_market_target = deposit / U256::from(2_u8);
+    let targets = current
+        .iter()
+        .map(|(market, assets)| {
+            assets
+                .checked_add(per_market_target)
+                .map(|target| (*market, target))
+        })
+        .collect::<Option<BTreeMap<_, _>>>()
+        .ok_or_else(|| std::io::Error::other("target overflow"))?;
+    let evidence = projection
+        .markets
+        .values()
+        .map(|market| {
+            (
+                market.market_id,
+                TopKMarketEvidence {
+                    market: market.market_id,
+                    current_rate: market.spot_supply_rate,
+                    post_probe_rate: market.spot_supply_rate,
+                    smoothed_rate: market.spot_supply_rate,
+                    ranking_rate: market.spot_supply_rate,
+                    destination_capacity: U256::MAX,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let current_direct_assets = current
+        .values()
+        .copied()
+        .try_fold(U256::ZERO, U256::checked_add)
+        .ok_or_else(|| std::io::Error::other("current total overflow"))?;
+    let target = TopKApyTarget {
+        selected_markets: vault
+            .positions
+            .iter()
+            .map(|position| position.market_id)
+            .collect(),
+        target_assets_by_market: targets,
+        current_assets_by_market: current,
+        evidence_by_market: evidence,
+        target_direct_assets: current_direct_assets
+            .checked_add(deposit)
+            .ok_or_else(|| std::io::Error::other("target total overflow"))?,
+        current_score_wad: U256::MAX,
+    };
+    let solved = solve_top_k_capital_deployment(
+        &snapshot,
+        &projection,
+        &vault,
+        &target,
+        TopKDeployableCapital {
+            idle_assets: deposit,
+            liquidity_assets: U256::ZERO,
+            total_assets: deposit,
+        },
+        TopKSolveLimits {
+            immediate_tranche_bps: 10_000,
+            maximum_actions: 4,
+            maximum_nodes: 16,
+        },
+    )?;
+    assert_eq!(solved.actions.len(), 1);
+    let allocated = solved
+        .actions
+        .iter()
+        .try_fold(U256::ZERO, |total, action| match action {
+            V2Action::Allocate {
+                requested_assets, ..
+            } => total.checked_add(requested_assets.0),
+            V2Action::Deallocate { .. } => None,
+        });
+    assert_eq!(allocated, Some(shared_headroom));
+    assert_eq!(
+        solved
+            .pending
+            .ok_or_else(|| std::io::Error::other("shared-cap remainder missing"))?
+            .remaining_assets,
+        deposit - shared_headroom
+    );
+    Ok(())
+}
+
+#[test]
+fn liquidity_maintenance_splits_across_caps_in_one_atomic_plan() -> Result<(), Box<dyn Error>> {
+    let (mut snapshot, mut vault, validated) = two_market_fixture()?;
+    let source = vault
+        .positions
+        .iter()
+        .find(|position| {
+            position.adapter.0 == snapshot.parent.liquidity_adapter
+                && encode_adapter_data(&position.market_params) == snapshot.parent.liquidity_data
+        })
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("liquidity source missing"))?;
+    let second = vault
+        .positions
+        .iter()
+        .find(|position| position.position_key != source.position_key)
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("second destination missing"))?;
+    let mut third = source.clone();
+    third.market_params.collateral_token = Address::with_last_byte(0x32);
+    third.market_id = derive_market_id(&third.market_params);
+    third.position_key = derive_position_key(third.adapter, &third.market_params);
+    let third_cap_ids = direct_position_cap_data(third.adapter, &third.market_params).ids();
+    let third_caps = third_cap_ids.map(|id| CapRef {
+        vault: vault.address,
+        id,
+    });
+    for reference in third_caps.into_iter().skip(1) {
+        snapshot.caps.insert(
+            reference,
+            CapState {
+                reference,
+                id_data_hash: B256::repeat_byte(0x83),
+                absolute_cap: if reference == third_caps[2] {
+                    U256::from(50_000_000_u64)
+                } else {
+                    U256::from(2_000_000_000_000_u64)
+                },
+                relative_cap: U256::from(1_000_000_000_000_000_000_u64),
+                recorded_allocation: U256::ZERO,
+            },
+        );
+    }
+    snapshot.positions.insert(
+        third.position_key,
+        DirectMarketPositionState {
+            position_key: third.position_key,
+            adapter: third.adapter,
+            market_params: third.market_params,
+            market_id: third.market_id,
+            internal_supply_shares: U256::ZERO,
+            actual_morpho_supply_shares: U256::ZERO,
+            ignored_donation_shares: U256::ZERO,
+            market_dead_supply_shares: vault.minimum_market_dead_supply_shares,
+            expected_assets: U256::ZERO,
+            parent_recorded_market_allocation: U256::ZERO,
+            affected_caps: third_caps,
+            mode: third.mode,
+            reward_policy: third.reward_policy.clone(),
+        },
+    );
+    let template_market = snapshot
+        .markets
+        .get(&source.market_id)
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("market template missing"))?;
+    snapshot.markets.insert(
+        third.market_id,
+        StoredMarketState {
+            market_id: third.market_id,
+            params: third.market_params,
+            ..template_market
+        },
+    );
+    let adapter = snapshot
+        .adapters
+        .get_mut(&third.adapter)
+        .ok_or_else(|| std::io::Error::other("adapter missing"))?;
+    adapter.current_market_ids.push(third.market_id);
+    adapter.current_market_ids.sort_unstable();
+    adapter.historical_market_ids.insert(third.market_id);
+    vault.positions.push(third.clone());
+    vault
+        .positions
+        .sort_by_key(|position| position.position_key);
+
+    let source_caps = snapshot
+        .positions
+        .get(&source.position_key)
+        .ok_or_else(|| std::io::Error::other("source state missing"))?
+        .affected_caps;
+    let source_market_cap = snapshot
+        .caps
+        .get_mut(&source_caps[2])
+        .ok_or_else(|| std::io::Error::other("source market cap missing"))?;
+    source_market_cap.absolute_cap = source_market_cap
+        .recorded_allocation
+        .checked_add(U256::from(20_000_000_u64))
+        .ok_or_else(|| std::io::Error::other("source cap overflow"))?;
+    let second_caps = snapshot
+        .positions
+        .get(&second.position_key)
+        .ok_or_else(|| std::io::Error::other("second state missing"))?
+        .affected_caps;
+    let second_market_cap = snapshot
+        .caps
+        .get_mut(&second_caps[2])
+        .ok_or_else(|| std::io::Error::other("second market cap missing"))?;
+    second_market_cap.absolute_cap = second_market_cap
+        .recorded_allocation
+        .checked_add(U256::from(50_000_000_u64))
+        .ok_or_else(|| std::io::Error::other("second cap overflow"))?;
+
+    let head = BlockRef {
+        number: 101,
+        hash: B256::repeat_byte(0x41),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp,
+        gas_limit: snapshot.context.block.gas_limit,
+    };
+    let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
+    assert!(!projection.deposit_headroom_satisfied);
+    let solved =
+        solve_liquidity_maintenance(&snapshot, &projection, &vault, &validated.app.solver, 4);
+    assert!(solved.certificate.search_complete);
+    let state = solved
+        .state
+        .ok_or_else(|| std::io::Error::other("split maintenance plan missing"))?;
+    assert_eq!(solved.actions.len(), 3);
+    assert_eq!(
+        solved
+            .actions
+            .iter()
+            .filter(|action| matches!(action, V2Action::Deallocate { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        solved
+            .actions
+            .iter()
+            .filter(|action| matches!(action, V2Action::Allocate { .. }))
+            .count(),
+        2
+    );
+    state.validate_service_constraints(&snapshot, &vault)?;
     Ok(())
 }
 
@@ -937,7 +1508,7 @@ fn capital_solver_deploys_only_verified_unreserved_idle() -> Result<(), Box<dyn 
         constrained.parent.idle_assets - deployed
     );
 
-    let mut locked = snapshot.clone();
+    let mut locked = snapshot;
     locked
         .idle_locks
         .locks
@@ -1342,7 +1913,7 @@ fn vault_v1_liquidity_adapter_actions_use_exact_closed_simulation() -> Result<()
     let projection = project_snapshot_to_head(&snapshot, head, &vault)?;
     assert!(!projection.deposit_headroom_satisfied);
     let solver = config()?.app.solver;
-    let maintenance = solve_liquidity_maintenance(&snapshot, &projection, &vault, &solver);
+    let maintenance = solve_liquidity_maintenance(&snapshot, &projection, &vault, &solver, 8);
     assert!(maintenance.certificate.search_complete);
     assert_eq!(maintenance.actions.len(), 2);
     assert!(matches!(
@@ -1360,7 +1931,7 @@ fn vault_v1_liquidity_adapter_actions_use_exact_closed_simulation() -> Result<()
     let mut truncated_solver = solver;
     truncated_solver.maximum_nodes = 1;
     assert!(
-        !solve_liquidity_maintenance(&snapshot, &projection, &vault, &truncated_solver)
+        !solve_liquidity_maintenance(&snapshot, &projection, &vault, &truncated_solver, 8)
             .certificate
             .search_complete
     );

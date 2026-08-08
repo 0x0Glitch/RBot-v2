@@ -66,15 +66,19 @@ The spread objectives are:
   not APR.
 
 The Top-K policy ranks the minimum of current supply yield, exact post-deposit
-yield, and a downside-fast/upside-slow smoothed yield. It targets 40/40/20 across
-three markets or 35/35/15/15 across four. Membership changes require 30 minutes
-of canonical-time confirmation; invalid markets are removed immediately. The
-included policy requires at least 200 APY bps of conservative target improvement,
-at least 250 APY bps of exact current-position underperformance before exit, and
-at least 100 APY bps of post-probe replacement improvement. APY comparisons use
-the exact compounded annual yield derived from native per-second rates. The
-separate fourth-market diversification gaps are 50 bps to enter and 100 bps to
-remain selected. Strategy memory is durable across restarts and reorg-aware.
+yield, and a downside-fast/upside-slow smoothed yield. Its base targets are
+50/30/20 across three markets and 40/30/20/10 across four. A fourth eligible,
+target-capable market is used exactly when its conservative APY is no more than
+250 bps below the best market. When the best selected market exceeds the average
+APY of the other selected markets by more than 200 bps, its target becomes 70%;
+the remaining 30% preserves the base relative distribution, producing
+70/18/12 or 70/15/10/5. Membership changes require 30 minutes of canonical-time
+confirmation; invalid markets are removed immediately. The included policy
+requires at least 200 APY bps of conservative target improvement, at least 250
+APY bps of exact current-position underperformance before exit, and at least 100
+APY bps of post-probe replacement improvement. APY comparisons use the exact
+compounded annual yield derived from native per-second rates. Strategy memory is
+durable across restarts and reorg-aware.
 `enforce_gas_economic_gate` is an advanced profitability policy: when enabled,
 projected 24-hour recoverable gain must cover the configured conservative gas
 charge before signing. Disabling it permits curator-approved small-TVL operation

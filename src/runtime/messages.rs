@@ -7,20 +7,6 @@ use crate::storage::models::CanonicalLogRecord;
 
 /// Capacity of the critical chain-to-state channel.
 pub const CHAIN_TO_STATE_CAPACITY: usize = 1_024;
-/// Capacity of state-to-planner commands.
-pub const STATE_TO_PLANNER_CAPACITY: usize = 128;
-/// Capacity of planner-to-executor requests.
-pub const PLANNER_TO_EXECUTOR_CAPACITY: usize = 16;
-/// Capacity of executor-to-chain requests.
-pub const EXECUTOR_TO_CHAIN_CAPACITY: usize = 32;
-/// Capacity of executor-to-state messages.
-pub const EXECUTOR_TO_STATE_CAPACITY: usize = 64;
-/// Capacity of storage actor commands in production.
-pub const STORAGE_COMMAND_CAPACITY: usize = 4_096;
-/// Capacity of telemetry events.
-pub const TELEMETRY_EVENT_CAPACITY: usize = 2_048;
-/// Capacity of operator control commands.
-pub const CONTROL_COMMAND_CAPACITY: usize = 64;
 
 /// Canonical transaction receipt facts needed by chain consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]

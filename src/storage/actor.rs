@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
@@ -48,7 +48,15 @@ const JOURNAL_SEGMENT_EVENTS: u64 = 128;
 const HOT_BLOCK_RETENTION: u64 = 512;
 const HOT_SNAPSHOT_RETENTION: usize = 32;
 const HOT_PLAN_RETENTION: usize = 32;
-const HOT_TOPOLOGY_RETENTION: usize = 256;
+/// Largest configured canonical rewind that retains complete topology reconstruction evidence.
+pub const MAX_DURABLE_REORG_RESCAN_BLOCKS: u64 = 256;
+// Include both ends of the supported rewind interval. Topology is checkpointed at most once per
+// vault/block, so 257 revisions retain blocks `head - 256` through `head` independently for every
+// managed vault.
+const HOT_TOPOLOGY_RETENTION_PER_VAULT: usize = 257;
+const HOT_TOP_K_MEMORY_RETENTION_PER_VAULT: usize = 257;
+const HOT_TRANSACTION_RETENTION: usize = 1_024;
+const ROLLING_POLICY_RETENTION_SECONDS: u64 = 172_800;
 
 fn epoch_millis() -> u64 {
     SystemTime::now()
@@ -304,12 +312,15 @@ impl JsonStore {
         };
         self.append_journal(&record)?;
         self.journal_head_hash = checksum;
-        if next.revision.is_multiple_of(JOURNAL_SEGMENT_EVENTS) {
-            self.persist(&next)?;
-            self.checkpoint_revision = next.revision;
+        // The fsynced journal record is the commit point. Advance the in-memory owner before
+        // attempting the periodic checkpoint/manifest maintenance so a failure in those derived
+        // files cannot leave memory at revision N-1 while the durable hash chain is already at N.
+        self.state = next;
+        if self.state.revision.is_multiple_of(JOURNAL_SEGMENT_EVENTS) {
+            self.persist(&self.state)?;
+            self.checkpoint_revision = self.state.revision;
             self.checkpoint_head_hash = checksum;
         }
-        self.state = next;
         self.persist_manifest()?;
         if self.state.revision.is_multiple_of(JOURNAL_SEGMENT_EVENTS) {
             self.prune_checkpointed_segments()?;
@@ -546,6 +557,7 @@ fn replay_journal(
 }
 
 fn compact_hot_state(state: &mut JsonState) {
+    compact_lifecycle_history(state);
     let referenced_plan_ids = state
         .transactions
         .iter()
@@ -558,13 +570,43 @@ fn compact_hot_state(state: &mut JsonState) {
         .filter(|entry| referenced_plan_ids.contains(&entry.plan.plan_id))
         .map(|entry| entry.plan.clone())
         .collect::<Vec<_>>();
-    if state.topology_history.len() > HOT_TOPOLOGY_RETENTION {
-        let excess = state
-            .topology_history
-            .len()
-            .saturating_sub(HOT_TOPOLOGY_RETENTION);
-        state.topology_history.drain(..excess);
+    let mut topology_by_vault = BTreeMap::<VaultAddress, Vec<TopologyRevision>>::new();
+    for revision in state.topology_history.drain(..) {
+        topology_by_vault
+            .entry(revision.topology.vault)
+            .or_default()
+            .push(revision);
     }
+    for revisions in topology_by_vault.values_mut() {
+        revisions.sort_by_key(|revision| (revision.block.number, revision.block.hash));
+        let excess = revisions
+            .len()
+            .saturating_sub(HOT_TOPOLOGY_RETENTION_PER_VAULT);
+        revisions.drain(..excess);
+    }
+    state.topology_history = topology_by_vault.into_values().flatten().collect();
+    state
+        .topology_history
+        .sort_by_key(|revision| (revision.block.number, revision.topology.vault));
+    let mut top_k_by_vault = BTreeMap::<VaultAddress, Vec<TimedTopKApyMemory>>::new();
+    for memory in state.top_k_apy_memory.drain(..) {
+        top_k_by_vault.entry(memory.vault).or_default().push(memory);
+    }
+    for history in top_k_by_vault.values_mut() {
+        history.sort_by_key(|entry| (entry.memory.last_observed_block, entry.updated_at));
+        let excess = history
+            .len()
+            .saturating_sub(HOT_TOP_K_MEMORY_RETENTION_PER_VAULT);
+        history.drain(..excess);
+    }
+    state.top_k_apy_memory = top_k_by_vault.into_values().flatten().collect();
+    state.top_k_apy_memory.sort_by_key(|entry| {
+        (
+            entry.vault,
+            entry.memory.last_observed_block,
+            entry.updated_at,
+        )
+    });
     let topology_replay_from = state
         .topology_history
         .first()
@@ -575,11 +617,15 @@ fn compact_hot_state(state: &mut JsonState) {
         .filter(|entry| entry.episode.state != RateEpisodeState::Complete)
         .map(|entry| entry.episode.detection_block.number)
         .min();
-    if let Some(replay_from) = topology_replay_from
+    if let Some(checkpoint_from) = topology_replay_from
         .into_iter()
         .chain(episode_replay_from)
         .min()
     {
+        // A newly established checkpoint may itself be orphaned. Retain the preceding supported
+        // rewind window of raw logs so topology can still be reconstructed at an ancestor before
+        // that checkpoint instead of incorrectly treating its post-state as reversible.
+        let replay_from = checkpoint_from.saturating_sub(MAX_DURABLE_REORG_RESCAN_BLOCKS);
         state
             .canonical_logs
             .retain(|log| log.block_number >= replay_from);
@@ -697,6 +743,60 @@ fn compact_hot_state(state: &mut JsonState) {
             .map(|(_, plan)| plan)
             .collect();
     }
+    let retained_plan_ids = state
+        .plans
+        .iter()
+        .map(|entry| entry.plan.plan_id)
+        .collect::<BTreeSet<_>>();
+    state
+        .final_preflights
+        .retain(|record| retained_plan_ids.contains(&record.plan_id));
+}
+
+fn compact_lifecycle_history(state: &mut JsonState) {
+    let latest_timestamp = state
+        .canonical_blocks
+        .iter()
+        .map(|record| record.block.timestamp)
+        .max()
+        .unwrap_or_default();
+    let rolling_cutoff = latest_timestamp.saturating_sub(ROLLING_POLICY_RETENTION_SECONDS);
+    let mut terminal = state
+        .transactions
+        .iter()
+        .filter(|row| !row.state.is_unresolved())
+        .map(|row| (row.reservation.created_at, row.reservation.transaction_id))
+        .collect::<Vec<_>>();
+    terminal.sort();
+    let tail_start = terminal.len().saturating_sub(HOT_TRANSACTION_RETENTION);
+    let retained_terminal = terminal
+        .into_iter()
+        .skip(tail_start)
+        .map(|(_, transaction_id)| transaction_id)
+        .collect::<BTreeSet<_>>();
+    state.transactions.retain(|row| {
+        row.state.is_unresolved()
+            || row.reservation.created_at >= rolling_cutoff
+            || retained_terminal.contains(&row.reservation.transaction_id)
+    });
+    let retained_transactions = state
+        .transactions
+        .iter()
+        .map(|row| row.reservation.transaction_id)
+        .collect::<BTreeSet<_>>();
+    state
+        .transaction_attempts
+        .retain(|attempt| retained_transactions.contains(&attempt.transaction_id));
+    state
+        .conformance_records
+        .retain(|record| retained_transactions.contains(&record.transaction_id));
+    state
+        .reconciliation_records
+        .retain(|record| retained_transactions.contains(&record.transaction_id));
+    state.rate_movement_reservations.retain(|record| {
+        record.state == RateMovementReservationState::Pending
+            || retained_transactions.contains(&record.transaction_id)
+    });
 }
 
 fn migrate_v1_to_v2(state: &mut JsonState) -> Result<(), StorageError> {
@@ -803,7 +903,7 @@ const fn consumes_rolling_budget(state: TransactionState) -> bool {
 }
 
 /// Single-writer actor command. Every critical mutation has an acknowledgment.
-pub enum StorageCommand {
+enum StorageCommand {
     /// Atomically apply a canonical block, receipts, logs, and cursor.
     ApplyCanonicalBlock {
         /// Block record.
@@ -812,8 +912,6 @@ pub enum StorageCommand {
         logs: Vec<CanonicalLogRecord>,
         /// Complete canonical receipts in transaction order.
         receipts: Vec<CanonicalReceiptRecord>,
-        /// Durable update timestamp.
-        updated_at: u64,
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
@@ -830,8 +928,6 @@ pub enum StorageCommand {
         chain_id: u64,
         /// Common ancestor.
         ancestor: BlockRef,
-        /// Durable update timestamp.
-        updated_at: u64,
         /// Rewind result.
         reply: oneshot::Sender<Result<RewindResult, StorageError>>,
     },
@@ -969,6 +1065,11 @@ pub enum StorageCommand {
         /// Recovery result.
         reply: oneshot::Sender<Result<Option<UnresolvedTransaction>, StorageError>>,
     },
+    /// Load every unresolved nonce lane independently of the current configuration.
+    LoadAllUnresolved {
+        /// Recovery results in deterministic signer order.
+        reply: oneshot::Sender<Result<Vec<UnresolvedTransaction>, StorageError>>,
+    },
     /// Load every signed semantic transaction as a secret-free durable summary.
     LoadTransactionSummaries {
         /// Durable summaries in deterministic transaction-hash order.
@@ -989,6 +1090,17 @@ pub enum StorageCommand {
         number: u64,
         /// Block result.
         reply: oneshot::Sender<Result<Option<BlockRef>, StorageError>>,
+    },
+    /// Load retained canonical blocks in one bounded range.
+    LoadCanonicalBlocks {
+        /// EVM chain ID.
+        chain_id: u64,
+        /// Inclusive first block.
+        from_block: u64,
+        /// Inclusive final block.
+        to_block: u64,
+        /// Ordered retained block results.
+        reply: oneshot::Sender<Result<Vec<BlockRef>, StorageError>>,
     },
     /// Count canonical execution opportunities over one exclusive/inclusive range.
     CountExecutionOpportunities {
@@ -1054,6 +1166,13 @@ pub enum StorageCommand {
         transaction_hash: B256,
         /// Whether the hash is owned by this bot's restricted signer lifecycle.
         reply: oneshot::Sender<Result<bool, StorageError>>,
+    },
+    /// Resolve a block's signed attempt hashes to their unique managed vaults.
+    KnownTransactionVaults {
+        /// Transaction hashes from one canonical block.
+        transaction_hashes: Vec<B256>,
+        /// Owning vaults in deterministic order.
+        reply: oneshot::Sender<Result<Vec<VaultAddress>, StorageError>>,
     },
     /// Load one durable conformance proof.
     LoadConformance {
@@ -1158,9 +1277,11 @@ struct StorageEnvelope {
 
 #[derive(Default)]
 struct StorageQueueStatsInner {
+    alive: AtomicBool,
     depth: AtomicUsize,
     high_water: AtomicUsize,
     oldest_enqueued_epoch_millis: AtomicU64,
+    active_command_started_epoch_millis: AtomicU64,
 }
 
 /// Bounded storage-mailbox telemetry snapshot.
@@ -1172,6 +1293,8 @@ pub struct StorageQueueStats {
     pub high_water: usize,
     /// Conservative age of the oldest queued command.
     pub oldest_age_millis: u64,
+    /// Age of the command currently owned by the storage thread, or zero while idle.
+    pub active_command_age_millis: u64,
 }
 
 /// Cloneable bounded command handle; it never exposes mutable state.
@@ -1182,6 +1305,12 @@ pub struct StorageHandle {
 }
 
 impl StorageHandle {
+    /// Returns whether the single storage-owner thread is still running.
+    #[must_use]
+    pub fn is_actor_alive(&self) -> bool {
+        self.stats.alive.load(Ordering::Acquire)
+    }
+
     /// Returns lock-free bounded-mailbox telemetry.
     #[must_use]
     pub fn queue_stats(&self) -> StorageQueueStats {
@@ -1195,10 +1324,20 @@ impl StorageHandle {
         } else {
             epoch_millis().saturating_sub(oldest)
         };
+        let active_started = self
+            .stats
+            .active_command_started_epoch_millis
+            .load(Ordering::Acquire);
+        let active_command_age_millis = if active_started == 0 {
+            0
+        } else {
+            epoch_millis().saturating_sub(active_started)
+        };
         StorageQueueStats {
             depth,
             high_water: self.stats.high_water.load(Ordering::Acquire),
             oldest_age_millis,
+            active_command_age_millis,
         }
     }
 
@@ -1219,13 +1358,12 @@ impl StorageHandle {
         block: CanonicalBlockRecord,
         logs: Vec<CanonicalLogRecord>,
         receipts: Vec<CanonicalReceiptRecord>,
-        updated_at: u64,
+        _updated_at: u64,
     ) -> Result<(), StorageError> {
         self.request(|reply| StorageCommand::ApplyCanonicalBlock {
             block,
             logs,
             receipts,
-            updated_at,
             reply,
         })
         .await
@@ -1245,12 +1383,11 @@ impl StorageHandle {
         &self,
         chain_id: u64,
         ancestor: BlockRef,
-        updated_at: u64,
+        _updated_at: u64,
     ) -> Result<RewindResult, StorageError> {
         self.request(|reply| StorageCommand::RewindToAncestor {
             chain_id,
             ancestor,
-            updated_at,
             reply,
         })
         .await
@@ -1365,6 +1502,12 @@ impl StorageHandle {
             .await
     }
 
+    /// Loads every durable unresolved nonce lane without deriving signer identities from config.
+    pub async fn load_all_unresolved(&self) -> Result<Vec<UnresolvedTransaction>, StorageError> {
+        self.request(|reply| StorageCommand::LoadAllUnresolved { reply })
+            .await
+    }
+
     /// Loads every durably signed semantic transaction for the read-only operator API.
     pub async fn load_transaction_summaries(
         &self,
@@ -1388,6 +1531,22 @@ impl StorageHandle {
         self.request(|reply| StorageCommand::LoadCanonicalBlock {
             chain_id,
             number,
+            reply,
+        })
+        .await
+    }
+
+    /// Loads every retained canonical block in one inclusive range and one actor round trip.
+    pub async fn load_canonical_blocks(
+        &self,
+        chain_id: u64,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<BlockRef>, StorageError> {
+        self.request(|reply| StorageCommand::LoadCanonicalBlocks {
+            chain_id,
+            from_block,
+            to_block,
             reply,
         })
         .await
@@ -1562,6 +1721,18 @@ impl StorageHandle {
     ) -> Result<bool, StorageError> {
         self.request(|reply| StorageCommand::IsKnownTransactionHash {
             transaction_hash,
+            reply,
+        })
+        .await
+    }
+
+    /// Resolves a block's signed attempt hashes to the vaults that own their lifecycles.
+    pub async fn known_transaction_vaults(
+        &self,
+        transaction_hashes: Vec<B256>,
+    ) -> Result<Vec<VaultAddress>, StorageError> {
+        self.request(|reply| StorageCommand::KnownTransactionVaults {
+            transaction_hashes,
             reply,
         })
         .await
@@ -1773,10 +1944,18 @@ impl StorageService {
         let store = JsonStore::open(state_path.to_owned(), initialization_timestamp)?;
         let (sender, receiver) = mpsc::channel(channel_capacity);
         let stats = Arc::new(StorageQueueStatsInner::default());
+        stats.alive.store(true, Ordering::Release);
         let actor_stats = Arc::clone(&stats);
-        let join = thread::Builder::new()
+        let join = match thread::Builder::new()
             .name("storage".to_owned())
-            .spawn(move || run_actor(store, lock_file, receiver, actor_stats))?;
+            .spawn(move || run_actor(store, lock_file, receiver, actor_stats))
+        {
+            Ok(join) => join,
+            Err(error) => {
+                stats.alive.store(false, Ordering::Release);
+                return Err(error.into());
+            }
+        };
         Ok(Self {
             handle: StorageHandle { sender, stats },
             join: Some(join),
@@ -1809,7 +1988,30 @@ fn run_actor(
     mut receiver: mpsc::Receiver<StorageEnvelope>,
     stats: Arc<StorageQueueStatsInner>,
 ) {
+    struct ActorLiveness(Arc<StorageQueueStatsInner>);
+
+    impl Drop for ActorLiveness {
+        fn drop(&mut self) {
+            self.0.alive.store(false, Ordering::Release);
+        }
+    }
+
+    let _liveness = ActorLiveness(Arc::clone(&stats));
     while let Some(envelope) = receiver.blocking_recv() {
+        struct ActiveCommand(Arc<StorageQueueStatsInner>);
+
+        impl Drop for ActiveCommand {
+            fn drop(&mut self) {
+                self.0
+                    .active_command_started_epoch_millis
+                    .store(0, Ordering::Release);
+            }
+        }
+
+        stats
+            .active_command_started_epoch_millis
+            .store(epoch_millis(), Ordering::Release);
+        let _active_command = ActiveCommand(Arc::clone(&stats));
         let remaining = stats.depth.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
         if remaining == 0 {
             stats
@@ -1822,7 +2024,6 @@ fn run_actor(
                 block,
                 logs,
                 receipts,
-                updated_at: _,
                 reply,
             } => {
                 let _ = reply.send(store.commit(|state| apply_block(state, block, logs, receipts)));
@@ -1830,7 +2031,6 @@ fn run_actor(
             StorageCommand::RewindToAncestor {
                 chain_id,
                 ancestor,
-                updated_at: _,
                 reply,
             } => {
                 let mut result = RewindResult::default();
@@ -2037,6 +2237,9 @@ fn run_actor(
             StorageCommand::LoadUnresolved { signer, reply } => {
                 let _ = reply.send(load_unresolved(&store.state, signer));
             }
+            StorageCommand::LoadAllUnresolved { reply } => {
+                let _ = reply.send(load_all_unresolved(&store.state));
+            }
             StorageCommand::LoadTransactionSummaries { reply } => {
                 let mut summaries = store
                     .state
@@ -2071,6 +2274,31 @@ fn run_actor(
                     .find(|record| record.chain_id == chain_id && record.block.number == number)
                     .map(|record| record.block);
                 let _ = reply.send(Ok(block));
+            }
+            StorageCommand::LoadCanonicalBlocks {
+                chain_id,
+                from_block,
+                to_block,
+                reply,
+            } => {
+                let result = if to_block < from_block {
+                    Err(StorageError::Invariant("canonical block range is reversed"))
+                } else {
+                    let mut blocks = store
+                        .state
+                        .canonical_blocks
+                        .iter()
+                        .filter(|record| {
+                            record.chain_id == chain_id
+                                && record.block.number >= from_block
+                                && record.block.number <= to_block
+                        })
+                        .map(|record| record.block)
+                        .collect::<Vec<_>>();
+                    blocks.sort_by_key(|block| block.number);
+                    Ok(blocks)
+                };
+                let _ = reply.send(result);
             }
             StorageCommand::CountExecutionOpportunities {
                 chain_id,
@@ -2114,7 +2342,10 @@ fn run_actor(
                     .filter(|transaction| {
                         transaction.reservation.signer == signer
                             && transaction.reservation.created_at >= since_timestamp
-                            && consumes_rolling_budget(transaction.state)
+                            && store.state.transaction_attempts.iter().any(|attempt| {
+                                attempt.transaction_id == transaction.reservation.transaction_id
+                                    && attempt.kind == TransactionAttemptKind::Initial
+                            })
                     })
                     .count();
                 let result = u64::try_from(count)
@@ -2201,6 +2432,50 @@ fn run_actor(
                     .iter()
                     .any(|attempt| attempt.transaction_hash == transaction_hash);
                 let _ = reply.send(Ok(known));
+            }
+            StorageCommand::KnownTransactionVaults {
+                transaction_hashes,
+                reply,
+            } => {
+                let requested = transaction_hashes.into_iter().collect::<BTreeSet<_>>();
+                let ownership = store
+                    .state
+                    .transaction_attempts
+                    .iter()
+                    .filter(|attempt| requested.contains(&attempt.transaction_hash))
+                    .map(|attempt| (attempt.transaction_hash, attempt.transaction_id))
+                    .collect::<BTreeSet<_>>();
+                let result = ownership
+                    .iter()
+                    .try_fold(BTreeSet::new(), |mut vaults, (hash, transaction_id)| {
+                        if ownership.iter().any(|(other_hash, other_id)| {
+                            other_hash == hash && other_id != transaction_id
+                        }) {
+                            return Err(StorageError::Invariant(
+                                "transaction hash belongs to multiple lifecycle rows",
+                            ));
+                        }
+                        let rows = store
+                            .state
+                            .transactions
+                            .iter()
+                            .filter(|row| row.reservation.transaction_id == *transaction_id)
+                            .collect::<Vec<_>>();
+                        match rows.as_slice() {
+                            [row] => {
+                                vaults.insert(row.reservation.vault);
+                                Ok(vaults)
+                            }
+                            [] => Err(StorageError::Invariant(
+                                "known transaction attempt has no lifecycle row",
+                            )),
+                            _ => Err(StorageError::Invariant(
+                                "known transaction attempt has multiple lifecycle rows",
+                            )),
+                        }
+                    })
+                    .map(|vaults| vaults.into_iter().collect());
+                let _ = reply.send(result);
             }
             StorageCommand::LoadConformance {
                 transaction_id,
@@ -2335,13 +2610,22 @@ fn run_actor(
                             "top-K memory timestamp exceeds durable update timestamp",
                         ));
                     }
-                    state.top_k_apy_memory.retain(|entry| entry.vault != vault);
+                    state.top_k_apy_memory.retain(|entry| {
+                        entry.vault != vault
+                            || entry.memory.last_observed_block != memory.last_observed_block
+                    });
                     state.top_k_apy_memory.push(TimedTopKApyMemory {
                         vault,
                         memory: *memory,
                         updated_at,
                     });
-                    state.top_k_apy_memory.sort_by_key(|entry| entry.vault);
+                    state.top_k_apy_memory.sort_by_key(|entry| {
+                        (
+                            entry.vault,
+                            entry.memory.last_observed_block,
+                            entry.updated_at,
+                        )
+                    });
                     Ok(())
                 }));
             }
@@ -2350,7 +2634,8 @@ fn run_actor(
                     .state
                     .top_k_apy_memory
                     .iter()
-                    .find(|entry| entry.vault == vault)
+                    .filter(|entry| entry.vault == vault)
+                    .max_by_key(|entry| (entry.memory.last_observed_block, entry.updated_at))
                     .map(|entry| entry.memory.clone());
                 let _ = reply.send(Ok(memory));
             }
@@ -2543,6 +2828,21 @@ fn rewind(
 ) -> Result<RewindResult, StorageError> {
     let old_blocks = state.canonical_blocks.len();
     let old_logs = state.canonical_logs.len();
+    // Capture receipt ownership before removing orphaned canonical evidence. Older durable rows
+    // did not store inclusion coordinates for terminal reverts/cancellations, so attempt hashes
+    // are also required to migrate them safely through a reorg.
+    let orphaned_receipt_hashes = state
+        .canonical_receipts
+        .iter()
+        .filter(|receipt| receipt.chain_id == chain_id && receipt.block_number > ancestor.number)
+        .map(|receipt| receipt.transaction_hash)
+        .collect::<BTreeSet<_>>();
+    let receipt_orphaned_transaction_ids = state
+        .transaction_attempts
+        .iter()
+        .filter(|attempt| orphaned_receipt_hashes.contains(&attempt.transaction_hash))
+        .map(|attempt| attempt.transaction_id)
+        .collect::<BTreeSet<_>>();
     state
         .canonical_blocks
         .retain(|record| record.chain_id != chain_id || record.block.number <= ancestor.number);
@@ -2569,15 +2869,21 @@ fn rewind(
         .transactions
         .iter()
         .filter(|transaction| {
-            transaction
+            (transaction
                 .included_block
                 .is_some_and(|number| number > ancestor.number)
+                || receipt_orphaned_transaction_ids
+                    .contains(&transaction.reservation.transaction_id))
                 && matches!(
                     transaction.state,
                     TransactionState::Included
                         | TransactionState::Confirmed
+                        | TransactionState::Reverted
+                        | TransactionState::Cancelled
+                        | TransactionState::ForeignNonceConsumed
                         | TransactionState::ConformanceValidated
                         | TransactionState::Reconciled
+                        | TransactionState::Failed
                 )
         })
         .map(|transaction| transaction.reservation.transaction_id)
@@ -2640,18 +2946,22 @@ fn rewind(
         .retain(|entry| entry.memory.last_observed_block <= ancestor.number);
     let mut transactions_orphaned = 0_u64;
     for transaction in &mut state.transactions {
-        if transaction
-            .included_block
-            .is_some_and(|number| number > ancestor.number)
+        if orphaned_transaction_ids.contains(&transaction.reservation.transaction_id)
             && matches!(
                 transaction.state,
                 TransactionState::Included
                     | TransactionState::Confirmed
+                    | TransactionState::Reverted
+                    | TransactionState::Cancelled
+                    | TransactionState::ForeignNonceConsumed
                     | TransactionState::ConformanceValidated
                     | TransactionState::Reconciled
+                    | TransactionState::Failed
             )
         {
             transaction.state = TransactionState::Orphaned;
+            transaction.included_block = None;
+            transaction.included_block_hash = None;
             transactions_orphaned = transactions_orphaned.saturating_add(1);
         }
     }
@@ -3414,6 +3724,23 @@ fn load_unresolved(
     }))
 }
 
+fn load_all_unresolved(state: &JsonState) -> Result<Vec<UnresolvedTransaction>, StorageError> {
+    let signers = state
+        .transactions
+        .iter()
+        .filter(|row| row.state.is_unresolved())
+        .map(|row| row.reservation.signer)
+        .collect::<BTreeSet<_>>();
+    signers
+        .into_iter()
+        .map(|signer| {
+            load_unresolved(state, signer)?.ok_or(StorageError::Invariant(
+                "unresolved signer index disappeared",
+            ))
+        })
+        .collect()
+}
+
 fn persist_episode(
     state: &mut JsonState,
     episode: RateSignalEpisode,
@@ -3449,16 +3776,19 @@ fn persist_episode(
 #[allow(clippy::panic)]
 mod compaction_tests {
     use alloy::primitives::{Address, B256, Bytes, U256};
+    use tempfile::TempDir;
 
     use super::{
-        HOT_BLOCK_RETENTION, JsonState, TopologyRevision, TransactionRow, compact_hot_state,
+        HOT_BLOCK_RETENTION, HOT_TOPOLOGY_RETENTION_PER_VAULT, HOT_TRANSACTION_RETENTION,
+        JOURNAL_SEGMENT_EVENTS, JsonState, JsonStore, MAX_DURABLE_REORG_RESCAN_BLOCKS,
+        TopologyRevision, TransactionRow, compact_hot_state,
     };
     use crate::{
         domain::{AdapterAddress, BlockRef, TransactionId, VaultAddress},
         state::topology::TopologyIndex,
         storage::models::{
             CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, NonceReservation,
-            TransactionState,
+            SignedAttemptRecord, TransactionAttemptKind, TransactionState,
         },
     };
 
@@ -3491,6 +3821,42 @@ mod compaction_tests {
 
         assert_eq!(state.canonical_logs.len(), 1);
         assert_eq!(state.canonical_logs[0].block_number, 10);
+    }
+
+    #[test]
+    fn checkpoint_failure_does_not_desynchronize_memory_from_the_durable_journal() {
+        let directory = TempDir::new().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let state_path = directory.path().join("state.json");
+        let mut store = JsonStore::open(state_path.clone(), 1)
+            .unwrap_or_else(|error| panic!("open store: {error}"));
+        for _ in 1..JOURNAL_SEGMENT_EVENTS {
+            store
+                .commit(|_| Ok(()))
+                .unwrap_or_else(|error| panic!("prime journal: {error}"));
+        }
+        assert_eq!(
+            store.state.revision,
+            JOURNAL_SEGMENT_EVENTS.saturating_sub(1)
+        );
+
+        let invalid_checkpoint = directory.path().join("cannot-replace-directory");
+        std::fs::create_dir(&invalid_checkpoint)
+            .unwrap_or_else(|error| panic!("create obstruction: {error}"));
+        store.path = invalid_checkpoint;
+        assert!(store.commit(|_| Ok(())).is_err());
+        assert_eq!(
+            store.state.revision, JOURNAL_SEGMENT_EVENTS,
+            "fsynced journal revision must remain the in-memory commit point"
+        );
+
+        store.path = state_path;
+        store
+            .commit(|_| Ok(()))
+            .unwrap_or_else(|error| panic!("continue hash chain: {error}"));
+        assert_eq!(
+            store.state.revision,
+            JOURNAL_SEGMENT_EVENTS.saturating_add(1)
+        );
     }
 
     #[test]
@@ -3536,6 +3902,73 @@ mod compaction_tests {
                 .iter()
                 .any(|record| record.block == checkpoint)
         );
+    }
+
+    #[test]
+    fn topology_retention_is_per_vault_and_keeps_pre_checkpoint_reorg_logs() {
+        let mut state = JsonState::default();
+        let first_block = 1_000_u64;
+        let last_block = 1_299_u64;
+        for vault_byte in [1_u8, 2_u8] {
+            let vault = VaultAddress(Address::with_last_byte(vault_byte));
+            for number in first_block..=last_block {
+                state.topology_history.push(TopologyRevision {
+                    topology: TopologyIndex::new(
+                        vault,
+                        1,
+                        [AdapterAddress(Address::with_last_byte(
+                            vault_byte.saturating_add(10),
+                        ))],
+                        [],
+                    ),
+                    block: BlockRef {
+                        number,
+                        hash: B256::from(U256::from(number)),
+                        parent_hash: B256::from(U256::from(number.saturating_sub(1))),
+                        timestamp: number,
+                        gas_limit: 30_000_000,
+                    },
+                });
+            }
+        }
+        let retained_log_block = first_block
+            .saturating_add(43)
+            .saturating_sub(MAX_DURABLE_REORG_RESCAN_BLOCKS);
+        for number in [retained_log_block.saturating_sub(1), retained_log_block] {
+            state.canonical_logs.push(CanonicalLogRecord {
+                chain_id: 999,
+                block_number: number,
+                block_hash: B256::from(U256::from(number)),
+                transaction_hash: B256::from(U256::from(number.saturating_add(1))),
+                transaction_index: 0,
+                log_index: 0,
+                address: Address::with_last_byte(3),
+                topics: [Some(B256::repeat_byte(4)), None, None, None],
+                data: Bytes::new(),
+            });
+        }
+
+        compact_hot_state(&mut state);
+
+        for vault_byte in [1_u8, 2_u8] {
+            let vault = VaultAddress(Address::with_last_byte(vault_byte));
+            let revisions = state
+                .topology_history
+                .iter()
+                .filter(|revision| revision.topology.vault == vault)
+                .collect::<Vec<_>>();
+            assert_eq!(revisions.len(), HOT_TOPOLOGY_RETENTION_PER_VAULT);
+            assert_eq!(
+                revisions.first().map(|revision| revision.block.number),
+                Some(1_043)
+            );
+            assert_eq!(
+                revisions.last().map(|revision| revision.block.number),
+                Some(last_block)
+            );
+        }
+        assert_eq!(state.canonical_logs.len(), 1);
+        assert_eq!(state.canonical_logs[0].block_number, retained_log_block);
     }
 
     #[test]
@@ -3623,5 +4056,103 @@ mod compaction_tests {
                 .iter()
                 .any(|record| record.block.number == 11)
         );
+    }
+
+    #[test]
+    fn terminal_lifecycle_history_is_bounded_without_pruning_an_unresolved_lane() {
+        let mut state = JsonState::default();
+        state.canonical_blocks.push(CanonicalBlockRecord {
+            chain_id: 999,
+            block: BlockRef {
+                number: 10_000,
+                hash: B256::repeat_byte(10),
+                parent_hash: B256::repeat_byte(9),
+                timestamp: 1_000_000,
+                gas_limit: 30_000_000,
+            },
+        });
+        let total_terminal = HOT_TRANSACTION_RETENTION.saturating_add(100);
+        for index in 0..total_terminal {
+            let transaction_id = TransactionId(B256::from(U256::from(index)));
+            let transaction_hash = B256::from(U256::from(index.saturating_add(1)));
+            state.transactions.push(TransactionRow {
+                reservation: NonceReservation {
+                    transaction_id,
+                    plan_id: None,
+                    vault: VaultAddress(Address::with_last_byte(1)),
+                    signer: Address::with_last_byte(2),
+                    nonce: u64::try_from(index).unwrap_or(u64::MAX),
+                    calldata: Bytes::new(),
+                    calldata_hash: B256::ZERO,
+                    max_fee_per_gas: U256::from(1_u8),
+                    max_priority_fee_per_gas: U256::from(1_u8),
+                    gas_limit: 21_000,
+                    movement_assets: U256::from(1_u8),
+                    created_block: 1,
+                    created_at: 1,
+                },
+                state: TransactionState::Reconciled,
+                transaction_hash: Some(transaction_hash),
+                raw_signed_transaction: Some(Bytes::new()),
+                submitted_at: Some(1),
+                included_block: Some(1),
+                included_block_hash: Some(B256::repeat_byte(1)),
+                updated_at: 1,
+            });
+            state.transaction_attempts.push(SignedAttemptRecord {
+                transaction_id,
+                kind: TransactionAttemptKind::Initial,
+                transaction_hash,
+                raw_signed_transaction: Bytes::new(),
+                max_fee_per_gas: U256::from(1_u8),
+                max_priority_fee_per_gas: U256::from(1_u8),
+                signed_at: 1,
+                signed_block: 1,
+                broadcast_at: Some(1),
+                last_broadcast_block: Some(1),
+            });
+        }
+        let unresolved_id = TransactionId(B256::repeat_byte(0xee));
+        state.transactions.push(TransactionRow {
+            reservation: NonceReservation {
+                transaction_id: unresolved_id,
+                plan_id: None,
+                vault: VaultAddress(Address::with_last_byte(3)),
+                signer: Address::with_last_byte(4),
+                nonce: 7,
+                calldata: Bytes::new(),
+                calldata_hash: B256::ZERO,
+                max_fee_per_gas: U256::from(1_u8),
+                max_priority_fee_per_gas: U256::from(1_u8),
+                gas_limit: 21_000,
+                movement_assets: U256::from(1_u8),
+                created_block: 1,
+                created_at: 1,
+            },
+            state: TransactionState::Submitted,
+            transaction_hash: Some(B256::repeat_byte(0xef)),
+            raw_signed_transaction: Some(Bytes::new()),
+            submitted_at: Some(1),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 1,
+        });
+
+        compact_hot_state(&mut state);
+
+        assert_eq!(
+            state.transactions.len(),
+            HOT_TRANSACTION_RETENTION.saturating_add(1)
+        );
+        assert!(
+            state
+                .transactions
+                .iter()
+                .any(|row| row.reservation.transaction_id == unresolved_id)
+        );
+        assert!(!state.transactions.iter().any(|row| {
+            row.reservation.transaction_id == TransactionId(B256::from(U256::ZERO))
+        }));
+        assert_eq!(state.transaction_attempts.len(), HOT_TRANSACTION_RETENTION);
     }
 }

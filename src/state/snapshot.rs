@@ -1074,12 +1074,13 @@ pub async fn build_exact_snapshot<P: AtomicSnapshotProvider>(
     assemble_snapshot(blueprint, atomic, values)
 }
 
-/// Builds a background exact snapshot after the complete locked identity set has passed the
-/// process-start gate.
+/// Builds a background exact snapshot for a caller that enforces the appropriate locked identity
+/// gate before publishing or persisting the result.
 ///
-/// This path is intentionally limited to canonical background refresh. Transaction preflight and
-/// post-state reconciliation use [`build_exact_snapshot`] so they still bind code verification to
-/// their own strict read context.
+/// This path is intentionally limited to canonical background refresh. The state owner verifies
+/// every dependency in the resulting vault-scoped read set before publishing it. Transaction
+/// preflight and post-state reconciliation use [`build_exact_snapshot`] so they still bind code
+/// verification to their own strict read context.
 pub async fn build_background_snapshot_after_identity_gate<P: AtomicSnapshotProvider>(
     provider: &P,
     blueprint: &SnapshotBlueprint<'_>,

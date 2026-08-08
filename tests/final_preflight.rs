@@ -456,6 +456,58 @@ async fn successful_preflight_persists_signed_bytes_before_one_broadcast()
 }
 
 #[tokio::test]
+async fn latest_only_preflight_uses_current_cursor_for_planning_and_pending_clock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer_key = PrivateKeySigner::random();
+    let mut config = config_for_signer(signer_key.address());
+    config.app.snapshot.mode = SnapshotMode::AtomicLatest;
+    let vault = &config.app.vaults[0];
+    let snapshot_head = block(100, 0x64, 0x63);
+    let current_head = block(105, 0x69, 0x68);
+    let directory = TempDir::new()?;
+    let service = StorageService::start(&directory.path().join("latest-current.json"), 32, 1)?;
+    let source = Source {
+        head: current_head,
+        plan: validated_plan(&config, snapshot_head),
+        snapshot: exact_snapshot(&config, snapshot_head),
+        storage: service.handle(),
+    };
+    let signer = LocalSigner {
+        signer: signer_key,
+        calls: AtomicUsize::new(0),
+    };
+    let submitter = Submitter {
+        calls: AtomicUsize::new(0),
+    };
+
+    let result = execute_one_head_preflight(
+        &HeaderProvider::new(vec![current_head]),
+        &NonceProvider(0),
+        &Simulator,
+        &submitter,
+        &source,
+        &service.handle(),
+        &signer,
+        &ExecutionReservationManager::default(),
+        &config,
+        vault,
+        request(),
+    )
+    .await?;
+    assert_eq!(result.context.snapshot_block_number, snapshot_head.number);
+    assert_eq!(result.context.event_cursor_block, current_head.number);
+    let pending = service
+        .handle()
+        .load_unresolved(vault.signer_address)
+        .await?
+        .ok_or("latest-only transaction must remain durable")?;
+    assert_eq!(pending.created_block, current_head.number);
+    assert_eq!(pending.last_attempt_block, current_head.number);
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn head_change_after_unsigned_persistence_aborts_without_signing()
 -> Result<(), Box<dyn std::error::Error>> {
     let signer_key = PrivateKeySigner::random();

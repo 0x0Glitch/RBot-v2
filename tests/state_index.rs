@@ -9,7 +9,7 @@ use alloy::sol_types::SolCall;
 use morpho_v2_reallocator::chain::logs::{EventSource, ProtocolEvent};
 use morpho_v2_reallocator::contracts::bindings::{IMorpho, IMorphoMarketV1AdapterV2, IVaultV2};
 use morpho_v2_reallocator::domain::{
-    AdapterAddress, BlockRef, CapId, CapRef, CapState, MarketId, VaultAddress,
+    AdapterAddress, BlockRef, CapId, CapRef, CapState, MarketId, PositionKey, VaultAddress,
 };
 use morpho_v2_reallocator::state::caps::{
     CapError, adapter_cap_id, direct_position_cap_data, validate_allocation_cap,
@@ -192,6 +192,53 @@ fn malformed_cap_and_unknown_pending_resolution_fail_closed() {
             }
         ),
         Err(TopologyError::UnknownPendingOperation)
+    );
+}
+
+#[test]
+fn persisted_topology_accepts_idempotent_config_expansion_but_not_identity_rebinding() {
+    let vault = VaultAddress(Address::with_last_byte(1));
+    let original_adapter = AdapterAddress(Address::with_last_byte(2));
+    let added_adapter = AdapterAddress(Address::with_last_byte(3));
+    let original_market = MarketId(B256::repeat_byte(4));
+    let added_market = MarketId(B256::repeat_byte(5));
+    let original_position = PositionKey(B256::repeat_byte(6));
+    let added_position = PositionKey(B256::repeat_byte(7));
+    let mut index = TopologyIndex::new(
+        vault,
+        10,
+        [original_adapter],
+        [(original_adapter, original_market, original_position)],
+    );
+    index
+        .merge_configured_read_set(
+            10,
+            [original_adapter, added_adapter],
+            [
+                (original_adapter, original_market, original_position),
+                (added_adapter, added_market, added_position),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("config expansion failed: {error}"));
+    assert!(index.adapters.contains_key(&original_adapter));
+    assert!(index.adapters.contains_key(&added_adapter));
+    assert_eq!(
+        index.configured_positions[&added_position].market_id,
+        added_market
+    );
+    assert!(
+        index.adapters[&added_adapter]
+            .historical_market_ids
+            .contains(&added_market)
+    );
+
+    assert_eq!(
+        index.merge_configured_read_set(
+            10,
+            [added_adapter],
+            [(added_adapter, original_market, original_position)],
+        ),
+        Err(TopologyError::ConfiguredPositionCollision)
     );
 }
 

@@ -10,6 +10,7 @@ pub mod heads;
 pub mod logs;
 pub mod multicall;
 pub mod provider;
+pub(crate) mod provider_consensus;
 pub mod receipts;
 pub mod reorg;
 

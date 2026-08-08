@@ -879,9 +879,20 @@ pub enum V2Action {
 #[repr(u8)]
 pub enum RateObjectiveBranch {
     /// Optimize spread over the full frozen evaluation set.
-    Portfolio,
+    Portfolio = 0,
     /// Optimize only the frozen controllable set.
-    Controllable,
+    Controllable = 1,
+}
+
+impl RateObjectiveBranch {
+    /// Stable hash-domain code for durable episode identity.
+    #[must_use]
+    pub const fn stable_code(self) -> u8 {
+        match self {
+            Self::Portfolio => 0,
+            Self::Controllable => 1,
+        }
+    }
 }
 
 /// Deterministic bounded-search evidence.
@@ -997,5 +1008,11 @@ mod tests {
             derive_market_id(&params).0,
             alloy::primitives::keccak256(encoded)
         );
+    }
+
+    #[test]
+    fn rate_objective_hash_codes_are_stable() {
+        assert_eq!(RateObjectiveBranch::Portfolio.stable_code(), 0);
+        assert_eq!(RateObjectiveBranch::Controllable.stable_code(), 1);
     }
 }

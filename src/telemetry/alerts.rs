@@ -7,9 +7,10 @@ use std::{
 
 use alloy::primitives::{B256, keccak256};
 use async_trait::async_trait;
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::domain::VaultAddress;
 
@@ -17,6 +18,9 @@ use crate::domain::VaultAddress;
 pub const ALERT_HISTORY_CAPACITY: usize = 1_024;
 /// Maximum configured alert transports.
 pub const ALERT_TRANSPORT_CAPACITY: usize = 4;
+/// Maximum concurrent bounded transport deliveries. Alert I/O is never allowed to stall a chain,
+/// state, execution, storage-monitor, or watchdog worker.
+pub const ALERT_IN_FLIGHT_CAPACITY: usize = 8;
 
 /// Operator alert severity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -175,11 +179,16 @@ struct AlertState {
     last_delivery: BTreeMap<B256, u64>,
 }
 
+const ALERT_DELIVERY_ATTEMPTS: usize = 3;
+const ALERT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+const ALERT_DELIVERY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Fan-out dispatcher with bounded history and caller-supplied deduplication time.
 pub struct AlertDispatcher {
     transports: Vec<Arc<dyn AlertTransport>>,
     state: Mutex<AlertState>,
     deduplication_seconds: u64,
+    delivery_slots: Arc<Semaphore>,
 }
 
 impl AlertDispatcher {
@@ -198,7 +207,26 @@ impl AlertDispatcher {
                 last_delivery: BTreeMap::new(),
             }),
             deduplication_seconds,
+            delivery_slots: Arc::new(Semaphore::new(ALERT_IN_FLIGHT_CAPACITY)),
         })
+    }
+
+    /// Starts one strictly bounded background delivery without blocking a safety-critical worker.
+    /// Direct [`Self::emit`] remains available to tests and explicit operator commands that need a
+    /// delivery result. Saturation drops only the transport attempt; callers still log the incident.
+    pub fn dispatch(self: &Arc<Self>, alert: Alert) -> Result<(), AlertError> {
+        let permit = Arc::clone(&self.delivery_slots)
+            .try_acquire_owned()
+            .map_err(|_| AlertError::Delivery)?;
+        let dispatcher = Arc::clone(self);
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| AlertError::Delivery)?;
+        runtime.spawn(async move {
+            let _permit = permit;
+            if dispatcher.emit(alert).await.is_err() {
+                tracing::error!("bounded operator alert delivery failed");
+            }
+        });
+        Ok(())
     }
 
     /// Delivers a non-duplicate alert and records bounded read-only history.
@@ -225,20 +253,36 @@ impl AlertDispatcher {
         if !alert.severity.operator_actionable() {
             return Ok(true);
         }
-        let mut failed = false;
-        for transport in &self.transports {
-            let delivery =
-                tokio::time::timeout(std::time::Duration::from_secs(12), transport.send(&alert))
-                    .await;
-            if !matches!(delivery, Ok(Ok(()))) {
-                failed = true;
+        let mut pending = self.transports.iter().collect::<Vec<_>>();
+        for attempt in 0..ALERT_DELIVERY_ATTEMPTS {
+            let outcomes = join_all(pending.iter().map(|transport| async {
+                (
+                    *transport,
+                    tokio::time::timeout(ALERT_DELIVERY_TIMEOUT, transport.send(&alert)).await,
+                )
+            }))
+            .await;
+            pending = outcomes
+                .into_iter()
+                .filter_map(|(transport, outcome)| {
+                    (!matches!(outcome, Ok(Ok(())))).then_some(transport)
+                })
+                .collect();
+            if pending.is_empty() {
+                return Ok(true);
+            }
+            if attempt.saturating_add(1) < ALERT_DELIVERY_ATTEMPTS {
+                tokio::time::sleep(ALERT_DELIVERY_RETRY_DELAY).await;
             }
         }
-        if failed {
-            Err(AlertError::Delivery)
-        } else {
-            Ok(true)
+
+        // A failed delivery is not a delivered incident. Remove only this invocation's marker so
+        // a later recurring observation can retry without bypassing a newer successful send.
+        let mut state = self.state.lock().await;
+        if state.last_delivery.get(&alert.dedup_key) == Some(&alert.created_at) {
+            state.last_delivery.remove(&alert.dedup_key);
         }
+        Err(AlertError::Delivery)
     }
 
     /// Returns bounded alert history in creation order.
@@ -272,6 +316,51 @@ mod tests {
         async fn send(&self, _alert: &Alert) -> Result<(), AlertTransportError> {
             self.0.fetch_add(1, Ordering::AcqRel);
             Ok(())
+        }
+    }
+
+    struct FailsOnceTransport(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl AlertTransport for FailsOnceTransport {
+        fn name(&self) -> &'static str {
+            "fails-once"
+        }
+
+        async fn send(&self, _alert: &Alert) -> Result<(), AlertTransportError> {
+            let attempt = self.0.fetch_add(1, Ordering::AcqRel);
+            if attempt == 0 {
+                Err(AlertTransportError::Request)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct AlwaysFailsTransport(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl AlertTransport for AlwaysFailsTransport {
+        fn name(&self) -> &'static str {
+            "always-fails"
+        }
+
+        async fn send(&self, _alert: &Alert) -> Result<(), AlertTransportError> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Err(AlertTransportError::Request)
+        }
+    }
+
+    struct HangingTransport;
+
+    #[async_trait]
+    impl AlertTransport for HangingTransport {
+        fn name(&self) -> &'static str {
+            "hanging"
+        }
+
+        async fn send(&self, _alert: &Alert) -> Result<(), AlertTransportError> {
+            std::future::pending().await
         }
     }
 
@@ -359,6 +448,89 @@ mod tests {
                 .await?
         );
         assert_eq!(deliveries.load(Ordering::Acquire), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transient_delivery_is_retried_without_resending_successful_transports()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let successful = Arc::new(AtomicUsize::new(0));
+        let flaky = Arc::new(AtomicUsize::new(0));
+        let dispatcher = AlertDispatcher::new(
+            vec![
+                Arc::new(CountingTransport(Arc::clone(&successful))),
+                Arc::new(FailsOnceTransport(Arc::clone(&flaky))),
+            ],
+            3_600,
+        )?;
+        assert!(
+            dispatcher
+                .emit(alert(
+                    AlertSeverity::P1,
+                    "Canonical RPC is unavailable",
+                    B256::repeat_byte(6),
+                    20_000,
+                )?)
+                .await?
+        );
+        assert_eq!(successful.load(Ordering::Acquire), 1);
+        assert_eq!(flaky.load(Ordering::Acquire), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_does_not_suppress_the_next_observation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let dispatcher = AlertDispatcher::new(
+            vec![Arc::new(AlwaysFailsTransport(Arc::clone(&attempts)))],
+            3_600,
+        )?;
+        let first = alert(
+            AlertSeverity::P0,
+            "Storage owner stopped",
+            B256::repeat_byte(7),
+            30_000,
+        )?;
+        assert_eq!(
+            dispatcher.emit(first.clone()).await,
+            Err(super::AlertError::Delivery)
+        );
+        assert_eq!(
+            dispatcher.emit(first).await,
+            Err(super::AlertError::Delivery)
+        );
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            super::ALERT_DELIVERY_ATTEMPTS.saturating_mul(2)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_dispatch_is_nonblocking_and_strictly_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dispatcher = Arc::new(AlertDispatcher::new(
+            vec![Arc::new(HangingTransport)],
+            3_600,
+        )?);
+        for index in 0..super::ALERT_IN_FLIGHT_CAPACITY {
+            dispatcher.dispatch(alert(
+                AlertSeverity::P1,
+                &format!("incident {index}"),
+                B256::with_last_byte(u8::try_from(index).unwrap_or(u8::MAX)),
+                40_000_u64.saturating_add(u64::try_from(index).unwrap_or(u64::MAX)),
+            )?)?;
+        }
+        assert_eq!(
+            dispatcher.dispatch(alert(
+                AlertSeverity::P1,
+                "one incident beyond the bound",
+                B256::repeat_byte(0xff),
+                50_000,
+            )?),
+            Err(super::AlertError::Delivery)
+        );
         Ok(())
     }
 }

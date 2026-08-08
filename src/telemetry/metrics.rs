@@ -1,11 +1,10 @@
 //! Complete bounded-label Prometheus metric registration.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::{counter::Counter, family::Family, gauge::Gauge};
 use prometheus_client::registry::Registry;
-use thiserror::Error;
 
 use crate::api::dto::RateSnapshotView;
 use crate::build_info;
@@ -52,16 +51,268 @@ pub fn register_build_info(registry: &mut Registry) {
     );
 }
 
-/// Unknown statically registered metric name.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-#[error("unknown operational metric")]
-pub struct UnknownMetric;
+/// Closed set of process-wide operational gauges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationalGauge {
+    /// Process liveness.
+    Up,
+    /// Overall readiness.
+    Ready,
+    /// Execute readiness.
+    ReadyForExecute,
+    /// Provider readiness.
+    ProvidersReady,
+    /// Exact-state readiness.
+    ExactStateReady,
+    /// Last processed canonical block.
+    LastProcessedBlock,
+    /// Last processed canonical timestamp.
+    LastProcessedTimestampSeconds,
+    /// Whether one transaction is unresolved.
+    PendingTransaction,
+    /// Whether every execution scope is ready.
+    ExecutionScopesReady,
+    /// Durable JSON format marker.
+    JsonFormatInfo,
+    /// Current storage mailbox depth.
+    StorageQueueDepth,
+    /// Storage mailbox high-water mark.
+    StorageQueueHighWater,
+    /// Age of the oldest queued storage command.
+    StorageOldestCommandAgeMilliseconds,
+    /// Age of the command currently owned by storage.
+    StorageActiveCommandAgeMilliseconds,
+}
+
+impl OperationalGauge {
+    #[cfg(test)]
+    const ALL: [Self; 14] = [
+        Self::Up,
+        Self::Ready,
+        Self::ReadyForExecute,
+        Self::ProvidersReady,
+        Self::ExactStateReady,
+        Self::LastProcessedBlock,
+        Self::LastProcessedTimestampSeconds,
+        Self::PendingTransaction,
+        Self::ExecutionScopesReady,
+        Self::JsonFormatInfo,
+        Self::StorageQueueDepth,
+        Self::StorageQueueHighWater,
+        Self::StorageOldestCommandAgeMilliseconds,
+        Self::StorageActiveCommandAgeMilliseconds,
+    ];
+
+    /// Stable Prometheus name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Up => "reallocator_up",
+            Self::Ready => "reallocator_ready",
+            Self::ReadyForExecute => "reallocator_ready_for_execute",
+            Self::ProvidersReady => "reallocator_providers_ready",
+            Self::ExactStateReady => "reallocator_exact_state_ready",
+            Self::LastProcessedBlock => "reallocator_last_processed_block",
+            Self::LastProcessedTimestampSeconds => "reallocator_last_processed_timestamp_seconds",
+            Self::PendingTransaction => "reallocator_pending_transaction",
+            Self::ExecutionScopesReady => "reallocator_execution_scopes_ready",
+            Self::JsonFormatInfo => "reallocator_json_format_info",
+            Self::StorageQueueDepth => "reallocator_storage_queue_depth",
+            Self::StorageQueueHighWater => "reallocator_storage_queue_high_water",
+            Self::StorageOldestCommandAgeMilliseconds => {
+                "reallocator_storage_oldest_command_age_milliseconds"
+            }
+            Self::StorageActiveCommandAgeMilliseconds => {
+                "reallocator_storage_active_command_age_milliseconds"
+            }
+        }
+    }
+}
+
+/// Closed set of process-wide operational counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationalCounter {
+    /// Successful exact snapshots.
+    SnapshotSuccess,
+    /// Failed idle-ledger replays.
+    IdleLedgerReplayFailure,
+    /// Retried exact snapshots.
+    SnapshotRetries,
+    /// Plans discarded after supersession.
+    PlansSuperseded,
+    /// Vault planning scopes quarantined.
+    PlanningScopeQuarantined,
+    /// Canonical-time strategy ticks.
+    StrategyTicks,
+}
+
+impl OperationalCounter {
+    #[cfg(test)]
+    const ALL: [Self; 6] = [
+        Self::SnapshotSuccess,
+        Self::IdleLedgerReplayFailure,
+        Self::SnapshotRetries,
+        Self::PlansSuperseded,
+        Self::PlanningScopeQuarantined,
+        Self::StrategyTicks,
+    ];
+
+    /// Stable Prometheus name before the client library's `_total` suffix.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SnapshotSuccess => "reallocator_snapshot_success",
+            Self::IdleLedgerReplayFailure => "reallocator_idle_ledger_replay_failure",
+            Self::SnapshotRetries => "reallocator_snapshot_retries",
+            Self::PlansSuperseded => "reallocator_plans_superseded",
+            Self::PlanningScopeQuarantined => "reallocator_planning_scope_quarantined",
+            Self::StrategyTicks => "reallocator_strategy_ticks",
+        }
+    }
+}
+
+struct GaugeHandles {
+    up: Gauge,
+    ready: Gauge,
+    ready_for_execute: Gauge,
+    providers_ready: Gauge,
+    exact_state_ready: Gauge,
+    last_processed_block: Gauge,
+    last_processed_timestamp_seconds: Gauge,
+    pending_transaction: Gauge,
+    execution_scopes_ready: Gauge,
+    json_format_info: Gauge,
+    storage_queue_depth: Gauge,
+    storage_queue_high_water: Gauge,
+    storage_oldest_command_age_milliseconds: Gauge,
+    storage_active_command_age_milliseconds: Gauge,
+}
+
+impl GaugeHandles {
+    fn register(registry: &mut Registry) -> Self {
+        Self {
+            up: register_gauge(registry, OperationalGauge::Up),
+            ready: register_gauge(registry, OperationalGauge::Ready),
+            ready_for_execute: register_gauge(registry, OperationalGauge::ReadyForExecute),
+            providers_ready: register_gauge(registry, OperationalGauge::ProvidersReady),
+            exact_state_ready: register_gauge(registry, OperationalGauge::ExactStateReady),
+            last_processed_block: register_gauge(registry, OperationalGauge::LastProcessedBlock),
+            last_processed_timestamp_seconds: register_gauge(
+                registry,
+                OperationalGauge::LastProcessedTimestampSeconds,
+            ),
+            pending_transaction: register_gauge(registry, OperationalGauge::PendingTransaction),
+            execution_scopes_ready: register_gauge(
+                registry,
+                OperationalGauge::ExecutionScopesReady,
+            ),
+            json_format_info: register_gauge(registry, OperationalGauge::JsonFormatInfo),
+            storage_queue_depth: register_gauge(registry, OperationalGauge::StorageQueueDepth),
+            storage_queue_high_water: register_gauge(
+                registry,
+                OperationalGauge::StorageQueueHighWater,
+            ),
+            storage_oldest_command_age_milliseconds: register_gauge(
+                registry,
+                OperationalGauge::StorageOldestCommandAgeMilliseconds,
+            ),
+            storage_active_command_age_milliseconds: register_gauge(
+                registry,
+                OperationalGauge::StorageActiveCommandAgeMilliseconds,
+            ),
+        }
+    }
+
+    const fn get(&self, metric: OperationalGauge) -> &Gauge {
+        match metric {
+            OperationalGauge::Up => &self.up,
+            OperationalGauge::Ready => &self.ready,
+            OperationalGauge::ReadyForExecute => &self.ready_for_execute,
+            OperationalGauge::ProvidersReady => &self.providers_ready,
+            OperationalGauge::ExactStateReady => &self.exact_state_ready,
+            OperationalGauge::LastProcessedBlock => &self.last_processed_block,
+            OperationalGauge::LastProcessedTimestampSeconds => {
+                &self.last_processed_timestamp_seconds
+            }
+            OperationalGauge::PendingTransaction => &self.pending_transaction,
+            OperationalGauge::ExecutionScopesReady => &self.execution_scopes_ready,
+            OperationalGauge::JsonFormatInfo => &self.json_format_info,
+            OperationalGauge::StorageQueueDepth => &self.storage_queue_depth,
+            OperationalGauge::StorageQueueHighWater => &self.storage_queue_high_water,
+            OperationalGauge::StorageOldestCommandAgeMilliseconds => {
+                &self.storage_oldest_command_age_milliseconds
+            }
+            OperationalGauge::StorageActiveCommandAgeMilliseconds => {
+                &self.storage_active_command_age_milliseconds
+            }
+        }
+    }
+}
+
+struct CounterHandles {
+    snapshot_success: Counter,
+    idle_ledger_replay_failure: Counter,
+    snapshot_retries: Counter,
+    plans_superseded: Counter,
+    planning_scope_quarantined: Counter,
+    strategy_ticks: Counter,
+}
+
+impl CounterHandles {
+    fn register(registry: &mut Registry) -> Self {
+        Self {
+            snapshot_success: register_counter(registry, OperationalCounter::SnapshotSuccess),
+            idle_ledger_replay_failure: register_counter(
+                registry,
+                OperationalCounter::IdleLedgerReplayFailure,
+            ),
+            snapshot_retries: register_counter(registry, OperationalCounter::SnapshotRetries),
+            plans_superseded: register_counter(registry, OperationalCounter::PlansSuperseded),
+            planning_scope_quarantined: register_counter(
+                registry,
+                OperationalCounter::PlanningScopeQuarantined,
+            ),
+            strategy_ticks: register_counter(registry, OperationalCounter::StrategyTicks),
+        }
+    }
+
+    const fn get(&self, metric: OperationalCounter) -> &Counter {
+        match metric {
+            OperationalCounter::SnapshotSuccess => &self.snapshot_success,
+            OperationalCounter::IdleLedgerReplayFailure => &self.idle_ledger_replay_failure,
+            OperationalCounter::SnapshotRetries => &self.snapshot_retries,
+            OperationalCounter::PlansSuperseded => &self.plans_superseded,
+            OperationalCounter::PlanningScopeQuarantined => &self.planning_scope_quarantined,
+            OperationalCounter::StrategyTicks => &self.strategy_ticks,
+        }
+    }
+}
+
+fn register_gauge(registry: &mut Registry, metric: OperationalGauge) -> Gauge {
+    let gauge = Gauge::default();
+    registry.register(
+        metric.name(),
+        "Morpho V2 reallocator operational gauge.",
+        gauge.clone(),
+    );
+    gauge
+}
+
+fn register_counter(registry: &mut Registry, metric: OperationalCounter) -> Counter {
+    let counter = Counter::default();
+    registry.register(
+        metric.name(),
+        "Morpho V2 reallocator monotonic operational counter.",
+        counter.clone(),
+    );
+    counter
+}
 
 /// Immutable registry plus update handles for metrics backed by live runtime state.
 pub struct OperationalMetrics {
     registry: Arc<Registry>,
-    gauges: BTreeMap<&'static str, Gauge>,
-    counters: BTreeMap<&'static str, Counter>,
+    gauges: GaugeHandles,
+    counters: CounterHandles,
     rate_snapshot_block: Family<VaultLabels, Gauge>,
     observed_rate_spread_bps: Family<VaultLabels, Gauge>,
     observed_utilization_spread_bps: Family<VaultLabels, Gauge>,
@@ -82,26 +333,8 @@ impl OperationalMetrics {
     pub fn new() -> Self {
         let mut registry = Registry::default();
         register_build_info(&mut registry);
-        let mut gauges = BTreeMap::new();
-        for name in GAUGE_NAMES {
-            let gauge = Gauge::default();
-            registry.register(
-                *name,
-                "Morpho V2 reallocator operational gauge.",
-                gauge.clone(),
-            );
-            gauges.insert(*name, gauge);
-        }
-        let mut counters = BTreeMap::new();
-        for name in COUNTER_NAMES {
-            let counter = Counter::default();
-            registry.register(
-                *name,
-                "Morpho V2 reallocator monotonic operational counter.",
-                counter.clone(),
-            );
-            counters.insert(*name, counter);
-        }
+        let gauges = GaugeHandles::register(&mut registry);
+        let counters = CounterHandles::register(&mut registry);
         let rate_snapshot_block = Family::<VaultLabels, Gauge>::default();
         registry.register(
             "reallocator_rate_snapshot_block",
@@ -157,16 +390,14 @@ impl OperationalMetrics {
         Arc::clone(&self.registry)
     }
 
-    /// Sets one registered integer gauge.
-    pub fn set(&self, name: &'static str, value: i64) -> Result<(), UnknownMetric> {
-        self.gauges.get(name).ok_or(UnknownMetric)?.set(value);
-        Ok(())
+    /// Sets one statically registered integer gauge.
+    pub fn set(&self, metric: OperationalGauge, value: i64) {
+        self.gauges.get(metric).set(value);
     }
 
-    /// Increments one registered monotonic counter.
-    pub fn increment(&self, name: &'static str) -> Result<(), UnknownMetric> {
-        self.counters.get(name).ok_or(UnknownMetric)?.inc();
-        Ok(())
+    /// Increments one statically registered monotonic counter.
+    pub fn increment(&self, metric: OperationalCounter) {
+        self.counters.get(metric).inc();
     }
 
     /// Publishes every rate metric from the same immutable API snapshot.
@@ -210,30 +441,6 @@ fn saturating_u256_i64(value: alloy::primitives::U256) -> i64 {
     u64::try_from(value).map_or(i64::MAX, saturating_i64)
 }
 
-const GAUGE_NAMES: &[&str] = &[
-    "reallocator_up",
-    "reallocator_ready",
-    "reallocator_ready_for_execute",
-    "reallocator_providers_ready",
-    "reallocator_exact_state_ready",
-    "reallocator_last_processed_block",
-    "reallocator_last_processed_timestamp_seconds",
-    "reallocator_pending_transaction",
-    "reallocator_json_format_info",
-    "reallocator_storage_queue_depth",
-    "reallocator_storage_queue_high_water",
-    "reallocator_storage_oldest_command_age_milliseconds",
-];
-
-const COUNTER_NAMES: &[&str] = &[
-    // `prometheus-client` appends the required `_total` suffix while encoding.
-    "reallocator_snapshot_success",
-    "reallocator_idle_ledger_replay_failure",
-    "reallocator_snapshot_retries",
-    "reallocator_plans_superseded",
-    "reallocator_strategy_ticks",
-];
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, U256};
@@ -249,16 +456,17 @@ mod tests {
     #[test]
     fn complete_metric_set_and_build_info_are_registered() -> Result<(), std::fmt::Error> {
         let metrics = OperationalMetrics::new();
-        let _ = metrics.set("reallocator_up", 1);
-        let _ = metrics.increment("reallocator_snapshot_success");
+        metrics.set(OperationalGauge::Up, 1);
+        metrics.increment(OperationalCounter::SnapshotSuccess);
         let mut output = String::new();
         encode(&mut output, &metrics.registry)?;
         assert!(output.contains("reallocator_build_info"));
         assert!(output.contains("version=\"0.1.0\""));
-        for name in GAUGE_NAMES {
-            assert!(output.contains(name));
+        for metric in OperationalGauge::ALL {
+            assert!(output.contains(metric.name()));
         }
-        for name in COUNTER_NAMES {
+        for metric in OperationalCounter::ALL {
+            let name = metric.name();
             assert!(output.contains(&format!("{name}_total")));
             assert!(!output.contains(&format!("{name}_total_total")));
         }

@@ -582,6 +582,6 @@ pub struct RewindResult {
     pub blocks_orphaned: u64,
     /// Canonical logs orphaned.
     pub logs_orphaned: u64,
-    /// Included transactions moved to `Orphaned`.
+    /// Transactions whose successful, reverted, or cancelled receipt was orphaned.
     pub transactions_orphaned: u64,
 }

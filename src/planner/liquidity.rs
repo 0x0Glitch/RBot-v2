@@ -12,6 +12,8 @@ use crate::{
     domain::{ExactVaultSnapshot, MarketMode, RequestedAssets, V2Action},
     planner::{
         CandidatePlanSet, PlanBuilder, PlanningError, PlanningInput,
+        candidates::{bounded_distributions, build_candidate_lattice},
+        capital::{allocation_cap_boundaries, projected_cap_headroom},
         certificate::{RejectionReason, SearchCertificate},
     },
     state::projection::ProjectedVaultView,
@@ -127,6 +129,8 @@ fn empty_result(certificate: SearchCertificate) -> LiquiditySolveResult {
 pub struct LiquidityPlanBuilder {
     /// Frozen bounded-search policy.
     pub solver: SolverConfigCanonical,
+    /// Closed transaction action-count bound.
+    pub maximum_actions: usize,
 }
 
 impl PlanBuilder for LiquidityPlanBuilder {
@@ -136,8 +140,13 @@ impl PlanBuilder for LiquidityPlanBuilder {
             .values()
             .next()
             .ok_or(PlanningError::MissingProjection)?;
-        let result =
-            solve_liquidity_maintenance(&input.exact, projection, &input.config, &self.solver);
+        let result = solve_liquidity_maintenance(
+            &input.exact,
+            projection,
+            &input.config,
+            &self.solver,
+            self.maximum_actions,
+        );
         if result.actions.is_empty()
             || input.projected.values().any(|scenario| {
                 crate::planner::simulator::simulate_actions(
@@ -194,6 +203,7 @@ pub fn solve_liquidity_maintenance(
     projection: &ProjectedVaultView,
     vault: &ValidatedVaultConfig,
     solver: &SolverConfigCanonical,
+    maximum_actions: usize,
 ) -> LiquiditySolveResult {
     let mut certificate = SearchCertificate {
         candidate_lattice_hash: B256::ZERO,
@@ -254,7 +264,7 @@ pub fn solve_liquidity_maintenance(
             position: configured.position_key,
             adapter: configured.address,
             data: alloy::primitives::Bytes::new(),
-            allocation_maximum: configured.maximum_action_assets,
+            allocation_maximum: configured.maximum_action_assets.min(current.max_deposit),
             deallocation_maximum: current
                 .real_assets
                 .saturating_sub(vault.minimum_liquidity_adapter_assets)
@@ -273,32 +283,6 @@ pub fn solve_liquidity_maintenance(
         endpoint.clone()
     };
 
-    let mut pairs = Vec::new();
-    if !idle.is_zero() {
-        pairs.push((None, liquidity.clone()));
-    }
-    for source in direct.iter().filter(|position| {
-        position.position != liquidity.position && !position.deallocation_maximum.is_zero()
-    }) {
-        pairs.push((Some(source.clone()), liquidity.clone()));
-        for destination in direct.iter().filter(|destination| {
-            destination.active_destination
-                && destination.position != source.position
-                && !destination.allocation_maximum.is_zero()
-        }) {
-            pairs.push((Some(source.clone()), destination.clone()));
-        }
-    }
-    if !liquidity.deallocation_maximum.is_zero() {
-        for destination in direct.iter().filter(|destination| {
-            destination.active_destination
-                && destination.position != liquidity.position
-                && !destination.allocation_maximum.is_zero()
-        }) {
-            pairs.push((Some(liquidity.clone()), destination.clone()));
-        }
-    }
-
     let Some(liquidity_assets) = base.position_expected_assets(liquidity.position) else {
         certificate.search_complete = false;
         return empty_result(certificate);
@@ -314,71 +298,253 @@ pub fn solve_liquidity_maintenance(
             .minimum_liquidity_adapter_assets
             .saturating_sub(liquidity_assets),
     ];
+    let mut sources = Vec::new();
+    if !idle.is_zero() {
+        sources.push((None, idle));
+    }
+    sources.extend(
+        direct
+            .iter()
+            .filter(|endpoint| !endpoint.deallocation_maximum.is_zero())
+            .cloned()
+            .map(|endpoint| {
+                let maximum = endpoint.deallocation_maximum;
+                (Some(endpoint), maximum)
+            }),
+    );
+    if !liquidity.deallocation_maximum.is_zero()
+        && !direct
+            .iter()
+            .any(|endpoint| endpoint.position == liquidity.position)
+    {
+        sources.push((Some(liquidity.clone()), liquidity.deallocation_maximum));
+    }
+    let mut destinations = vec![liquidity.clone()];
+    destinations.extend(
+        direct
+            .iter()
+            .filter(|endpoint| {
+                endpoint.active_destination
+                    && endpoint.position != liquidity.position
+                    && !endpoint.allocation_maximum.is_zero()
+            })
+            .cloned(),
+    );
+    destinations.retain(|endpoint| !endpoint.allocation_maximum.is_zero());
+    if sources.is_empty() || destinations.is_empty() || maximum_actions == 0 {
+        certificate.candidate_lattice_hash = keccak256([]);
+        return empty_result(certificate);
+    }
+
+    let Some(source_total) = sources.iter().try_fold(U256::ZERO, |total, (_, maximum)| {
+        total.checked_add(*maximum)
+    }) else {
+        certificate.search_complete = false;
+        return empty_result(certificate);
+    };
+    let Some(destination_total) = destinations.iter().try_fold(U256::ZERO, |total, endpoint| {
+        total.checked_add(endpoint.allocation_maximum)
+    }) else {
+        certificate.search_complete = false;
+        return empty_result(certificate);
+    };
+    let maximum = source_total.min(destination_total);
+    if maximum < vault.minimum_action_assets {
+        certificate.candidate_lattice_hash = keccak256([]);
+        return empty_result(certificate);
+    }
+
+    let mut movement_boundaries = vec![
+        deficits[0],
+        deficits[1],
+        deficits[2],
+        idle,
+        source_total,
+        destination_total,
+        maximum,
+    ];
+    let mut destination_boundaries = Vec::with_capacity(destinations.len());
+    for destination in &destinations {
+        let boundaries = if destination.position == liquidity.position {
+            snapshot
+                .liquidity_adapter
+                .as_ref()
+                .and_then(|state| {
+                    projected_cap_headroom(
+                        snapshot,
+                        projection,
+                        crate::domain::CapRef {
+                            vault: vault.address,
+                            id: state.adapter_id,
+                        },
+                    )
+                })
+                .map(|boundary| vec![boundary])
+                .unwrap_or_default()
+        } else {
+            let Some(boundaries) =
+                allocation_cap_boundaries(snapshot, projection, destination.position)
+            else {
+                certificate.search_complete = false;
+                return empty_result(certificate);
+            };
+            boundaries
+        };
+        movement_boundaries.extend(boundaries.iter().copied());
+        destination_boundaries.push(boundaries);
+    }
+    let movement_lattice = build_candidate_lattice(
+        vault.minimum_action_assets,
+        maximum,
+        &movement_boundaries,
+        solver.maximum_amount_candidates_per_position,
+    );
+    let mut lattice_identity = movement_lattice.hash.as_slice().to_vec();
+    let source_lattices = sources
+        .iter()
+        .map(|(_, maximum)| {
+            let lattice = build_candidate_lattice(
+                vault.minimum_action_assets,
+                *maximum,
+                &movement_boundaries,
+                solver.maximum_amount_candidates_per_position,
+            );
+            lattice_identity.extend_from_slice(lattice.hash.as_slice());
+            lattice.amounts
+        })
+        .collect::<Vec<_>>();
+    let destination_lattices = destinations
+        .iter()
+        .zip(&destination_boundaries)
+        .map(|(endpoint, boundaries)| {
+            let mut prioritized = movement_boundaries.clone();
+            prioritized.extend(boundaries.iter().copied());
+            let lattice = build_candidate_lattice(
+                vault.minimum_action_assets,
+                endpoint.allocation_maximum,
+                &prioritized,
+                solver.maximum_amount_candidates_per_position,
+            );
+            lattice_identity.extend_from_slice(lattice.hash.as_slice());
+            lattice.amounts
+        })
+        .collect::<Vec<_>>();
+    let source_maximums = sources
+        .iter()
+        .map(|(_, maximum)| *maximum)
+        .collect::<Vec<_>>();
+    let destination_maximums = destinations
+        .iter()
+        .map(|endpoint| endpoint.allocation_maximum)
+        .collect::<Vec<_>>();
     let mut best: Option<(
         U256,
         Vec<V2Action>,
         crate::planner::simulator::SimulationState,
     )> = None;
     let mut evaluated = 0_u64;
-    let mut lattice_identity = Vec::new();
-    'search: for (source, destination) in pairs {
-        let source_maximum = source
+    'search: for amount in movement_lattice
+        .amounts
+        .into_iter()
+        .filter(|amount| *amount >= vault.minimum_action_assets)
+    {
+        if best
             .as_ref()
-            .map_or(idle, |endpoint| endpoint.deallocation_maximum);
-        let maximum = source_maximum.min(destination.allocation_maximum);
-        if maximum < vault.minimum_action_assets {
+            .is_some_and(|(movement, _, _)| *movement < amount)
+        {
             continue;
         }
-        let lattice = crate::planner::candidates::build_candidate_lattice(
+        let remaining_nodes = solver.maximum_nodes.saturating_sub(evaluated);
+        let distribution_limit = usize::try_from(remaining_nodes).unwrap_or(usize::MAX);
+        let Some(source_distributions) = bounded_distributions(
+            &source_maximums,
+            &source_lattices,
+            amount,
             vault.minimum_action_assets,
-            maximum,
-            &[deficits[0], deficits[1], deficits[2], idle, maximum],
-            solver.maximum_amount_candidates_per_position,
-        );
-        lattice_identity.extend_from_slice(
-            source
-                .as_ref()
-                .map_or(B256::ZERO, |endpoint| endpoint.position.0)
-                .as_slice(),
-        );
-        lattice_identity.extend_from_slice(destination.position.0.as_slice());
-        lattice_identity.extend_from_slice(lattice.hash.as_slice());
-        for amount in lattice
-            .amounts
-            .into_iter()
-            .filter(|amount| *amount >= vault.minimum_action_assets)
-        {
-            if evaluated >= solver.maximum_nodes {
-                certificate.search_complete = false;
-                break 'search;
+            distribution_limit.min(solver.maximum_source_sets),
+        ) else {
+            certificate.search_complete = false;
+            break;
+        };
+        let Some(destination_distributions) = bounded_distributions(
+            &destination_maximums,
+            &destination_lattices,
+            amount,
+            vault.minimum_action_assets,
+            distribution_limit.min(solver.maximum_destination_sets),
+        ) else {
+            certificate.search_complete = false;
+            break;
+        };
+        for source_amounts in &source_distributions {
+            for destination_amounts in &destination_distributions {
+                if evaluated >= solver.maximum_nodes {
+                    certificate.search_complete = false;
+                    break 'search;
+                }
+                evaluated = evaluated.saturating_add(1);
+                let overlapping_position =
+                    sources
+                        .iter()
+                        .zip(source_amounts)
+                        .any(|((source, _), source_amount)| {
+                            !source_amount.is_zero()
+                                && source.as_ref().is_some_and(|source| {
+                                    destinations.iter().zip(destination_amounts).any(
+                                        |(destination, destination_amount)| {
+                                            !destination_amount.is_zero()
+                                                && destination.position == source.position
+                                        },
+                                    )
+                                })
+                        });
+                if overlapping_position {
+                    certificate.reject(RejectionReason::Simulation);
+                    continue;
+                }
+                let mut actions = sources
+                    .iter()
+                    .zip(source_amounts)
+                    .filter_map(|((source, _), amount)| {
+                        (!amount.is_zero())
+                            .then(|| source.as_ref().map(|source| source.deallocate(*amount)))
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>();
+                actions.extend(
+                    destinations
+                        .iter()
+                        .zip(destination_amounts)
+                        .filter(|(_, amount)| !amount.is_zero())
+                        .map(|(destination, amount)| destination.allocate(*amount)),
+                );
+                if actions.is_empty() || actions.len() > maximum_actions {
+                    certificate.reject(RejectionReason::Service);
+                    continue;
+                }
+                let Ok(state) = crate::planner::simulator::simulate_actions(
+                    snapshot, projection, vault, &actions,
+                ) else {
+                    certificate.reject(RejectionReason::Simulation);
+                    continue;
+                };
+                if state.immediate_loss_assets > vault.maximum_immediate_rebalance_loss_assets {
+                    certificate.reject(RejectionReason::ImmediateLoss);
+                    continue;
+                }
+                if state.validate_service_constraints(snapshot, vault).is_err() {
+                    certificate.reject(RejectionReason::Service);
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_movement, best_actions, _)| {
+                        (amount, actions.len()) < (*best_movement, best_actions.len())
+                    })
+                {
+                    best = Some((amount, actions, state));
+                }
             }
-            evaluated = evaluated.saturating_add(1);
-            if best
-                .as_ref()
-                .is_some_and(|(movement, _, _)| *movement <= amount)
-            {
-                continue;
-            }
-            let mut actions = Vec::with_capacity(2);
-            if let Some(source) = &source {
-                actions.push(source.deallocate(amount));
-            }
-            actions.push(destination.allocate(amount));
-            let Ok(state) =
-                crate::planner::simulator::simulate_actions(snapshot, projection, vault, &actions)
-            else {
-                certificate.reject(RejectionReason::Simulation);
-                continue;
-            };
-            if state.immediate_loss_assets > vault.maximum_immediate_rebalance_loss_assets {
-                certificate.reject(RejectionReason::ImmediateLoss);
-                continue;
-            }
-            if state.validate_service_constraints(snapshot, vault).is_err() {
-                certificate.reject(RejectionReason::Service);
-                continue;
-            }
-            best = Some((amount, actions, state));
         }
     }
     certificate.nodes_evaluated = evaluated;

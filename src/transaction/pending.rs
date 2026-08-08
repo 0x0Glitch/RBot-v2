@@ -4,10 +4,7 @@ use alloy::primitives::{B256, U256};
 use thiserror::Error;
 
 use crate::{
-    chain::{
-        logs::StateInvalidation,
-        provider::{ProviderError, SignedTransactionSubmitter},
-    },
+    chain::provider::{ProviderError, SignedTransactionSubmitter},
     config::{ValidatedExecutionConfig, ValidatedVaultConfig},
     domain::{
         AdapterAddress, MarketId, PlanReason, PositionKey, TransactionId, V2Action, V2Plan,
@@ -69,26 +66,6 @@ pub struct PendingSafetySignals {
     pub provider_ambiguous: bool,
     /// New locked idle overlaps the plan.
     pub external_idle_lock_created: bool,
-}
-
-impl PendingSafetySignals {
-    fn cancellation_reason(self) -> Option<CancellationReason> {
-        if self.provider_ambiguous {
-            Some(CancellationReason::ProviderAmbiguity)
-        } else if self.signer_role_lost {
-            Some(CancellationReason::SignerRoleLost)
-        } else if self.external_idle_lock_created {
-            Some(CancellationReason::ExternalIdleLock)
-        } else if self.direction_reversed {
-            Some(CancellationReason::DirectionReversed)
-        } else if self.service_constraint_failed {
-            Some(CancellationReason::ServiceConstraint)
-        } else if self.reward_policy_expired {
-            Some(CancellationReason::RewardPolicyExpired)
-        } else {
-            None
-        }
-    }
 }
 
 /// Immutable dependencies touched by a pending plan.
@@ -163,23 +140,6 @@ impl TouchedResources {
             markets,
         })
     }
-
-    fn is_material(&self, invalidation: &StateInvalidation) -> bool {
-        match invalidation {
-            StateInvalidation::VaultAccounting(vault)
-            | StateInvalidation::VaultTopology(vault)
-            | StateInvalidation::RoleState(vault)
-            | StateInvalidation::GateState(vault)
-            | StateInvalidation::AllForVault(vault) => *vault == self.vault,
-            StateInvalidation::CapState { vault, .. } => *vault == self.vault,
-            StateInvalidation::AdapterState(adapter) => self.adapters.contains(adapter),
-            StateInvalidation::PositionState(position) => self.positions.contains(position),
-            StateInvalidation::MarketState(market) => self.markets.contains(market),
-            StateInvalidation::PendingAdministration(_) | StateInvalidation::TokenLiquidity(_) => {
-                true
-            }
-        }
-    }
 }
 
 /// Inclusion-opportunity state for the one unresolved transaction.
@@ -250,7 +210,6 @@ pub enum PendingPolicyError {
 pub fn assess_pending(
     clock: &PendingClock,
     current: InclusionOpportunity,
-    invalidations: &[StateInvalidation],
     signals: PendingSafetySignals,
     execution: &ValidatedExecutionConfig,
 ) -> Result<PendingDecision, PendingPolicyError> {
@@ -262,16 +221,11 @@ pub fn assess_pending(
         .0
         .checked_sub(clock.last_attempt_at.0)
         .ok_or(PendingPolicyError::Clock)?;
-    if let Some(reason) = signals.cancellation_reason() {
-        return Ok(PendingDecision::Cancel(reason));
-    }
-    if invalidations
-        .iter()
-        .any(|invalidation| clock.touched.is_material(invalidation))
-    {
-        return Ok(PendingDecision::Cancel(
-            CancellationReason::MaterialInvalidation,
-        ));
+    // Signed bytes own the nonce until a receipt or bounded pending horizon resolves it. Ordinary
+    // market/config churn supersedes only the next plan; cancelling on every touched event creates
+    // an unbounded original-versus-cancellation race. During provider ambiguity, sign nothing new.
+    if signals.provider_ambiguous {
+        return Ok(PendingDecision::Wait);
     }
     let horizon = pending_horizon(clock.reason, execution)?;
     let remaining = horizon.saturating_sub(age);
@@ -456,7 +410,6 @@ mod tests {
         PendingSafetySignals, TouchedResources, assess_pending,
     };
     use crate::{
-        chain::logs::StateInvalidation,
         config::{AppConfig, ValidatedConfig},
         domain::{AdapterAddress, MarketId, PlanReason, PositionKey, VaultAddress},
     };
@@ -506,7 +459,6 @@ mod tests {
             assess_pending(
                 &clock,
                 InclusionOpportunity(10),
-                &[],
                 PendingSafetySignals::default(),
                 &config.app.execution,
             )
@@ -517,7 +469,6 @@ mod tests {
             assess_pending(
                 &clock,
                 InclusionOpportunity(12),
-                &[],
                 PendingSafetySignals::default(),
                 &config.app.execution,
             )
@@ -528,7 +479,6 @@ mod tests {
             assess_pending(
                 &clock,
                 InclusionOpportunity(15),
-                &[],
                 PendingSafetySignals::default(),
                 &config.app.execution,
             )
@@ -539,7 +489,6 @@ mod tests {
             assess_pending(
                 &clock,
                 InclusionOpportunity(9),
-                &[],
                 PendingSafetySignals::default(),
                 &config.app.execution,
             )
@@ -548,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn touched_state_and_hard_safety_signals_cancel_before_replacement() {
+    fn signed_nonce_ignores_state_churn_and_waits_during_provider_ambiguity() {
         let config = test_config();
         assert!(config.is_some(), "test configuration must validate");
         let Some(config) = config else {
@@ -558,25 +507,24 @@ mod tests {
         assert_eq!(
             assess_pending(
                 &clock,
-                InclusionOpportunity(10),
-                &[StateInvalidation::MarketState(MarketId(B256::repeat_byte(
-                    4
-                )))],
-                PendingSafetySignals::default(),
+                InclusionOpportunity(12),
+                PendingSafetySignals {
+                    direction_reversed: true,
+                    service_constraint_failed: true,
+                    reward_policy_expired: true,
+                    signer_role_lost: true,
+                    provider_ambiguous: false,
+                    external_idle_lock_created: true,
+                },
                 &config.app.execution,
             )
             .ok(),
-            Some(PendingDecision::Cancel(
-                CancellationReason::MaterialInvalidation
-            ))
+            Some(PendingDecision::Replace)
         );
         assert_eq!(
             assess_pending(
                 &clock,
-                InclusionOpportunity(10),
-                &[StateInvalidation::MarketState(MarketId(B256::repeat_byte(
-                    9
-                )))],
+                InclusionOpportunity(15),
                 PendingSafetySignals {
                     provider_ambiguous: true,
                     ..PendingSafetySignals::default()
@@ -584,9 +532,7 @@ mod tests {
                 &config.app.execution,
             )
             .ok(),
-            Some(PendingDecision::Cancel(
-                CancellationReason::ProviderAmbiguity
-            ))
+            Some(PendingDecision::Wait)
         );
     }
 }

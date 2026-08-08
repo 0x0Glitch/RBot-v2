@@ -17,6 +17,9 @@ use morpho_v2_reallocator::planner::{
     episodes::{IndependentRateEvent, RateSignalEpisode},
     top_k_apy::TopKApyMemory,
 };
+use morpho_v2_reallocator::reconciliation::classification::{
+    canonical_receipt_outcome, persist_canonical_receipt_outcome,
+};
 use morpho_v2_reallocator::storage::StorageError;
 use morpho_v2_reallocator::storage::actor::StorageService;
 use morpho_v2_reallocator::storage::models::{
@@ -104,7 +107,7 @@ fn rate_episode(vault: VaultAddress, detection: BlockRef, salt: u8) -> RateSigna
 }
 
 #[tokio::test]
-async fn top_k_memory_is_durable_and_removed_when_its_observation_is_reorged()
+async fn top_k_memory_restores_the_ancestor_observation_after_reorg()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = directory.path().join("top-k-memory.json");
@@ -125,17 +128,30 @@ async fn top_k_memory_is_durable_and_removed_when_its_observation_is_reorged()
             )
             .await?;
     }
-    let memory = TopKApyMemory {
-        last_observed_block: observed.number,
-        last_observed_timestamp: observed.timestamp,
+    let ancestor_memory = TopKApyMemory {
+        last_observed_block: ancestor.number,
+        last_observed_timestamp: ancestor.timestamp,
         generation: 1,
         selected_markets: vec![MarketId(B256::repeat_byte(1))],
         ..TopKApyMemory::default()
     };
     handle
-        .persist_top_k_apy_memory(vault, memory.clone(), observed.timestamp)
+        .persist_top_k_apy_memory(vault, ancestor_memory.clone(), ancestor.timestamp)
         .await?;
-    assert_eq!(handle.load_top_k_apy_memory(vault).await?, Some(memory));
+    let orphaned_memory = TopKApyMemory {
+        last_observed_block: observed.number,
+        last_observed_timestamp: observed.timestamp,
+        generation: 2,
+        selected_markets: vec![MarketId(B256::repeat_byte(2))],
+        ..TopKApyMemory::default()
+    };
+    handle
+        .persist_top_k_apy_memory(vault, orphaned_memory.clone(), observed.timestamp)
+        .await?;
+    assert_eq!(
+        handle.load_top_k_apy_memory(vault).await?,
+        Some(orphaned_memory)
+    );
     service.shutdown().await?;
 
     let reopened = reopen(&path).await?;
@@ -144,7 +160,10 @@ async fn top_k_memory_is_durable_and_removed_when_its_observation_is_reorged()
     handle
         .rewind_to_ancestor(999, ancestor, ancestor.timestamp)
         .await?;
-    assert_eq!(handle.load_top_k_apy_memory(vault).await?, None);
+    assert_eq!(
+        handle.load_top_k_apy_memory(vault).await?,
+        Some(ancestor_memory)
+    );
     reopened.shutdown().await?;
     Ok(())
 }
@@ -358,6 +377,12 @@ async fn signed_transaction_summaries_are_durable_and_current()
             updated_at: 1_800_000_001,
         })
         .await?;
+    assert_eq!(
+        handle
+            .known_transaction_vaults(vec![transaction_hash, B256::repeat_byte(0xff)])
+            .await?,
+        vec![vault]
+    );
     let summaries = handle.load_transaction_summaries().await?;
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].vault, vault);
@@ -402,6 +427,307 @@ async fn signed_transaction_summaries_are_durable_and_current()
     assert_eq!(summaries[0].state, TransactionState::Included);
     assert_eq!(summaries[0].included_block, Some(12));
     reopened.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reverted_receipt_remains_recoverable_until_exact_recovery_commits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let service = reopen(&directory.path().join("staged-revert.json")).await?;
+    let handle = service.handle();
+    let signer = Address::with_last_byte(0x43);
+    let reservation = reservation(signer);
+    let transaction_id = reservation.transaction_id;
+    handle.reserve_nonce(reservation).await?;
+    let raw = Bytes::from_static(&[0x02, 0xaa]);
+    let transaction_hash = alloy::primitives::keccak256(&raw);
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id,
+            transaction_hash,
+            raw_signed_transaction: raw,
+            updated_at: 2,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(transaction_hash),
+            submitted_at: Some(3),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 3,
+        })
+        .await?;
+    let pending = handle
+        .load_unresolved(signer)
+        .await?
+        .ok_or("submitted transaction must own the nonce lane")?;
+    let receipt = CanonicalReceiptRecord {
+        chain_id: 999,
+        transaction_hash,
+        block_number: 4,
+        block_hash: B256::repeat_byte(4),
+        transaction_index: 0,
+        status: Some(0),
+        gas_used: 100_000,
+        logs: Vec::new(),
+    };
+    let ancestor = block(3, 3, 2);
+    let receipt_block = block(4, 4, 3);
+    handle
+        .apply_canonical_block(
+            CanonicalBlockRecord {
+                chain_id: 999,
+                block: ancestor,
+            },
+            Vec::new(),
+            ancestor.timestamp,
+        )
+        .await?;
+    handle
+        .apply_canonical_block_with_receipts(
+            CanonicalBlockRecord {
+                chain_id: 999,
+                block: receipt_block,
+            },
+            Vec::new(),
+            vec![receipt.clone()],
+            receipt_block.timestamp,
+        )
+        .await?;
+    let outcome = canonical_receipt_outcome(&pending, &receipt)?;
+    assert_eq!(outcome, TransactionState::Reverted);
+    assert_eq!(
+        handle.load_unresolved(signer).await?.map(|row| row.state),
+        Some(TransactionState::Submitted)
+    );
+
+    persist_canonical_receipt_outcome(&handle, &pending, &receipt, outcome, 4).await?;
+    assert!(handle.load_unresolved(signer).await?.is_none());
+    assert_eq!(handle.count_transactions_since(signer, 0).await?, 1);
+    assert_eq!(
+        handle
+            .load_transaction_summaries()
+            .await?
+            .first()
+            .map(|summary| summary.state),
+        Some(TransactionState::Reverted)
+    );
+
+    let rewind = handle
+        .rewind_to_ancestor(999, ancestor, ancestor.timestamp)
+        .await?;
+    assert_eq!(rewind.transactions_orphaned, 1);
+    let reopened = handle
+        .load_unresolved(signer)
+        .await?
+        .ok_or("orphaned revert must reopen nonce ownership")?;
+    assert_eq!(reopened.state, TransactionState::Orphaned);
+    assert_eq!(reopened.included_block, None);
+    assert_eq!(reopened.included_block_hash, None);
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphaned_cancellation_reopens_the_nonce_lane() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let service = reopen(&directory.path().join("cancel-reorg.json")).await?;
+    let handle = service.handle();
+    let signer = Address::with_last_byte(0x44);
+    let nonce = reservation(signer);
+    let transaction_id = nonce.transaction_id;
+    handle.reserve_nonce(nonce).await?;
+
+    let initial_raw = Bytes::from_static(&[0x02, 0xbb]);
+    let initial_hash = alloy::primitives::keccak256(&initial_raw);
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id,
+            transaction_hash: initial_hash,
+            raw_signed_transaction: initial_raw,
+            updated_at: 2,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(initial_hash),
+            submitted_at: Some(3),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 3,
+        })
+        .await?;
+
+    let cancellation_raw = Bytes::from_static(&[0x02, 0xcc]);
+    let cancellation_hash = alloy::primitives::keccak256(&cancellation_raw);
+    handle
+        .persist_signed_attempt(SignedAttemptRecord {
+            transaction_id,
+            kind: TransactionAttemptKind::Cancellation,
+            transaction_hash: cancellation_hash,
+            raw_signed_transaction: cancellation_raw,
+            max_fee_per_gas: U256::from(200_u64),
+            max_priority_fee_per_gas: U256::from(4_u64),
+            signed_at: 4,
+            signed_block: 4,
+            broadcast_at: None,
+            last_broadcast_block: None,
+        })
+        .await?;
+    handle
+        .record_attempt_broadcast(transaction_id, cancellation_hash, 4, 4)
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::CancellationSigned,
+            next_state: TransactionState::CancellationSubmitted,
+            transaction_hash: Some(cancellation_hash),
+            submitted_at: Some(4),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 4,
+        })
+        .await?;
+
+    let ancestor = block(4, 4, 3);
+    let receipt_block = block(5, 5, 4);
+    let receipt = CanonicalReceiptRecord {
+        chain_id: 999,
+        transaction_hash: cancellation_hash,
+        block_number: receipt_block.number,
+        block_hash: receipt_block.hash,
+        transaction_index: 0,
+        status: Some(1),
+        gas_used: 21_000,
+        logs: Vec::new(),
+    };
+    handle
+        .apply_canonical_block(
+            CanonicalBlockRecord {
+                chain_id: 999,
+                block: ancestor,
+            },
+            Vec::new(),
+            ancestor.timestamp,
+        )
+        .await?;
+    handle
+        .apply_canonical_block_with_receipts(
+            CanonicalBlockRecord {
+                chain_id: 999,
+                block: receipt_block,
+            },
+            Vec::new(),
+            vec![receipt.clone()],
+            receipt_block.timestamp,
+        )
+        .await?;
+
+    let pending = handle
+        .load_unresolved(signer)
+        .await?
+        .ok_or("cancellation must own the nonce before confirmation")?;
+    let outcome = canonical_receipt_outcome(&pending, &receipt)?;
+    assert_eq!(outcome, TransactionState::Cancelled);
+    persist_canonical_receipt_outcome(
+        &handle,
+        &pending,
+        &receipt,
+        outcome,
+        receipt_block.timestamp,
+    )
+    .await?;
+    assert!(handle.load_unresolved(signer).await?.is_none());
+
+    let rewind = handle
+        .rewind_to_ancestor(999, ancestor, ancestor.timestamp)
+        .await?;
+    assert_eq!(rewind.transactions_orphaned, 1);
+    assert_eq!(
+        handle.load_unresolved(signer).await?.map(|row| row.state),
+        Some(TransactionState::Orphaned)
+    );
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphaned_foreign_nonce_evidence_returns_to_recovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let service = reopen(&directory.path().join("foreign-nonce-reorg.json")).await?;
+    let handle = service.handle();
+    let signer = Address::with_last_byte(0x45);
+    let nonce = reservation(signer);
+    let transaction_id = nonce.transaction_id;
+    handle.reserve_nonce(nonce).await?;
+    let raw = Bytes::from_static(&[0x02, 0xdd]);
+    let known_hash = alloy::primitives::keccak256(&raw);
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id,
+            transaction_hash: known_hash,
+            raw_signed_transaction: raw,
+            updated_at: 2,
+        })
+        .await?;
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(known_hash),
+            submitted_at: Some(3),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: 3,
+        })
+        .await?;
+    let ancestor = block(3, 3, 2);
+    let consumed = block(4, 4, 3);
+    for canonical in [ancestor, consumed] {
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 999,
+                    block: canonical,
+                },
+                Vec::new(),
+                canonical.timestamp,
+            )
+            .await?;
+    }
+    handle
+        .transition_transaction(TransactionTransition {
+            transaction_id,
+            expected_state: TransactionState::Submitted,
+            next_state: TransactionState::ForeignNonceConsumed,
+            transaction_hash: Some(B256::repeat_byte(0xee)),
+            submitted_at: None,
+            included_block: Some(consumed.number),
+            included_block_hash: Some(consumed.hash),
+            updated_at: consumed.timestamp,
+        })
+        .await?;
+
+    let rewind = handle
+        .rewind_to_ancestor(999, ancestor, ancestor.timestamp)
+        .await?;
+    assert_eq!(rewind.transactions_orphaned, 1);
+    assert_eq!(
+        handle.load_unresolved(signer).await?.map(|row| row.state),
+        Some(TransactionState::Orphaned)
+    );
+    service.shutdown().await?;
     Ok(())
 }
 
@@ -1132,6 +1458,8 @@ async fn transaction_boundaries_recover_after_every_reopen()
         .load_unresolved(signer)
         .await?
         .ok_or("included transaction disappeared")?;
+    let all_unresolved = service.handle().load_all_unresolved().await?;
+    assert_eq!(all_unresolved, vec![included.clone()]);
     assert_eq!(included.included_block, Some(20));
     assert_eq!(included.included_block_hash, Some(B256::repeat_byte(0x20)));
     service.shutdown().await?;
@@ -1759,6 +2087,7 @@ async fn storage_mailbox_exposes_bounded_queue_telemetry() -> Result<(), Box<dyn
     let stats = handle.queue_stats();
     assert_eq!(stats.depth, 0);
     assert_eq!(stats.oldest_age_millis, 0);
+    assert_eq!(stats.active_command_age_millis, 0);
     assert!(stats.high_water >= 1);
     service.shutdown().await?;
     Ok(())

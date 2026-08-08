@@ -172,7 +172,7 @@ impl RateSignalEpisode {
             direction.push(1);
             direction.extend_from_slice(market.0.as_slice());
         }
-        direction.push(objective_branch as u8);
+        direction.push(objective_branch.stable_code());
         direction.extend_from_slice(config_revision.as_slice());
         direction.extend_from_slice(topology_revision.as_slice());
         let direction_hash = keccak256(&direction);

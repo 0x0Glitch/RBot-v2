@@ -89,59 +89,21 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveCurrentStateSour
         &self,
     ) -> Result<RecoveryStateAssessment, CurrentStateSourceError> {
         let vault = self.configured_vault()?;
-        let (snapshot, projection) = self.rebuild_exact_snapshot(None).await?;
+        let current = self
+            .storage
+            .load_cursor(self.config.app.chain.chain_id)
+            .await
+            .map_err(|_| CurrentStateSourceError::FatalAt("cursor_load"))?
+            .ok_or(CurrentStateSourceError::ContextNotReady)?;
+        let (snapshot, projection) = self.rebuild_exact_snapshot(Some(current.number)).await?;
         let active_episode = self
             .storage
             .load_active_rate_episode(vault.address, vault.rate_group.id)
             .await
             .map_err(|_| CurrentStateSourceError::FatalAt("active_episode_load"))?;
-        let (current_rate_spread, _next_plan_needed) =
-            if vault.strategy == VaultStrategy::TopKApyDiversified {
-                let memory = self
-                    .storage
-                    .load_top_k_apy_memory(vault.address)
-                    .await
-                    .map_err(|_| CurrentStateSourceError::FatalAt("top_k_memory_load"))?;
-                let funding = verified_deployable_capital(&snapshot, vault)
-                    .map_err(|_| CurrentStateSourceError::FailedAt("top_k_funding"))?;
-                let observation = observe_top_k_target(
-                    &snapshot,
-                    &projection,
-                    vault,
-                    &self.config.app.strategy.top_k_apy,
-                    memory.as_ref(),
-                    funding.total_assets,
-                )
-                .map_err(|_| CurrentStateSourceError::FailedAt("top_k_target"))?;
-                self.storage
-                    .persist_top_k_apy_memory(
-                        vault.address,
-                        observation.next_memory,
-                        projection.head.timestamp,
-                    )
-                    .await
-                    .map_err(|_| CurrentStateSourceError::FatalAt("top_k_memory_persist"))?;
-                let score = observation
-                    .target
-                    .as_ref()
-                    .map_or(alloy::primitives::U256::ZERO, |target| {
-                        target.current_score_wad
-                    });
-                let needs_plan = funding.total_assets >= vault.minimum_action_assets
-                    || score > self.config.app.strategy.top_k_apy.target_score_wad;
-                (score, needs_plan)
-            } else {
-                let spread = current_rate_spread(
-                    active_episode.as_ref(),
-                    &projection,
-                    &self.config.app.strategy,
-                    vault,
-                )?;
-                (
-                    spread,
-                    spread > self.config.app.strategy.convergence_spread(),
-                )
-            };
+        let (current_rate_spread, _next_plan_needed) = self
+            .current_strategy_state(vault, &snapshot, &projection, active_episode.as_ref())
+            .await?;
         let service_constraints_met = projection.deposit_headroom_satisfied
             && projection.atomic_exit_coverage_satisfied
             && projection.source_constraints_satisfied;
@@ -169,6 +131,59 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveCurrentStateSour
             .ok_or(CurrentStateSourceError::FailedAt("configured_vault"))
     }
 
+    /// Refreshes the selected strategy from one exact snapshot and persists strategy-owned
+    /// memory before reporting whether another plan is needed.
+    async fn current_strategy_state(
+        &self,
+        vault: &crate::config::ValidatedVaultConfig,
+        snapshot: &crate::domain::ExactVaultSnapshot,
+        projection: &ProjectedVaultView,
+        active_episode: Option<&crate::planner::episodes::RateSignalEpisode>,
+    ) -> Result<(alloy::primitives::U256, bool), CurrentStateSourceError> {
+        if vault.strategy != VaultStrategy::TopKApyDiversified {
+            let spread =
+                current_rate_spread(active_episode, projection, &self.config.app.strategy, vault)?;
+            return Ok((
+                spread,
+                spread > self.config.app.strategy.convergence_spread(),
+            ));
+        }
+
+        let memory = self
+            .storage
+            .load_top_k_apy_memory(vault.address)
+            .await
+            .map_err(|_| CurrentStateSourceError::FatalAt("top_k_memory_load"))?;
+        let funding = verified_deployable_capital(snapshot, vault)
+            .map_err(|_| CurrentStateSourceError::FailedAt("top_k_funding"))?;
+        let observation = observe_top_k_target(
+            snapshot,
+            projection,
+            vault,
+            &self.config.app.strategy.top_k_apy,
+            memory.as_ref(),
+            funding.total_assets,
+        )
+        .map_err(|_| CurrentStateSourceError::FailedAt("top_k_target"))?;
+        let score = observation
+            .target
+            .as_ref()
+            .map_or(alloy::primitives::U256::ZERO, |target| {
+                target.current_score_wad
+            });
+        let needs_plan = funding.total_assets >= vault.minimum_action_assets
+            || score > self.config.app.strategy.top_k_apy.target_score_wad;
+        self.storage
+            .persist_top_k_apy_memory(
+                vault.address,
+                observation.next_memory,
+                projection.head.timestamp,
+            )
+            .await
+            .map_err(|_| CurrentStateSourceError::FatalAt("top_k_memory_persist"))?;
+        Ok((score, needs_plan))
+    }
+
     async fn rebuild_exact_snapshot(
         &self,
         minimum_block: Option<u64>,
@@ -177,13 +192,21 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveCurrentStateSour
         let vault = self.configured_vault()?;
         if self.config.app.snapshot.mode == SnapshotMode::AtomicLatest {
             let minimum = minimum_block.unwrap_or(0);
+            let cursor = self
+                .storage
+                .load_cursor(self.config.app.chain.chain_id)
+                .await
+                .map_err(|_| CurrentStateSourceError::FatalAt("cursor_load"))?
+                .filter(|cursor| cursor.number >= minimum)
+                .ok_or(CurrentStateSourceError::ContextNotReady)?;
             let snapshot = match self.api.snapshot(vault.address).await {
-                Some(snapshot) if snapshot.context.block.number >= minimum => snapshot,
+                Some(snapshot) if snapshot.context.block == cursor => snapshot,
                 _ => self
                     .storage
                     .load_latest_exact_snapshot(vault.address, minimum)
                     .await
                     .map_err(|_| CurrentStateSourceError::FatalAt("latest_snapshot_load"))?
+                    .filter(|snapshot| snapshot.context.block == cursor)
                     .ok_or(CurrentStateSourceError::ContextNotReady)?,
             };
             self.identities
@@ -292,53 +315,9 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> ExactCurrentStateSou
             .ok_or(CurrentStateSourceError::FailedAt(
                 "reconciliation_context_absent",
             ))?;
-        let (current_rate_spread, next_plan_needed) =
-            if vault.strategy == VaultStrategy::TopKApyDiversified {
-                let memory = self
-                    .storage
-                    .load_top_k_apy_memory(vault.address)
-                    .await
-                    .map_err(|_| CurrentStateSourceError::FatalAt("top_k_memory_load"))?;
-                let funding = verified_deployable_capital(&snapshot, vault)
-                    .map_err(|_| CurrentStateSourceError::FailedAt("top_k_funding"))?;
-                let observation = observe_top_k_target(
-                    &snapshot,
-                    &projection,
-                    vault,
-                    &self.config.app.strategy.top_k_apy,
-                    memory.as_ref(),
-                    funding.total_assets,
-                )
-                .map_err(|_| CurrentStateSourceError::FailedAt("top_k_target"))?;
-                self.storage
-                    .persist_top_k_apy_memory(
-                        vault.address,
-                        observation.next_memory,
-                        projection.head.timestamp,
-                    )
-                    .await
-                    .map_err(|_| CurrentStateSourceError::FatalAt("top_k_memory_persist"))?;
-                let score = observation
-                    .target
-                    .as_ref()
-                    .map_or(alloy::primitives::U256::ZERO, |target| {
-                        target.current_score_wad
-                    });
-                let needs_plan = funding.total_assets >= vault.minimum_action_assets
-                    || score > self.config.app.strategy.top_k_apy.target_score_wad;
-                (score, needs_plan)
-            } else {
-                let spread = current_rate_spread(
-                    active_episode.as_ref(),
-                    &projection,
-                    &self.config.app.strategy,
-                    vault,
-                )?;
-                (
-                    spread,
-                    spread > self.config.app.strategy.convergence_spread(),
-                )
-            };
+        let (current_rate_spread, next_plan_needed) = self
+            .current_strategy_state(vault, &snapshot, &projection, active_episode.as_ref())
+            .await?;
         let confirmed_episode = match (
             reconciliation_context.rate_movement,
             reconciliation_context.rate_episode,

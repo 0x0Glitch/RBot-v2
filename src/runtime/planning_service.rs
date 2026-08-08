@@ -627,7 +627,13 @@ pub fn build_validated_liquidity_plan(
     projection: &ProjectedVaultView,
     revision: Option<&PlanningRevision>,
 ) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
-    let solved = solve_liquidity_maintenance(snapshot, projection, vault, &config.app.solver);
+    let solved = solve_liquidity_maintenance(
+        snapshot,
+        projection,
+        vault,
+        &config.app.solver,
+        config.app.execution.maximum_actions,
+    );
     let Some(state) = solved.state else {
         return Ok(None);
     };

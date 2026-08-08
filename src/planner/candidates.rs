@@ -102,3 +102,65 @@ pub fn build_candidate_lattice(
         hash: keccak256(encoded),
     }
 }
+
+/// Enumerates bounded exact distributions of `total` across endpoint maxima.
+///
+/// Every result conserves the requested total. A deterministic sink receives the residual, which
+/// means exact feasibility boundaries are not lost merely because they were absent from one
+/// endpoint's sparse lattice.
+pub(crate) fn bounded_distributions(
+    maximums: &[U256],
+    lattices: &[Vec<U256>],
+    total: U256,
+    minimum_action: U256,
+    limit: usize,
+) -> Option<Vec<Vec<U256>>> {
+    let limit = limit.max(1);
+    let mut unique = BTreeSet::new();
+    for sink in 0..maximums.len() {
+        let mut partials = vec![(vec![U256::ZERO; maximums.len()], U256::ZERO)];
+        for (index, amounts) in lattices.iter().enumerate() {
+            if index == sink {
+                continue;
+            }
+            let mut next = Vec::new();
+            for (selected, subtotal) in partials {
+                for amount in amounts {
+                    let Some(updated) = subtotal.checked_add(*amount) else {
+                        continue;
+                    };
+                    if updated > total {
+                        continue;
+                    }
+                    if next.len() >= limit {
+                        return None;
+                    }
+                    let mut candidate = selected.clone();
+                    let slot = candidate.get_mut(index)?;
+                    *slot = *amount;
+                    next.push((candidate, updated));
+                }
+            }
+            partials = next;
+        }
+        for (mut selected, subtotal) in partials {
+            let residual = total.saturating_sub(subtotal);
+            let sink_maximum = maximums.get(sink)?;
+            if residual > *sink_maximum
+                || (!residual.is_zero() && residual < minimum_action)
+                || selected
+                    .iter()
+                    .any(|amount| !amount.is_zero() && *amount < minimum_action)
+            {
+                continue;
+            }
+            let slot = selected.get_mut(sink)?;
+            *slot = residual;
+            unique.insert(selected);
+            if unique.len() > limit {
+                return None;
+            }
+        }
+    }
+    Some(unique.into_iter().collect())
+}

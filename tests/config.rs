@@ -100,6 +100,34 @@ fn checked_in_hyperevm_vault_configuration_is_exact_and_complete() {
         validated.app.strategy.top_k_apy.replacement_apy_wad,
         alloy::primitives::U256::from(10_000_000_000_000_000_u64)
     );
+    assert_eq!(
+        validated
+            .app
+            .strategy
+            .top_k_apy
+            .fourth_market_max_gap_apy_wad,
+        alloy::primitives::U256::from(25_000_000_000_000_000_u64)
+    );
+    assert_eq!(
+        validated
+            .app
+            .strategy
+            .top_k_apy
+            .top_market_boost_threshold_apy_wad,
+        alloy::primitives::U256::from(20_000_000_000_000_000_u64)
+    );
+    assert_eq!(
+        validated.app.strategy.top_k_apy.top_market_boost_weight_bps,
+        7_000
+    );
+    assert_eq!(
+        validated.app.strategy.top_k_apy.three_market_weights_bps,
+        vec![5_000, 3_000, 2_000]
+    );
+    assert_eq!(
+        validated.app.strategy.top_k_apy.four_market_weights_bps,
+        vec![4_000, 3_000, 2_000, 1_000]
+    );
     assert_eq!(vault.positions.len(), 8);
     assert!(vault.liquidity_adapter.is_some());
 }
@@ -119,6 +147,68 @@ fn one_allocator_may_own_multiple_distinct_vaults() {
     assert_eq!(
         validated.app.vaults[0].signer_address,
         validated.app.vaults[1].signer_address
+    );
+}
+
+#[test]
+fn top_k_weight_policy_rejects_more_than_seventy_percent() {
+    let mut boosted = raw_example();
+    boosted.strategy.top_k_apy.top_market_boost_weight_bps = 7_001;
+    assert_field(
+        match boosted.validate() {
+            Ok(_) => panic!("a top-market boost above 70% must fail"),
+            Err(error) => error,
+        },
+        "strategy.top_k_apy.yield_weighting",
+    );
+
+    let mut base = raw_example();
+    base.strategy.top_k_apy.three_market_weights_bps = vec![7_001, 1_999, 1_000];
+    assert_field(
+        match base.validate() {
+            Ok(_) => panic!("a base market weight above 70% must fail"),
+            Err(error) => error,
+        },
+        "strategy.top_k_apy.weights",
+    );
+}
+
+#[test]
+fn reorg_rescan_cannot_exceed_durable_topology_retention() {
+    let mut config = raw_example();
+    config.chain.reorg_rescan_blocks =
+        morpho_v2_reallocator::storage::actor::MAX_DURABLE_REORG_RESCAN_BLOCKS.saturating_add(1);
+    assert_field(
+        match config.validate() {
+            Ok(_) => panic!("unsupported reorg window must fail"),
+            Err(error) => error,
+        },
+        "chain",
+    );
+}
+
+#[test]
+fn duplicate_adapter_and_market_inputs_are_rejected_before_planning() {
+    let mut duplicate_adapter = raw_example();
+    let repeated_adapter = duplicate_adapter.vault[0].adapter[0].clone();
+    duplicate_adapter.vault[0].adapter.push(repeated_adapter);
+    assert_field(
+        match duplicate_adapter.validate() {
+            Ok(_) => panic!("duplicate adapter must fail"),
+            Err(error) => error,
+        },
+        "vault.adapter.address",
+    );
+
+    let mut duplicate_position = raw_example();
+    let repeated_position = duplicate_position.vault[0].position[0].clone();
+    duplicate_position.vault[0].position.push(repeated_position);
+    assert_field(
+        match duplicate_position.validate() {
+            Ok(_) => panic!("duplicate market position must fail"),
+            Err(error) => error,
+        },
+        "vault.position",
     );
 }
 

@@ -125,6 +125,9 @@ pub enum TopologyError {
     /// Canonical external donation evidence exceeds uint256.
     #[error("external donation share evidence overflow")]
     DonationEvidenceOverflow,
+    /// A configured position key was previously associated with another adapter or market.
+    #[error("configured position identity conflicts with persisted topology")]
+    ConfiguredPositionCollision,
     /// Canonical serialization failed.
     #[error("topology serialization failed")]
     Serialization,
@@ -190,6 +193,40 @@ impl TopologyIndex {
             performance_fee_recipient: Address::ZERO,
             management_fee_recipient: Address::ZERO,
         }
+    }
+
+    /// Idempotently merges the current validated static read set into a persisted all-ever index.
+    /// Existing event history and live membership are retained. A position key can never be
+    /// silently rebound to another adapter or market across configuration revisions.
+    pub fn merge_configured_read_set(
+        &mut self,
+        deployment_block: u64,
+        configured_adapters: impl IntoIterator<Item = AdapterAddress>,
+        configured_positions: impl IntoIterator<Item = (AdapterAddress, MarketId, PositionKey)>,
+    ) -> Result<(), TopologyError> {
+        for adapter in configured_adapters {
+            let entry = self.adapter_entry(adapter, deployment_block);
+            entry.first_seen_block = entry.first_seen_block.min(deployment_block);
+        }
+        for (adapter, market, position) in configured_positions {
+            let configured = ConfiguredPositionTopology {
+                adapter,
+                market_id: market,
+            };
+            match self.configured_positions.get(&position) {
+                Some(existing) if *existing != configured => {
+                    return Err(TopologyError::ConfiguredPositionCollision);
+                }
+                Some(_) => {}
+                None => {
+                    self.configured_positions.insert(position, configured);
+                }
+            }
+            let entry = self.adapter_entry(adapter, deployment_block);
+            entry.first_seen_block = entry.first_seen_block.min(deployment_block);
+            entry.historical_market_ids.insert(market);
+        }
+        Ok(())
     }
 
     /// Applies one strictly decoded canonical event in transaction/log order.

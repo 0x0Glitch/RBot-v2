@@ -29,8 +29,8 @@ use morpho_v2_reallocator::{
         fees::{signed_gas_limit, validate_replacement_fees},
         firewall::{
             FirewallError, RoutineTransactionFields, ValidatedPlan, canonical_plan_hash,
-            canonical_plan_id, validate_historical_plan, validate_plan,
-            validate_routine_transaction,
+            canonical_plan_id, validate_historical_plan, validate_historical_routine_transaction,
+            validate_plan, validate_routine_transaction,
         },
         lifecycle::{
             RecoveryClassification, RecoveryFacts, classify_recovery, persist_unsigned_rebalance,
@@ -330,7 +330,7 @@ fn liquidity_adapter_uses_only_the_configured_address_and_empty_data() {
 fn historical_receipt_validation_keeps_the_signing_revision_bound() {
     let config = config_for_signer(Address::with_last_byte(0x02));
     let plan = raw_plan(&config);
-    let mut restarted = config.clone();
+    let mut restarted = config;
     restarted.revision = B256::repeat_byte(0x99);
 
     assert!(validate_plan(plan.clone(), &restarted).is_err());
@@ -340,6 +340,30 @@ fn historical_receipt_validation_keeps_the_signing_revision_bound() {
     internally_inconsistent.snapshot.static_config_revision = B256::repeat_byte(0x98);
     rehash(&mut internally_inconsistent);
     assert!(validate_historical_plan(internally_inconsistent, &restarted).is_err());
+}
+
+#[test]
+fn unresolved_transaction_recovery_survives_an_unrelated_config_revision() {
+    let config = config_for_signer(Address::with_last_byte(0x02));
+    let plan = raw_plan(&config);
+    let fields = fields(
+        &config,
+        &validate_plan(plan.clone(), &config)
+            .unwrap_or_else(|error| panic!("signing-time plan must validate: {error}")),
+    );
+    let mut restarted = config;
+    restarted.revision = B256::repeat_byte(0xa9);
+
+    assert!(validate_plan(plan.clone(), &restarted).is_err());
+    assert!(
+        validate_historical_routine_transaction(
+            plan,
+            fields,
+            &restarted,
+            &restarted.app.vaults[0],
+        )
+        .is_ok()
+    );
 }
 
 #[test]

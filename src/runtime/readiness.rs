@@ -24,6 +24,8 @@ pub enum ReadinessReason {
     ExactState,
     /// Signer transport, identity or nonce recovery is not ready.
     Signer,
+    /// At least one configured vault runtime scope is quarantined or not execution-ready.
+    RuntimeState,
     /// One unresolved transaction requires recovery/tracking.
     PendingTransaction,
     /// Operator explicitly paused the vault/process.
@@ -51,6 +53,8 @@ pub struct ReadinessInputs {
     pub exact_state_ready: bool,
     /// Restricted signer identity and lane recovery passed.
     pub signer_ready: bool,
+    /// Every configured vault runtime scope can participate in the execution lifecycle.
+    pub execution_scopes_ready: bool,
     /// There is an unresolved nonce lane.
     pub pending_transaction: bool,
     /// Operator pause is active.
@@ -104,12 +108,16 @@ pub fn evaluate_readiness(input: ReadinessInputs) -> ReadinessReport {
     let execute = shadow
         && input.mode == RuntimeMode::Execute
         && input.signer_ready
+        && input.execution_scopes_ready
         && !input.pending_transaction;
     if input.mode != RuntimeMode::Execute {
         reasons.insert(ReadinessReason::NonExecuteMode);
     } else {
         if !input.signer_ready {
             reasons.insert(ReadinessReason::Signer);
+        }
+        if !input.execution_scopes_ready {
+            reasons.insert(ReadinessReason::RuntimeState);
         }
         if input.pending_transaction {
             reasons.insert(ReadinessReason::PendingTransaction);
@@ -143,6 +151,7 @@ mod tests {
             storage_ready: true,
             exact_state_ready: true,
             signer_ready: true,
+            execution_scopes_ready: true,
             pending_transaction: false,
             operator_paused: false,
         };
@@ -161,5 +170,11 @@ mod tests {
             })
             .ready_for_execute
         );
+        let quarantined = evaluate_readiness(ReadinessInputs {
+            execution_scopes_ready: false,
+            ..ready
+        });
+        assert!(!quarantined.ready_for_execute);
+        assert!(quarantined.reasons.contains(&ReadinessReason::RuntimeState));
     }
 }

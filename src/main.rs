@@ -15,7 +15,7 @@ use std::{
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use clap::Parser;
 use futures::StreamExt;
-use morpho_v2_reallocator::api::{ApiDataStore, ReadOnlyApiState, router};
+use morpho_v2_reallocator::api::{ApiDataStore, ReadOnlyApiBinding, ReadOnlyApiState, router};
 use morpho_v2_reallocator::chain::{
     ChainError,
     heads::{ChainService, ChainServiceConfig},
@@ -52,12 +52,12 @@ use morpho_v2_reallocator::storage::actor::{DEFAULT_STORAGE_CHANNEL_CAPACITY, St
 use morpho_v2_reallocator::telemetry::{
     alerts::{Alert, AlertDispatcher, AlertKind, AlertSeverity, AlertTransport},
     health::HealthState,
-    metrics::OperationalMetrics,
+    metrics::{OperationalGauge, OperationalMetrics},
     pagerduty::PagerDutyTransport,
     telegram::TelegramTransport,
 };
 use morpho_v2_reallocator::transaction::{
-    final_preflight::{ExecutionReservationManager, PreflightError},
+    final_preflight::{ExecutionReservationManager, PreflightError, ReservationError},
     local_signer::LocalDevelopmentRoutineSigner,
     remote_signer::{RemoteRoutineSigner, RemoteSignerPolicy},
     signer::RoutineSigner,
@@ -300,7 +300,7 @@ async fn run_supervised(
         return Err("read provider chain ID differs from configuration".to_owned());
     }
     identities
-        .verify_deployed(read.as_ref())
+        .verify_core_deployed(read.as_ref())
         .await
         .map_err(|error| error.to_string())?;
     let signer = build_execute_signer(&config, &lock)?;
@@ -337,30 +337,28 @@ async fn run_supervised(
             storage_ready: true,
             exact_state_ready: false,
             signer_ready,
+            execution_scopes_ready: false,
             pending_transaction: false,
             operator_paused: false,
         }))
         .await;
     let metrics = Arc::new(OperationalMetrics::new());
-    metrics
-        .set("reallocator_up", 1)
-        .map_err(|error| error.to_string())?;
-    metrics
-        .set("reallocator_json_format_info", 1)
-        .map_err(|error| error.to_string())?;
-    metrics
-        .set("reallocator_providers_ready", 1)
-        .map_err(|error| error.to_string())?;
+    metrics.set(OperationalGauge::Up, 1);
+    metrics.set(OperationalGauge::JsonFormatInfo, 1);
+    metrics.set(OperationalGauge::ProvidersReady, 1);
     let alerts = Arc::new(build_alert_dispatcher(&config)?);
     let data = ApiDataStore::default();
     data.refresh_transactions(&storage_handle, &runtime)
         .await
         .map_err(|error| error.to_string())?;
     let sources = EventSourceRegistry::from_config(&config).map_err(|error| error.to_string())?;
-    let provider_ready = Arc::new(AtomicBool::new(true));
+    // Startup is not execution-ready until the first complete primary/checkpoint comparison,
+    // canonical catch-up, durable persistence, and head publication have all succeeded.
+    let provider_ready = Arc::new(AtomicBool::new(false));
     let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(CHAIN_TO_STATE_CAPACITY);
     let (head_hints_tx, head_hints_rx) = tokio::sync::watch::channel(None);
     let (planning_tx, planning_rx) = tokio::sync::watch::channel(PlanningWorkSet::default());
+    let chain_progress_health = health.clone();
     let chain = Arc::new(
         ChainService::new(
             Arc::clone(&primary),
@@ -380,16 +378,16 @@ async fn run_supervised(
         .with_log_filter(Arc::new(sources.clone()))
         .with_indexed_token_accounts(sources.indexed_token_accounts())
         .with_head_hints(head_hints_tx)
-        .with_provider_readiness(Arc::clone(&provider_ready)),
+        .with_provider_readiness(Arc::clone(&provider_ready))
+        .with_progress_callback(move || chain_progress_health.record_chain_heartbeat()),
     );
     chain
         .verify_provider_identity()
         .await
         .map_err(|error| error.to_string())?;
-    let listener_probe = tokio::net::TcpListener::bind(bind)
+    let api_binding = ReadOnlyApiBinding::bind(bind)
         .await
         .map_err(|error| error.to_string())?;
-    drop(listener_probe);
     let api_state = ReadOnlyApiState {
         health: health.clone(),
         runtime: runtime.clone(),
@@ -400,6 +398,14 @@ async fn run_supervised(
     let shutdown = ShutdownSignal::default();
     let mut supervisor =
         Supervisor::new(shutdown.clone(), health.clone(), DEFAULT_SHUTDOWN_TIMEOUT);
+    let storage_monitor = storage_handle.clone();
+    let storage_monitor_shutdown = shutdown.clone();
+    supervisor
+        .spawn(
+            "storage-owner",
+            run_storage_owner_monitor(storage_monitor, storage_monitor_shutdown),
+        )
+        .map_err(|error| error.to_string())?;
     let chain_for_worker = Arc::clone(&chain);
     let chain_websocket = websocket_url_env.clone();
     let chain_shutdown = shutdown.clone();
@@ -503,11 +509,10 @@ async fn run_supervised(
             }
         })
         .map_err(|error| error.to_string())?;
-    let api_bind = bind;
     let api_shutdown = shutdown.clone();
     supervisor
         .spawn_restartable("api", move || {
-            run_api_service(api_bind, api_state.clone(), api_shutdown.clone())
+            run_api_service(api_binding.clone(), api_state.clone(), api_shutdown.clone())
         })
         .map_err(|error| error.to_string())?;
     let watchdog_health = health.clone();
@@ -688,7 +693,7 @@ async fn run_polling_chain_service(
 async fn poll_canonical_chain(
     chain: &Arc<ChainService<HttpProvider>>,
     shutdown: &ShutdownSignal,
-    alerts: &AlertDispatcher,
+    alerts: &Arc<AlertDispatcher>,
     consecutive_failures: &AtomicU32,
     health: &HealthState,
 ) -> Result<(), ServiceFailure> {
@@ -714,6 +719,23 @@ async fn poll_canonical_chain(
         }
         Err(error) => {
             tracing::error!(service = "chain", %error, "canonical chain service failed");
+            let alert = Alert::new(
+                AlertSeverity::P1,
+                AlertKind::CanonicalChainStopped,
+                None,
+                "Canonical chain evidence was rejected".to_owned(),
+                "a non-retryable log, receipt, reorg, storage, or publication invariant failed; Execute is gated and the chain worker is restarting from the durable cursor".to_owned(),
+                None,
+                unix_timestamp().unwrap_or_default(),
+            );
+            match alert {
+                Ok(alert) => {
+                    if alerts.dispatch(alert).is_err() {
+                        tracing::error!("canonical chain invariant alert delivery failed");
+                    }
+                }
+                Err(_) => tracing::error!("canonical chain invariant alert construction failed"),
+            }
             eprintln!("chain service failed: {error}");
             Err(ServiceFailure::restart("canonical chain service failed"))
         }
@@ -722,7 +744,7 @@ async fn poll_canonical_chain(
     result
 }
 
-async fn emit_persistent_chain_alert(alerts: &AlertDispatcher) {
+async fn emit_persistent_chain_alert(alerts: &Arc<AlertDispatcher>) {
     let Ok(alert) = Alert::new(
         AlertSeverity::P1,
         AlertKind::CanonicalChainStopped,
@@ -735,7 +757,7 @@ async fn emit_persistent_chain_alert(alerts: &AlertDispatcher) {
         tracing::error!("persistent canonical RPC alert construction failed");
         return;
     };
-    if alerts.emit(alert).await.is_err() {
+    if alerts.dispatch(alert).is_err() {
         tracing::error!("persistent canonical RPC alert delivery failed");
     }
 }
@@ -829,15 +851,8 @@ fn build_execute_signer(
         SigningConfig::LocalDevelopment {
             private_key_env, ..
         } => {
-            let vault = config
-                .app
-                .vaults
-                .first()
-                .filter(|_| config.app.vaults.len() == 1)
-                .ok_or_else(|| {
-                    "local-development Execute requires exactly one configured vault".to_owned()
-                })?;
-            LocalDevelopmentRoutineSigner::from_env(private_key_env, vault.signer_address)
+            let signer_address = shared_signer_address(config)?;
+            LocalDevelopmentRoutineSigner::from_env(private_key_env, signer_address)
                 .map(|signer| Some(Arc::new(signer) as Arc<dyn RoutineSigner>))
                 .map_err(|error| error.to_string())
         }
@@ -899,6 +914,24 @@ fn build_execute_signer(
     }
 }
 
+fn shared_signer_address(config: &ValidatedConfig) -> Result<alloy::primitives::Address, String> {
+    let signer_address = config
+        .app
+        .vaults
+        .first()
+        .map(|vault| vault.signer_address)
+        .ok_or_else(|| "Execute requires at least one configured vault".to_owned())?;
+    if config
+        .app
+        .vaults
+        .iter()
+        .any(|vault| vault.signer_address != signer_address)
+    {
+        return Err("all managed vaults must share one allocator signer".to_owned());
+    }
+    Ok(signer_address)
+}
+
 async fn run_execution_service(
     execution: Arc<LiveExecutionService<HttpProvider>>,
     shutdown: ShutdownSignal,
@@ -917,7 +950,7 @@ async fn run_execution_service(
                     Err(error @ ExecutionServiceError::Preflight(
                         PreflightError::RefreshAndReplan
                         | PreflightError::NonceBusy
-                        | PreflightError::Reservation(_)
+                        | PreflightError::Reservation(ReservationError::Busy)
                     )) => {
                         tracing::debug!(service = "execution", %error, "bounded execution attempt deferred");
                     }
@@ -952,11 +985,12 @@ async fn run_execution_service(
 }
 
 async fn run_api_service(
-    bind: std::net::SocketAddr,
+    binding: ReadOnlyApiBinding,
     state: ReadOnlyApiState,
     shutdown: ShutdownSignal,
 ) -> Result<(), ServiceFailure> {
-    let listener = tokio::net::TcpListener::bind(bind)
+    let listener = binding
+        .listener()
         .await
         .map_err(|_| ServiceFailure::restart("read-only API bind failed"))?;
     axum::serve(listener, router(state))
@@ -999,14 +1033,13 @@ async fn run_systemd_watchdog(
             }
             _ = interval.tick() => {
                 let queue = storage.queue_stats();
-                for (name, value) in [
-                    ("reallocator_storage_queue_depth", queue.depth),
-                    ("reallocator_storage_queue_high_water", queue.high_water),
-                    ("reallocator_storage_oldest_command_age_milliseconds", usize::try_from(queue.oldest_age_millis).unwrap_or(usize::MAX)),
+                for (metric, value) in [
+                    (OperationalGauge::StorageQueueDepth, queue.depth),
+                    (OperationalGauge::StorageQueueHighWater, queue.high_water),
+                    (OperationalGauge::StorageOldestCommandAgeMilliseconds, usize::try_from(queue.oldest_age_millis).unwrap_or(usize::MAX)),
+                    (OperationalGauge::StorageActiveCommandAgeMilliseconds, usize::try_from(queue.active_command_age_millis).unwrap_or(usize::MAX)),
                 ] {
-                    metrics
-                        .set(name, i64::try_from(value).unwrap_or(i64::MAX))
-                        .map_err(|_| ServiceFailure::restart("storage mailbox metric registration failed"))?;
+                    metrics.set(metric, i64::try_from(value).unwrap_or(i64::MAX));
                 }
                 if queue.depth >= DEFAULT_STORAGE_CHANNEL_CAPACITY.saturating_mul(3).saturating_div(4)
                     && !storage_high_water_alerted
@@ -1020,7 +1053,7 @@ async fn run_systemd_watchdog(
                         format!("depth={} high_water={} oldest_ms={}", queue.depth, queue.high_water, queue.oldest_age_millis),
                         None,
                         unix_timestamp().unwrap_or_default(),
-                    ) && alerts.emit(alert).await.is_err() {
+                    ) && alerts.dispatch(alert).is_err() {
                         tracing::error!("storage mailbox alert delivery failed");
                     }
                     storage_high_water_alerted = true;
@@ -1048,6 +1081,28 @@ async fn run_systemd_watchdog(
                     previous = current;
                 } else {
                     tracing::error!(storage_responsive, workers_progressed, "watchdog withheld: supervisor, storage, or event loop is not responsive");
+                }
+            }
+        }
+    }
+}
+
+async fn run_storage_owner_monitor(
+    storage: morpho_v2_reallocator::storage::actor::StorageHandle,
+    shutdown: ShutdownSignal,
+) -> Result<(), ServiceFailure> {
+    const MAX_ACTIVE_COMMAND_AGE_MILLIS: u64 = 60_000;
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            _ = interval.tick() => {
+                if !storage.is_actor_alive() {
+                    return Err(ServiceFailure::fatal("storage owner stopped unexpectedly"));
+                }
+                if storage.queue_stats().active_command_age_millis > MAX_ACTIVE_COMMAND_AGE_MILLIS {
+                    return Err(ServiceFailure::fatal("storage owner stopped making progress"));
                 }
             }
         }
@@ -1330,8 +1385,12 @@ fn enforce_non_writable_by_group_or_world(_path: &Path, _label: &str) -> Result<
 
 #[cfg(test)]
 mod chain_retry_tests {
-    use super::retryable_chain_error;
+    use super::{retryable_chain_error, run_storage_owner_monitor, shared_signer_address};
     use morpho_v2_reallocator::chain::ChainError;
+    use morpho_v2_reallocator::config::AppConfig;
+    use morpho_v2_reallocator::runtime::{failure::FailureDisposition, shutdown::ShutdownSignal};
+    use morpho_v2_reallocator::storage::actor::StorageService;
+    use tempfile::TempDir;
 
     #[test]
     fn only_temporary_provider_view_mismatch_is_retryable() {
@@ -1344,5 +1403,53 @@ mod chain_retry_tests {
         assert!(!retryable_chain_error(&ChainError::InvalidBundle(
             "receipt block identity mismatch"
         )));
+    }
+
+    #[tokio::test]
+    async fn stopped_storage_owner_is_a_process_integrity_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TempDir::new()?;
+        let service = StorageService::start(&directory.path().join("state.json"), 8, 1)?;
+        let handle = service.handle();
+        assert!(handle.is_actor_alive());
+        service.shutdown().await?;
+        assert!(!handle.is_actor_alive());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_storage_owner_monitor(handle, ShutdownSignal::default()),
+        )
+        .await?;
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(()) => return Err("stopped storage owner did not terminate the monitor".into()),
+        };
+        assert_eq!(
+            failure.disposition,
+            FailureDisposition::FatalProcessIntegrity
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn one_local_restricted_signer_can_own_multiple_configured_vaults()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
+        let mut raw = AppConfig::load(&path)?;
+        let mut second = raw
+            .vault
+            .first()
+            .cloned()
+            .ok_or("example vault is missing")?;
+        second.address = "0x0000000000000000000000000000000000000200".to_owned();
+        raw.vault.push(second);
+        let config = raw.validate()?;
+        let configured = config
+            .app
+            .vaults
+            .first()
+            .map(|vault| vault.signer_address)
+            .ok_or("validated vault is missing")?;
+        assert_eq!(shared_signer_address(&config)?, configured);
+        Ok(())
     }
 }

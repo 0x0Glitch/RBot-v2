@@ -1,6 +1,6 @@
 //! Deterministic selectable rate/utilization spread-rebalance candidate search.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use alloy::primitives::{B256, I256, U256, keccak256};
 
@@ -12,7 +12,8 @@ use crate::{
     morpho::blue_math::mul_div_down,
     planner::{
         CandidatePlanSet, PlanBuilder, PlanningError, PlanningInput,
-        candidates::build_candidate_lattice,
+        candidates::{bounded_distributions, build_candidate_lattice},
+        capital::{allocation_cap_boundaries, reallocation_cap_limited_allocation},
         certificate::{RejectionReason, SearchCertificate},
         episodes::RateSignalEpisode,
         objective::{ObjectiveMetrics, complete_strategy_spread, ranks_before},
@@ -119,63 +120,6 @@ fn metrics(
         movement_assets: movement,
         action_count: state.actions.len(),
     })
-}
-
-fn bounded_distributions(
-    maximums: &[U256],
-    lattices: &[Vec<U256>],
-    total: U256,
-    minimum_action: U256,
-    limit: u64,
-) -> Option<Vec<Vec<U256>>> {
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let mut unique = BTreeSet::new();
-    for sink in 0..maximums.len() {
-        let mut partials = vec![(vec![U256::ZERO; maximums.len()], U256::ZERO)];
-        for (index, amounts) in lattices.iter().enumerate() {
-            if index == sink {
-                continue;
-            }
-            let mut next = Vec::new();
-            for (selected, subtotal) in partials {
-                for amount in amounts {
-                    let Some(updated) = subtotal.checked_add(*amount) else {
-                        continue;
-                    };
-                    if updated > total {
-                        continue;
-                    }
-                    if next.len() >= limit {
-                        return None;
-                    }
-                    let mut candidate = selected.clone();
-                    let slot = candidate.get_mut(index)?;
-                    *slot = *amount;
-                    next.push((candidate, updated));
-                }
-            }
-            partials = next;
-        }
-        for (mut selected, subtotal) in partials {
-            let residual = total.saturating_sub(subtotal);
-            let sink_maximum = maximums.get(sink)?;
-            if residual > *sink_maximum
-                || (!residual.is_zero() && residual < minimum_action)
-                || selected
-                    .iter()
-                    .any(|amount| !amount.is_zero() && *amount < minimum_action)
-            {
-                continue;
-            }
-            let slot = selected.get_mut(sink)?;
-            *slot = residual;
-            unique.insert(selected);
-            if unique.len() > limit {
-                return None;
-            }
-        }
-    }
-    Some(unique.into_iter().collect())
 }
 
 fn episode_rejection(solver: &SolverConfigCanonical) -> RateSolveResult {
@@ -436,7 +380,9 @@ fn search_rate_rebalance(
                 .maximum_position_assets
                 .saturating_sub(*current)
                 .min(position.maximum_action_assets);
-            Some((position, maximum))
+            let boundaries =
+                allocation_cap_boundaries(snapshot, projection, position.position_key)?;
+            Some((position, maximum, boundaries))
         })
         .collect::<Option<Vec<_>>>()
     else {
@@ -449,7 +395,7 @@ fn search_rate_rebalance(
     };
     let destinations = destinations
         .into_iter()
-        .filter(|(_, maximum)| !maximum.is_zero())
+        .filter(|(_, maximum, _)| !maximum.is_zero())
         .collect::<Vec<_>>();
     let Some(source_total) = sources.iter().try_fold(U256::ZERO, |total, (_, maximum)| {
         total.checked_add(*maximum)
@@ -463,7 +409,7 @@ fn search_rate_rebalance(
     };
     let Some(destination_total) = destinations
         .iter()
-        .try_fold(U256::ZERO, |total, (_, maximum)| {
+        .try_fold(U256::ZERO, |total, (_, maximum, _)| {
             total.checked_add(*maximum)
         })
     else {
@@ -475,10 +421,26 @@ fn search_rate_rebalance(
         };
     };
     let maximum = source_total.min(destination_total).min(budget);
+    let mut movement_boundaries = vec![budget, source_total, destination_total];
+    for (position, maximum, boundaries) in &destinations {
+        movement_boundaries.push(*maximum);
+        movement_boundaries.extend(boundaries.iter().copied());
+        let Some(reallocation_capacity) =
+            reallocation_cap_limited_allocation(snapshot, projection, vault, position.position_key)
+        else {
+            certificate.search_complete = false;
+            return RateSolveResult {
+                best: None,
+                certificate,
+                target_reachable: false,
+            };
+        };
+        movement_boundaries.push((*maximum).min(reallocation_capacity));
+    }
     let movement_lattice = build_candidate_lattice(
         vault.minimum_action_assets,
         maximum,
-        &[budget, source_total, destination_total],
+        &movement_boundaries,
         solver.maximum_amount_candidates_per_position,
     );
     let mut hashes = movement_lattice.hash.as_slice().to_vec();
@@ -497,11 +459,13 @@ fn search_rate_rebalance(
         .collect::<Vec<_>>();
     let destination_lattices = destinations
         .iter()
-        .map(|(_, maximum)| {
+        .map(|(_, maximum, boundaries)| {
+            let mut prioritized = vec![budget, destination_total, *maximum];
+            prioritized.extend(boundaries.iter().copied());
             let lattice = build_candidate_lattice(
                 vault.minimum_action_assets,
                 *maximum,
-                &[budget, destination_total],
+                &prioritized,
                 solver.maximum_amount_candidates_per_position,
             );
             hashes.extend_from_slice(lattice.hash.as_slice());
@@ -514,7 +478,7 @@ fn search_rate_rebalance(
         .collect::<Vec<_>>();
     let destination_maximums = destinations
         .iter()
-        .map(|(_, maximum)| *maximum)
+        .map(|(_, maximum, _)| *maximum)
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     'search: for amount in movement_lattice
@@ -525,8 +489,9 @@ fn search_rate_rebalance(
         let remaining_nodes = certificate
             .node_limit
             .saturating_sub(certificate.nodes_evaluated);
-        let source_limit = remaining_nodes
-            .min(u64::try_from(solver.maximum_source_sets).map_or(u64::MAX, |limit| limit));
+        let source_limit = usize::try_from(remaining_nodes)
+            .unwrap_or(usize::MAX)
+            .min(solver.maximum_source_sets);
         let Some(source_distributions) = bounded_distributions(
             &source_maximums,
             &source_lattices,
@@ -537,8 +502,9 @@ fn search_rate_rebalance(
             certificate.search_complete = false;
             break;
         };
-        let destination_limit = remaining_nodes
-            .min(u64::try_from(solver.maximum_destination_sets).map_or(u64::MAX, |limit| limit));
+        let destination_limit = usize::try_from(remaining_nodes)
+            .unwrap_or(usize::MAX)
+            .min(solver.maximum_destination_sets);
         let Some(destination_distributions) = bounded_distributions(
             &destination_maximums,
             &destination_lattices,
@@ -571,7 +537,7 @@ fn search_rate_rebalance(
                             .iter()
                             .zip(destination_amounts)
                             .filter(|(_, amount)| !amount.is_zero())
-                            .map(|((destination, _), amount)| V2Action::Allocate {
+                            .map(|((destination, _, _), amount)| V2Action::Allocate {
                                 position: destination.position_key,
                                 adapter: destination.adapter,
                                 data: crate::domain::encode_adapter_data(
@@ -703,7 +669,8 @@ fn search_rate_rebalance(
 mod tests {
     use alloy::primitives::U256;
 
-    use super::{bounded_distributions, constrained_movement_limit};
+    use super::constrained_movement_limit;
+    use crate::planner::candidates::bounded_distributions;
 
     #[test]
     fn tranche_is_taken_from_optimal_movement_not_raw_capacity() {

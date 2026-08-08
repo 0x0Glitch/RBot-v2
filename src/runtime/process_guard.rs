@@ -28,6 +28,7 @@ pub enum ProcessGuardError {
 }
 
 /// RAII owner for one chain lane and every configured signer lane.
+#[must_use = "dropping process guards releases exclusive chain and signer ownership"]
 pub struct ProcessGuards {
     _files: Vec<File>,
 }

@@ -58,7 +58,7 @@ use crate::{
     telemetry::{
         alerts::{Alert, AlertDispatcher, AlertKind, AlertSeverity},
         health::HealthState,
-        metrics::OperationalMetrics,
+        metrics::{OperationalCounter, OperationalGauge, OperationalMetrics},
     },
 };
 
@@ -98,9 +98,6 @@ pub enum StateServiceError {
     /// A latest-state snapshot was captured ahead of canonical event replay.
     #[error("latest snapshot is waiting for canonical event replay")]
     SnapshotAwaitingCanonicalReplay,
-    /// A registered operational metric could not be updated.
-    #[error("operational metric registry is incomplete")]
-    Metric,
     /// Durable live Shadow planning failed.
     #[error(transparent)]
     Planning(#[from] PlanningServiceError),
@@ -265,6 +262,7 @@ pub struct CanonicalStateService<P> {
     last_exact_head: Option<BlockRef>,
     last_strategy_tick_timestamp: Option<u64>,
     pending_latest_snapshots: BTreeMap<VaultAddress, ExactVaultSnapshot>,
+    consecutive_snapshot_provider_failures: u32,
     dirty: DirtyAccumulator,
     planning_work: PlanningWorkSet,
     planning_triggers: Option<watch::Sender<PlanningWorkSet>>,
@@ -303,6 +301,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             last_exact_head: None,
             last_strategy_tick_timestamp: None,
             pending_latest_snapshots: BTreeMap::new(),
+            consecutive_snapshot_provider_failures: 0,
             dirty,
             planning_work: PlanningWorkSet::default(),
             planning_triggers: None,
@@ -350,8 +349,12 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
     pub async fn apply_update(&mut self, update: ChainUpdate) -> Result<(), StateServiceError> {
         self.health.record_state_heartbeat();
         match update {
-            ChainUpdate::CanonicalBlock { block, logs, .. } => {
-                self.apply_block(block, &logs).await?;
+            ChainUpdate::CanonicalBlock {
+                block,
+                receipts,
+                logs,
+            } => {
+                self.apply_block(block, &receipts, &logs).await?;
                 // Preserve the last independently validated Shadow signal only as
                 // an Execute trigger. Global readiness is false until this head's
                 // exact refresh completes, and final preflight rebuilds topology,
@@ -364,6 +367,28 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 // leaves every vault in CatchingUp and cannot be bypassed by the executor.
                 self.providers_ready = true;
                 self.ensure_replayed_through(head).await?;
+                // Sparse latest-only catch-up deliberately publishes only its final head. A known
+                // reverted/cancelled allocator attempt may emit no watched log, so receipt-driven
+                // dirtying alone is insufficient. Durable nonce ownership is authoritative: keep
+                // its vault dirty at every canonical head until receipt conformance and exact
+                // current-state reconciliation release the lane.
+                let unresolved = self.storage.load_all_unresolved().await?;
+                for pending in unresolved {
+                    if self
+                        .config
+                        .app
+                        .vaults
+                        .iter()
+                        .any(|vault| vault.address == pending.vault)
+                    {
+                        retain_unresolved_exact_refresh(
+                            &mut self.dirty,
+                            &mut self.planning_work,
+                            pending.vault,
+                            head.number,
+                        );
+                    }
+                }
                 if strategy_tick_due(
                     self.last_strategy_tick_timestamp,
                     head.timestamp,
@@ -377,9 +402,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                         sender.send_replace(self.planning_work.clone());
                     }
                     self.last_strategy_tick_timestamp = Some(head.timestamp);
-                    self.metrics
-                        .increment("reallocator_strategy_ticks")
-                        .map_err(|_| StateServiceError::Metric)?;
+                    self.metrics.increment(OperationalCounter::StrategyTicks);
                     tracing::info!(
                         block = head.number,
                         canonical_timestamp = head.timestamp,
@@ -390,14 +413,32 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 if self.last_exact_head != Some(head) {
                     match self.refresh_exact_at_head(head).await {
                         Ok(()) => {
+                            self.consecutive_snapshot_provider_failures = 0;
                             self.last_exact_head = Some(head);
                             tracing::debug!(block = head.number, "block processed");
                         }
                         Err(error) if transient_snapshot_context(&error) => {
+                            if snapshot_provider_outage(&error) {
+                                self.consecutive_snapshot_provider_failures = self
+                                    .consecutive_snapshot_provider_failures
+                                    .saturating_add(1);
+                                if self.consecutive_snapshot_provider_failures == 3 {
+                                    self.emit_runtime_alert(
+                                        AlertSeverity::P1,
+                                        AlertKind::CanonicalChainStopped,
+                                        None,
+                                        "Exact state RPC remained unavailable",
+                                        "three consecutive atomic snapshot attempts failed because the RPC state view was unavailable; Execute remains disabled until exact reads recover".to_owned(),
+                                        None,
+                                        head.timestamp,
+                                    )
+                                    .await;
+                                }
+                            } else {
+                                self.consecutive_snapshot_provider_failures = 0;
+                            }
                             self.mark_catching_up().await?;
-                            self.metrics
-                                .increment("reallocator_snapshot_retries")
-                                .map_err(|_| StateServiceError::Metric)?;
+                            self.metrics.increment(OperationalCounter::SnapshotRetries);
                             self.publish_readiness(false, false).await?;
                         }
                         Err(error) => return Err(error),
@@ -433,6 +474,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
     async fn apply_block(
         &mut self,
         block: BlockRef,
+        receipts: &[crate::runtime::messages::ReceiptRecord],
         logs: &[CanonicalLogRecord],
     ) -> Result<(), StateServiceError> {
         let deployed_vaults = self
@@ -443,7 +485,27 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             .filter(|vault| vault.deployment_block <= block.number)
             .count();
         if self.vaults.len() != deployed_vaults {
-            return self.rebuild_through(block).await;
+            self.rebuild_through(block).await?;
+            merge_canonical_invalidations(&self.config, &self.sources, &mut self.dirty, logs)?;
+            let known_transaction_vaults = self
+                .storage
+                .known_transaction_vaults(
+                    receipts
+                        .iter()
+                        .map(|receipt| receipt.transaction_hash)
+                        .collect(),
+                )
+                .await?;
+            for vault in &known_transaction_vaults {
+                self.dirty.mark_post_transaction(*vault, block.number);
+            }
+            if !logs.is_empty() || !known_transaction_vaults.is_empty() {
+                self.supersede_dirty_plans(
+                    "a canonical change at a vault deployment boundary requires exact refresh",
+                )
+                .await?;
+            }
+            return Ok(());
         }
         if self.vaults.values().any(|state| {
             block.number != state.through.number.saturating_add(1)
@@ -451,31 +513,27 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         }) {
             return Err(StateServiceError::NonCanonicalUpdate);
         }
+        merge_canonical_invalidations(&self.config, &self.sources, &mut self.dirty, logs)?;
         let sources = &self.sources;
         for log in logs {
-            if let Some(source) = sources.source(log.address) {
-                let raw = RawEventLog {
-                    address: log.address,
-                    topics: log.topics.into_iter().flatten().collect(),
-                    data: log.data.clone(),
-                };
-                if let Some(decoded) = decode_watched_event(source, &raw)? {
-                    self.dirty.merge_invalidations(
-                        &self.config,
-                        block.number,
-                        decoded.invalidations,
-                    );
-                }
-            }
             apply_log_to_vaults(sources, &mut self.vaults, log)?;
         }
-        if !logs.is_empty() {
-            for vault in self.dirty.dirty_vaults() {
-                self.planning_work.vaults.remove(&vault);
-            }
-            if let Some(sender) = &self.planning_triggers {
-                sender.send_replace(self.planning_work.clone());
-            }
+        let known_transaction_vaults = self
+            .storage
+            .known_transaction_vaults(
+                receipts
+                    .iter()
+                    .map(|receipt| receipt.transaction_hash)
+                    .collect(),
+            )
+            .await?;
+        for vault in &known_transaction_vaults {
+            self.dirty.mark_post_transaction(*vault, block.number);
+        }
+        let known_transaction_receipt = !known_transaction_vaults.is_empty();
+        if !logs.is_empty() || known_transaction_receipt {
+            self.supersede_dirty_plans("a relevant canonical change requires exact refresh")
+                .await?;
         }
         for vault in &self.config.app.vaults {
             let ledger = self
@@ -501,8 +559,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 }
             } else {
                 self.metrics
-                    .increment("reallocator_idle_ledger_replay_failure")
-                    .map_err(|_| StateServiceError::Metric)?;
+                    .increment(OperationalCounter::IdleLedgerReplayFailure);
             }
         }
         for state in self.vaults.values_mut() {
@@ -519,19 +576,72 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         if complete {
             Ok(())
         } else {
-            self.rebuild_through(head).await
+            let replay_from = self
+                .vaults
+                .values()
+                .map(|state| state.through.number)
+                .min()
+                .and_then(|number| number.checked_add(1));
+            self.rebuild_through(head).await?;
+            if let Some(replay_from) = replay_from.filter(|from| *from <= head.number) {
+                let logs = self
+                    .storage
+                    .load_canonical_logs(self.config.app.chain.chain_id, replay_from, head.number)
+                    .await?;
+                merge_canonical_invalidations(&self.config, &self.sources, &mut self.dirty, &logs)?;
+                if !logs.is_empty() {
+                    self.supersede_dirty_plans(
+                        "coalesced canonical events require one exact refresh",
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
         }
     }
 
     async fn rebuild_through(&mut self, head: BlockRef) -> Result<(), StateServiceError> {
         let mut rebuilt = BTreeMap::new();
-        for vault in &self.config.app.vaults {
+        let vaults = self.config.app.vaults.clone();
+        for vault in &vaults {
             if vault.deployment_block > head.number {
                 continue;
             }
-            let topology =
-                replay_topology_through(&self.config, &self.sources, &self.storage, vault, head)
+            let topology = match replay_topology_through(
+                &self.config,
+                &self.sources,
+                &self.storage,
+                vault,
+                head,
+            )
+            .await
+            {
+                Ok(topology) => topology,
+                Err(error) if topology_replay_failure_is_vault_scoped(&error) => {
+                    let fallback = self
+                        .vaults
+                        .get(&vault.address)
+                        .map(|state| state.topology.clone())
+                        .map_or_else(|| new_topology(vault), Ok)?;
+                    rebuilt.insert(
+                        vault.address,
+                        VaultReplayState {
+                            topology: fallback,
+                            idle_ledger: None,
+                            through: head,
+                        },
+                    );
+                    self.record_vault_refresh_failure(
+                        vault.address,
+                        head,
+                        RuntimeVaultState::PausedUnsupportedConfiguration,
+                        "one vault canonical topology cannot be reconstructed exactly",
+                    )
                     .await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             self.storage
                 .persist_topology(topology.clone(), head)
                 .await?;
@@ -548,6 +658,37 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         Ok(())
     }
 
+    async fn supersede_dirty_plans(
+        &mut self,
+        reason: &'static str,
+    ) -> Result<(), StateServiceError> {
+        let dirty_vaults = self.dirty.dirty_vaults().collect::<Vec<_>>();
+        for vault in dirty_vaults {
+            self.planning_work.vaults.remove(&vault);
+            self.api.clear_plan(vault).await;
+            self.runtime
+                .update(vault, |status| {
+                    status.record_planning(None, status.episode_id)?;
+                    if status.state.can_start_transaction()
+                        || matches!(
+                            status.state,
+                            RuntimeVaultState::PendingDeployment
+                                | RuntimeVaultState::IdleLocksActive
+                        )
+                    {
+                        status
+                            .transition(RuntimeVaultState::CatchingUp, Some(reason.to_owned()))?;
+                    }
+                    Ok(())
+                })
+                .await?;
+        }
+        if let Some(sender) = &self.planning_triggers {
+            sender.send_replace(self.planning_work.clone());
+        }
+        Ok(())
+    }
+
     async fn reported_candidate_is_current(
         &self,
         candidate: &ExactVaultSnapshot,
@@ -559,8 +700,28 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             return Ok(false);
         }
         let mut exact_topology = topology.clone();
-        reconcile_topology_from_snapshot(&mut exact_topology, candidate)?;
-        let replayed_revision = exact_topology.revision()?;
+        // A reported-latest candidate belongs to exactly one vault. An inconsistent dynamic
+        // topology means that candidate cannot be reused; it does not invalidate the canonical
+        // cursor, storage owner, provider view, or any other vault. Reject it here and let the
+        // ordinary exact-snapshot path classify/quarantine the affected vault if the condition is
+        // persistent. Propagating `TopologyError` would restart the shared state owner and delay
+        // otherwise healthy vaults.
+        if reconcile_topology_from_snapshot(&mut exact_topology, candidate).is_err() {
+            tracing::debug!(
+                snapshot_block = snapshot_block.number,
+                replay_head = replay_head.number,
+                "reported latest candidate rejected because its topology is inconsistent"
+            );
+            return Ok(false);
+        }
+        let Ok(replayed_revision) = exact_topology.revision() else {
+            tracing::debug!(
+                snapshot_block = snapshot_block.number,
+                replay_head = replay_head.number,
+                "reported latest candidate rejected because its topology revision is invalid"
+            );
+            return Ok(false);
+        };
         if replayed_revision != candidate.context.dynamic_topology_revision {
             tracing::debug!(
                 snapshot_block = snapshot_block.number,
@@ -609,7 +770,11 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
     async fn refresh_exact_at_head(&mut self, head: BlockRef) -> Result<(), StateServiceError> {
         let mut all_exact_ready = true;
         let mut captured_snapshot = false;
-        for vault in &self.config.app.vaults {
+        // Clone the validated vault descriptors so a vault-scoped refresh failure can be recorded
+        // through `&mut self` without retaining a borrow of the process-wide configuration. One
+        // unavailable adapter must not prevent exact refresh and execution for every later vault.
+        let vaults = self.config.app.vaults.clone();
+        for vault in &vaults {
             if vault.deployment_block > head.number {
                 all_exact_ready = false;
                 continue;
@@ -693,6 +858,34 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                             Err(SnapshotError::IdentityMismatch) => {
                                 return Err(StateServiceError::SnapshotAwaitingCanonicalReplay);
                             }
+                            Err(error)
+                                if snapshot_failure_scope(&error)
+                                    == SnapshotFailureScope::VaultRetry =>
+                            {
+                                all_exact_ready = false;
+                                self.record_vault_refresh_failure(
+                                    vault.address,
+                                    head,
+                                    RuntimeVaultState::CatchingUp,
+                                    "one authoritative vault or adapter read temporarily reverted",
+                                )
+                                .await?;
+                                continue;
+                            }
+                            Err(error)
+                                if snapshot_failure_scope(&error)
+                                    == SnapshotFailureScope::VaultQuarantine =>
+                            {
+                                all_exact_ready = false;
+                                self.record_vault_refresh_failure(
+                                    vault.address,
+                                    head,
+                                    RuntimeVaultState::PausedUnsupportedConfiguration,
+                                    "one vault runtime, ABI, topology, or numeric identity is outside the reviewed profile",
+                                )
+                                .await?;
+                                continue;
+                            }
                             Err(error) => return Err(error.into()),
                         };
                     if candidate.context.block.number > head.number {
@@ -744,14 +937,33 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 },
                 Err(_) => {
                     self.metrics
-                        .increment("reallocator_idle_ledger_replay_failure")
-                        .map_err(|_| StateServiceError::Metric)?;
+                        .increment(OperationalCounter::IdleLedgerReplayFailure);
                     (None, unverified_idle_ledger_snapshot(exact_idle_assets))
                 }
             };
-            bind_idle_lock_ledger(&mut snapshot, &blueprint, idle_locks)?;
+            if bind_idle_lock_ledger(&mut snapshot, &blueprint, idle_locks).is_err() {
+                all_exact_ready = false;
+                self.record_vault_refresh_failure(
+                    vault.address,
+                    head,
+                    RuntimeVaultState::PausedUnsupportedConfiguration,
+                    "one vault exact idle-accounting result is internally inconsistent",
+                )
+                .await?;
+                continue;
+            }
             let mut exact_topology = topology;
-            reconcile_topology_from_snapshot(&mut exact_topology, &snapshot)?;
+            if reconcile_topology_from_snapshot(&mut exact_topology, &snapshot).is_err() {
+                all_exact_ready = false;
+                self.record_vault_refresh_failure(
+                    vault.address,
+                    head,
+                    RuntimeVaultState::PausedUnsupportedConfiguration,
+                    "one vault exact topology is outside the configured all-ever read set",
+                )
+                .await?;
+                continue;
+            }
             self.storage
                 .persist_topology(exact_topology.clone(), head)
                 .await?;
@@ -759,19 +971,86 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 state.idle_ledger = retained_ledger;
                 state.topology = exact_topology;
             }
-            self.identities.validate_snapshot(&snapshot)?;
+            let vault_identity = self
+                .identities
+                .verify_vault_deployed(self.provider.as_ref(), vault, Some(&snapshot))
+                .await;
+            if let Err(error) = vault_identity {
+                if matches!(error, RuntimeIdentityError::Provider(_)) {
+                    return Err(error.into());
+                }
+                all_exact_ready = false;
+                self.record_vault_refresh_failure(
+                    vault.address,
+                    head,
+                    RuntimeVaultState::PausedUnsupportedConfiguration,
+                    "a vault-specific runtime or proxy implementation differs from the pinned identity",
+                )
+                .await?;
+                continue;
+            }
+            if self.identities.validate_snapshot(&snapshot).is_err() {
+                all_exact_ready = false;
+                self.record_vault_refresh_failure(
+                    vault.address,
+                    head,
+                    RuntimeVaultState::PausedUnsupportedConfiguration,
+                    "a vault-discovered dependency is outside the pinned protocol identity",
+                )
+                .await?;
+                continue;
+            }
             self.storage
                 .persist_snapshot(snapshot.clone(), snapshot_block.timestamp)
                 .await?;
             captured_snapshot = true;
-            let projection = project_snapshot_to_head(&snapshot, head, vault)?;
-            self.record_independent_rate_event(
-                vault,
-                previous_snapshot.as_ref(),
-                &snapshot,
-                &projection,
-            )
-            .await?;
+            let projection = match project_snapshot_to_head(&snapshot, head, vault) {
+                Ok(projection) => projection,
+                Err(_) => {
+                    all_exact_ready = false;
+                    self.record_vault_refresh_failure(
+                        vault.address,
+                        head,
+                        RuntimeVaultState::PausedUnsupportedConfiguration,
+                        "one vault exact state cannot be projected with checked protocol arithmetic",
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            let active_rate_episode = match self
+                .record_independent_rate_event(
+                    vault,
+                    previous_snapshot.as_ref(),
+                    &snapshot,
+                    &projection,
+                )
+                .await
+            {
+                Ok(active) => active,
+                Err(error) if independent_event_failure_is_vault_scoped(&error) => {
+                    all_exact_ready = false;
+                    self.record_vault_refresh_failure(
+                        vault.address,
+                        head,
+                        RuntimeVaultState::PausedUnsupportedConfiguration,
+                        "one vault rate-episode state is inconsistent with its exact canonical state",
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if active_rate_episode
+                && vault.strategy == crate::config::VaultStrategy::SpreadEqualization
+            {
+                // The episode was created by a real event/tick, but short confirmation and
+                // successive 90% tranches must not wait for an unrelated event or the five-minute
+                // top-K evaluation. Publish one current canonical continuation generation.
+                self.dirty
+                    .mark_strategy_continuation(vault.address, head.number);
+                self.planning_work.vaults.remove(&vault.address);
+            }
             let strategy_markets = strategy_market_ids(vault);
             let policy_states = strategy_markets
                 .iter()
@@ -811,18 +1090,33 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             self.api.record_rates(rate_snapshot.clone()).await;
             self.metrics.record_rate_snapshot(&rate_snapshot);
             let pending_transaction = self.storage.load_unresolved(vault.signer_address).await?;
-            let desired = desired_runtime_state(
+            let calculated_state = desired_runtime_state(
                 self.config.app.node.mode,
                 &snapshot,
                 self.signer_ready,
                 pending_transaction.as_ref(),
             );
-            let reason = runtime_reason(
+            let calculated_reason = runtime_reason(
                 self.config.app.node.mode,
                 &snapshot,
                 self.signer_ready,
                 pending_transaction.as_ref(),
             );
+            let current_status = self
+                .runtime
+                .get(vault.address)
+                .await
+                .ok_or(StateServiceError::NonCanonicalUpdate)?;
+            let desired = preserve_incident_quarantine(
+                current_status.state,
+                calculated_state,
+                pending_transaction.is_some(),
+            );
+            let reason = if desired == current_status.state && desired != calculated_state {
+                current_status.reason
+            } else {
+                calculated_reason
+            };
             self.runtime
                 .update(vault.address, |status| {
                     status.canonical_head = Some(head);
@@ -863,24 +1157,88 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             all_exact_ready &= exact_ready_for_mode(self.config.app.node.mode, &snapshot);
         }
         self.health.record_processed_block(head.number);
-        self.metrics
-            .set(
-                "reallocator_last_processed_block",
-                i64::try_from(head.number).unwrap_or(i64::MAX),
-            )
-            .map_err(|_| StateServiceError::Metric)?;
-        self.metrics
-            .set(
-                "reallocator_last_processed_timestamp_seconds",
-                i64::try_from(head.timestamp).unwrap_or(i64::MAX),
-            )
-            .map_err(|_| StateServiceError::Metric)?;
+        self.metrics.set(
+            OperationalGauge::LastProcessedBlock,
+            i64::try_from(head.number).unwrap_or(i64::MAX),
+        );
+        self.metrics.set(
+            OperationalGauge::LastProcessedTimestampSeconds,
+            i64::try_from(head.timestamp).unwrap_or(i64::MAX),
+        );
         if captured_snapshot {
-            self.metrics
-                .increment("reallocator_snapshot_success")
-                .map_err(|_| StateServiceError::Metric)?;
+            self.metrics.increment(OperationalCounter::SnapshotSuccess);
         }
         self.publish_readiness(true, all_exact_ready).await
+    }
+
+    async fn record_vault_refresh_failure(
+        &mut self,
+        vault: VaultAddress,
+        head: BlockRef,
+        state: RuntimeVaultState,
+        reason: &'static str,
+    ) -> Result<(), StateServiceError> {
+        let previous = self.runtime.get(vault).await;
+        let newly_degraded = previous.as_ref().is_some_and(|status| {
+            !status.state.is_persistent_quarantine()
+                && !matches!(
+                    status.state,
+                    RuntimeVaultState::PendingTransaction | RuntimeVaultState::Recovery
+                )
+                && (status.state != state || status.reason.as_deref() != Some(reason))
+        });
+        self.pending_latest_snapshots.remove(&vault);
+        self.planning_work.vaults.remove(&vault);
+        self.api.clear_plan(vault).await;
+        self.runtime
+            .update(vault, |status| {
+                status.canonical_head = Some(head);
+                status.record_planning(None, None)?;
+                if status.state.is_persistent_quarantine()
+                    || matches!(
+                        status.state,
+                        RuntimeVaultState::PendingTransaction | RuntimeVaultState::Recovery
+                    )
+                {
+                    Ok(())
+                } else {
+                    status.transition(state, Some(reason.to_owned()))
+                }
+            })
+            .await?;
+        if let Some(sender) = &self.planning_triggers {
+            sender.send_replace(self.planning_work.clone());
+        }
+        self.metrics.increment(OperationalCounter::SnapshotRetries);
+        if newly_degraded {
+            tracing::warn!(vault = %vault.0, block = head.number, reason, "vault exact refresh deferred");
+            if state == RuntimeVaultState::PausedUnsupportedConfiguration {
+                self.emit_runtime_alert(
+                    AlertSeverity::P1,
+                    AlertKind::UnsupportedDependency,
+                    Some(vault),
+                    "One vault exact state is outside the reviewed profile",
+                    reason.to_owned(),
+                    None,
+                    head.timestamp,
+                )
+                .await;
+            } else if state == RuntimeVaultState::CatchingUp {
+                self.emit_runtime_alert(
+                    AlertSeverity::P1,
+                    AlertKind::ServiceFailure,
+                    Some(vault),
+                    "One vault exact state is temporarily unavailable",
+                    reason.to_owned(),
+                    None,
+                    head.timestamp,
+                )
+                .await;
+            }
+        } else {
+            tracing::debug!(vault = %vault.0, block = head.number, reason, "vault exact refresh still deferred");
+        }
+        Ok(())
     }
 
     /// Records only an unambiguous, exact borrower-side causal observation. A missing previous
@@ -892,15 +1250,17 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         previous: Option<&ExactVaultSnapshot>,
         current: &ExactVaultSnapshot,
         current_projection: &crate::state::projection::ProjectedVaultView,
-    ) -> Result<(), StateServiceError> {
+    ) -> Result<bool, StateServiceError> {
         let Some(mut episode) = self
             .storage
             .load_active_rate_episode(vault.address, vault.rate_group.id)
             .await?
-            .filter(|episode| episode.state == RateEpisodeState::Immediate)
         else {
-            return Ok(());
+            return Ok(false);
         };
+        if episode.state != RateEpisodeState::Immediate {
+            return Ok(true);
+        }
         let Some(previous) = previous.filter(|snapshot| {
             snapshot.context.chain_id == current.context.chain_id
                 && snapshot.context.block.number < current.context.block.number
@@ -908,17 +1268,17 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 && snapshot.context.dynamic_topology_revision
                     == current.context.dynamic_topology_revision
         }) else {
-            return Ok(());
+            return Ok(true);
         };
         let Some(canonical_previous) = self
             .storage
             .load_canonical_block(previous.context.chain_id, previous.context.block.number)
             .await?
         else {
-            return Ok(());
+            return Ok(true);
         };
         if canonical_previous != previous.context.block {
-            return Ok(());
+            return Ok(true);
         }
         let interval_blocks = current
             .context
@@ -936,7 +1296,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             .await?
             != interval_blocks
         {
-            return Ok(());
+            return Ok(true);
         }
         let logs = self
             .storage
@@ -953,21 +1313,21 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             vault.minimum_independent_event_assets,
         )?
         else {
-            return Ok(());
+            return Ok(true);
         };
         if self
             .storage
             .is_known_transaction_hash(candidate.transaction_hash)
             .await?
         {
-            return Ok(());
+            return Ok(true);
         }
         let Some(event_block) = self
             .storage
             .load_canonical_block(current.context.chain_id, candidate.block_number)
             .await?
         else {
-            return Ok(());
+            return Ok(true);
         };
         if event_block.hash != candidate.block_hash
             || !episode_partition_preserved(
@@ -976,17 +1336,17 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 self.config.app.strategy.objective,
             )
         {
-            return Ok(());
+            return Ok(true);
         }
         let Ok(counterfactual) = project_snapshot_to_head(previous, current.context.block, vault)
         else {
-            return Ok(());
+            return Ok(true);
         };
         let Some(observed) = current_projection.markets.get(&candidate.market) else {
-            return Ok(());
+            return Ok(true);
         };
         let Some(without_event) = counterfactual.markets.get(&candidate.market) else {
-            return Ok(());
+            return Ok(true);
         };
         let observed_value = strategy_value(observed, self.config.app.strategy.objective);
         let without_event_value = strategy_value(without_event, self.config.app.strategy.objective);
@@ -1001,7 +1361,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         if impact.is_none_or(|impact| {
             impact < self.config.app.strategy.minimum_independent_event_impact()
         }) {
-            return Ok(());
+            return Ok(true);
         }
         if episode.record_independent_event(IndependentRateEvent {
             transaction_hash: candidate.transaction_hash,
@@ -1011,7 +1371,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 .persist_rate_episode(episode.clone(), current.context.block.timestamp)
                 .await?;
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn emit_state_alert(
@@ -1061,7 +1421,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         );
         match alert {
             Ok(alert) => {
-                if dispatcher.emit(alert).await.is_err() {
+                if dispatcher.dispatch(alert).is_err() {
                     tracing::error!("typed runtime alert delivery failed");
                 }
             }
@@ -1073,7 +1433,11 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         for vault in &self.config.app.vaults {
             self.runtime
                 .update(vault.address, |status| {
-                    status.transition(RuntimeVaultState::CatchingUp, None)
+                    if status.state.is_persistent_quarantine() {
+                        Ok(())
+                    } else {
+                        status.transition(RuntimeVaultState::CatchingUp, None)
+                    }
                 })
                 .await?;
         }
@@ -1085,14 +1449,20 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         caught_up: bool,
         exact_state_ready: bool,
     ) -> Result<(), StateServiceError> {
-        let mut pending = false;
-        for vault in &self.config.app.vaults {
-            pending |= self
-                .storage
-                .load_unresolved(vault.signer_address)
-                .await?
-                .is_some();
-        }
+        // Durable nonce ownership is authoritative even when an operator has accidentally
+        // removed its signer or vault from the new process configuration.
+        let pending = !self.storage.load_all_unresolved().await?.is_empty();
+        let runtime_statuses = self.runtime.all().await;
+        let operator_paused = runtime_statuses
+            .iter()
+            .any(|status| status.state == RuntimeVaultState::PausedByOperator);
+        let runtime_signer_ready = self.signer_ready
+            && !runtime_statuses
+                .iter()
+                .any(|status| status.state == RuntimeVaultState::PausedSignerFailure);
+        let execution_scopes_ready = runtime_statuses
+            .iter()
+            .all(|status| status.state.execution_scope_ready());
         let report = evaluate_readiness(ReadinessInputs {
             mode: self.config.app.node.mode,
             configuration_valid: true,
@@ -1101,20 +1471,23 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             chain_caught_up: caught_up,
             storage_ready: true,
             exact_state_ready,
-            signer_ready: self.signer_ready,
+            signer_ready: runtime_signer_ready,
+            execution_scopes_ready,
             pending_transaction: pending,
-            operator_paused: false,
+            operator_paused,
         });
-        for (name, value) in [
-            ("reallocator_ready", report.ready),
-            ("reallocator_ready_for_execute", report.ready_for_execute),
-            ("reallocator_providers_ready", self.providers_ready),
-            ("reallocator_exact_state_ready", exact_state_ready),
-            ("reallocator_pending_transaction", pending),
+        for (metric, value) in [
+            (OperationalGauge::Ready, report.ready),
+            (OperationalGauge::ReadyForExecute, report.ready_for_execute),
+            (OperationalGauge::ProvidersReady, self.providers_ready),
+            (OperationalGauge::ExactStateReady, exact_state_ready),
+            (OperationalGauge::PendingTransaction, pending),
+            (
+                OperationalGauge::ExecutionScopesReady,
+                execution_scopes_ready,
+            ),
         ] {
-            self.metrics
-                .set(name, i64::from(value))
-                .map_err(|_| StateServiceError::Metric)?;
+            self.metrics.set(metric, i64::from(value));
         }
         self.health.set_readiness(report).await;
         Ok(())
@@ -1134,6 +1507,28 @@ struct IndependentEventCandidate {
     block_hash: B256,
     market: MarketId,
     direction: IndependentEventDirection,
+}
+
+fn merge_canonical_invalidations(
+    config: &ValidatedConfig,
+    sources: &EventSourceRegistry,
+    dirty: &mut DirtyAccumulator,
+    logs: &[CanonicalLogRecord],
+) -> Result<(), StateServiceError> {
+    for log in logs {
+        let Some(source) = sources.source(log.address) else {
+            continue;
+        };
+        let raw = RawEventLog {
+            address: log.address,
+            topics: log.topics.into_iter().flatten().collect(),
+            data: log.data.clone(),
+        };
+        if let Some(decoded) = decode_watched_event(source, &raw)? {
+            dirty.merge_invalidations(config, log.block_number, decoded.invalidations);
+        }
+    }
+    Ok(())
 }
 
 /// Finds a sole borrower-side economic event across an exact snapshot interval. Multiple relevant
@@ -1342,6 +1737,19 @@ pub(crate) async fn replay_topology_through(
         }
         _ => (new_topology(vault)?, vault.deployment_block),
     };
+    topology.merge_configured_read_set(
+        vault.deployment_block,
+        vault.adapters.iter().map(|adapter| adapter.address).chain(
+            vault
+                .liquidity_adapter
+                .iter()
+                .map(|adapter| adapter.address),
+        ),
+        vault
+            .positions
+            .iter()
+            .map(|position| (position.adapter, position.market_id, position.position_key)),
+    )?;
     catalog_configured_caps(&mut topology, vault, head.number)?;
     if replay_from <= head.number {
         let logs = storage
@@ -1496,6 +1904,18 @@ pub(crate) fn desired_runtime_state(
     }
 }
 
+fn preserve_incident_quarantine(
+    current: RuntimeVaultState,
+    calculated: RuntimeVaultState,
+    has_unresolved_transaction: bool,
+) -> RuntimeVaultState {
+    if current.is_persistent_quarantine() && !has_unresolved_transaction {
+        current
+    } else {
+        calculated
+    }
+}
+
 pub(crate) fn runtime_reason(
     mode: RuntimeMode,
     snapshot: &crate::domain::ExactVaultSnapshot,
@@ -1562,6 +1982,16 @@ const fn plan_refresh_allowed(
     }
 }
 
+fn retain_unresolved_exact_refresh(
+    dirty: &mut DirtyAccumulator,
+    planning_work: &mut PlanningWorkSet,
+    vault: VaultAddress,
+    block_number: u64,
+) {
+    dirty.mark_post_transaction(vault, block_number);
+    planning_work.vaults.remove(&vault);
+}
+
 fn transient_snapshot_context(error: &StateServiceError) -> bool {
     match error {
         StateServiceError::SnapshotAwaitingCanonicalReplay
@@ -1578,6 +2008,52 @@ fn transient_snapshot_context(error: &StateServiceError) -> bool {
     }
 }
 
+fn snapshot_provider_outage(error: &StateServiceError) -> bool {
+    matches!(
+        error,
+        StateServiceError::Snapshot(SnapshotError::Multicall(MulticallError::Provider(provider)))
+            if provider.is_transient_outage()
+    )
+}
+
+const fn independent_event_failure_is_vault_scoped(error: &StateServiceError) -> bool {
+    // Storage failure and malformed canonical bytes invalidate process-wide evidence. An invalid
+    // rate-episode transition is derived only from one vault's durable strategy state and must not
+    // starve unrelated vaults sharing the state owner.
+    matches!(error, StateServiceError::Episode(_))
+}
+
+const fn topology_replay_failure_is_vault_scoped(error: &StateServiceError) -> bool {
+    matches!(error, StateServiceError::Topology(_))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotFailureScope {
+    VaultRetry,
+    VaultQuarantine,
+    Global,
+}
+
+const fn snapshot_failure_scope(error: &SnapshotError) -> SnapshotFailureScope {
+    match error {
+        // `aggregate3` reports the exact failed subcall. The manifest belongs to one vault, so a
+        // temporarily reverting adapter/market read is vault-scoped. Transport, canonical-context,
+        // or aggregate-integrity failures remain global because the provider view itself is not
+        // trustworthy for any vault.
+        SnapshotError::Multicall(MulticallError::AuthoritativeCallFailed { .. }) => {
+            SnapshotFailureScope::VaultRetry
+        }
+        SnapshotError::Topology(_)
+        | SnapshotError::Capability(_)
+        | SnapshotError::MissingCodeIdentity
+        | SnapshotError::CodeIdentityMismatch
+        | SnapshotError::ReturnSchemaMismatch
+        | SnapshotError::MissingResult { .. }
+        | SnapshotError::NumericRange => SnapshotFailureScope::VaultQuarantine,
+        _ => SnapshotFailureScope::Global,
+    }
+}
+
 fn unverified_idle_ledger_snapshot(exact_idle_assets: U256) -> IdleLockLedgerSnapshot {
     IdleLockLedgerSnapshot {
         locks: Vec::new(),
@@ -1589,10 +2065,15 @@ fn unverified_idle_ledger_snapshot(exact_idle_assets: U256) -> IdleLockLedgerSna
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
+    use std::path::PathBuf;
+
     use alloy::primitives::IntoLogData;
 
     use super::*;
-    use crate::domain::{Assets, RateGroupId};
+    use crate::{
+        config::AppConfig,
+        domain::{Assets, RateGroupId},
+    };
 
     #[test]
     fn strategy_tick_uses_canonical_five_minute_boundaries() {
@@ -1719,6 +2200,75 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_nonce_lane_keeps_its_vault_dirty_and_removes_presign_work() {
+        let vault = VaultAddress(Address::with_last_byte(0x44));
+        let block = BlockRef {
+            number: 25,
+            hash: B256::repeat_byte(25),
+            parent_hash: B256::repeat_byte(24),
+            timestamp: 125,
+            gas_limit: 10_000_000,
+        };
+        let mut dirty = DirtyAccumulator::default();
+        dirty.mark_post_transaction(vault, block.number.saturating_sub(1));
+        let revision = dirty
+            .bind_snapshot(
+                vault,
+                B256::repeat_byte(1),
+                B256::repeat_byte(2),
+                block,
+                B256::repeat_byte(3),
+            )
+            .unwrap_or_else(|| panic!("dirty fixture did not bind"));
+        let mut planning_work = PlanningWorkSet::default();
+        planning_work.vaults.insert(vault, revision);
+
+        retain_unresolved_exact_refresh(&mut dirty, &mut planning_work, vault, block.number);
+
+        assert!(dirty.is_vault_dirty(vault));
+        assert!(!planning_work.vaults.contains_key(&vault));
+    }
+
+    #[test]
+    fn coalesced_sparse_replay_events_still_trigger_exact_vault_refresh() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = AppConfig::load(&root.join("config.example.json"))
+            .and_then(AppConfig::validate)
+            .unwrap_or_else(|error| panic!("configuration fixture rejected: {error}"));
+        let vault = config
+            .app
+            .vaults
+            .first()
+            .unwrap_or_else(|| panic!("configuration fixture has no vault"));
+        let market = vault
+            .positions
+            .first()
+            .map(|position| position.market_id)
+            .unwrap_or_else(|| panic!("configuration fixture has no position"));
+        let sources = EventSourceRegistry::from_config(&config)
+            .unwrap_or_else(|error| panic!("event source fixture rejected: {error}"));
+        let log = event_log(
+            config.app.chain.morpho_blue,
+            IMorpho::Borrow {
+                id: market.0,
+                caller: Address::with_last_byte(5),
+                onBehalf: Address::with_last_byte(6),
+                receiver: Address::with_last_byte(7),
+                assets: U256::from(100_u64),
+                shares: U256::from(100_u64),
+            },
+            B256::repeat_byte(31),
+            0,
+        );
+        let mut dirty = DirtyAccumulator::default();
+
+        merge_canonical_invalidations(&config, &sources, &mut dirty, &[log])
+            .unwrap_or_else(|error| panic!("coalesced invalidation failed: {error}"));
+
+        assert!(dirty.is_vault_dirty(vault.address));
+    }
+
+    #[test]
     fn only_one_directional_borrower_event_is_independently_attributable() {
         let morpho = Address::with_last_byte(9);
         let source = MarketId(B256::repeat_byte(1));
@@ -1814,9 +2364,115 @@ mod tests {
 
     #[test]
     fn authoritative_adapter_read_revert_is_retryable_without_process_failure() {
-        let error = StateServiceError::Snapshot(SnapshotError::Multicall(
-            MulticallError::AuthoritativeCallFailed { index: 3 },
-        ));
+        let snapshot_error =
+            SnapshotError::Multicall(MulticallError::AuthoritativeCallFailed { index: 3 });
+        assert_eq!(
+            snapshot_failure_scope(&snapshot_error),
+            SnapshotFailureScope::VaultRetry
+        );
+        let error = StateServiceError::Snapshot(snapshot_error);
         assert!(transient_snapshot_context(&error));
+    }
+
+    #[test]
+    fn provider_or_canonical_context_failure_remains_global() {
+        for error in [
+            SnapshotError::Multicall(MulticallError::ContextChanged),
+            SnapshotError::Multicall(MulticallError::ContextMismatch),
+            SnapshotError::Multicall(MulticallError::MalformedAggregate),
+        ] {
+            assert_eq!(snapshot_failure_scope(&error), SnapshotFailureScope::Global);
+        }
+        let outage =
+            StateServiceError::Snapshot(SnapshotError::Multicall(MulticallError::Provider(
+                crate::chain::provider::ProviderError::Transport { method: "eth_call" },
+            )));
+        assert!(snapshot_provider_outage(&outage));
+        assert!(!snapshot_provider_outage(&StateServiceError::Snapshot(
+            SnapshotError::Multicall(MulticallError::ContextChanged,)
+        )));
+    }
+
+    #[test]
+    fn one_vaults_runtime_or_abi_mismatch_is_vault_scoped() {
+        for error in [
+            SnapshotError::CodeIdentityMismatch,
+            SnapshotError::ReturnSchemaMismatch,
+            SnapshotError::NumericRange,
+        ] {
+            assert_eq!(
+                snapshot_failure_scope(&error),
+                SnapshotFailureScope::VaultQuarantine
+            );
+        }
+        assert_eq!(
+            snapshot_failure_scope(&SnapshotError::InvalidManifest),
+            SnapshotFailureScope::Global,
+            "a malformed locally constructed manifest remains a process-integrity error"
+        );
+    }
+
+    #[test]
+    fn one_vaults_episode_state_failure_does_not_restart_the_shared_state_owner() {
+        assert!(independent_event_failure_is_vault_scoped(
+            &StateServiceError::Episode(EpisodeError::DirectionChanged)
+        ));
+        assert!(!independent_event_failure_is_vault_scoped(
+            &StateServiceError::Storage(StorageError::ActorStopped)
+        ));
+        assert!(!independent_event_failure_is_vault_scoped(
+            &StateServiceError::Event(EventDecodeError::Malformed(
+                crate::chain::logs::WatchedEventKind::Transfer,
+            ))
+        ));
+    }
+
+    #[test]
+    fn one_vaults_topology_replay_failure_does_not_restart_the_shared_state_owner() {
+        assert!(topology_replay_failure_is_vault_scoped(
+            &StateServiceError::Topology(TopologyError::UncataloguedTopology)
+        ));
+        assert!(!topology_replay_failure_is_vault_scoped(
+            &StateServiceError::Event(EventDecodeError::MissingSignature)
+        ));
+        assert!(!topology_replay_failure_is_vault_scoped(
+            &StateServiceError::Storage(StorageError::ActorStopped)
+        ));
+    }
+
+    #[test]
+    fn ordinary_refresh_preserves_incident_quarantine_but_not_snapshot_derived_pause() {
+        assert_eq!(
+            preserve_incident_quarantine(
+                RuntimeVaultState::PausedSignerFailure,
+                RuntimeVaultState::Automatic,
+                false,
+            ),
+            RuntimeVaultState::PausedSignerFailure
+        );
+        assert_eq!(
+            preserve_incident_quarantine(
+                RuntimeVaultState::PausedReconciliationFailure,
+                RuntimeVaultState::Automatic,
+                false,
+            ),
+            RuntimeVaultState::PausedReconciliationFailure
+        );
+        assert_eq!(
+            preserve_incident_quarantine(
+                RuntimeVaultState::PausedUnsupportedConfiguration,
+                RuntimeVaultState::Automatic,
+                false,
+            ),
+            RuntimeVaultState::Automatic
+        );
+        assert_eq!(
+            preserve_incident_quarantine(
+                RuntimeVaultState::PausedSignerFailure,
+                RuntimeVaultState::PendingTransaction,
+                true,
+            ),
+            RuntimeVaultState::PendingTransaction
+        );
     }
 }

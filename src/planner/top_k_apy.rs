@@ -14,7 +14,11 @@ use crate::{
         market_adapter::allocate,
     },
     planner::{
-        capital::{CapitalSolveResult, PendingDeployment, cap_limited_allocation},
+        candidates::{bounded_distributions, build_candidate_lattice},
+        capital::{
+            CapitalSolveResult, PendingDeployment, cap_limited_allocation, projected_cap_headroom,
+            reallocation_cap_limited_allocation,
+        },
         certificate::{RejectionReason, SearchCertificate},
         simulator::{SimulationState, simulate_actions},
     },
@@ -271,7 +275,7 @@ fn current_assets_by_market(
         .collect()
 }
 
-fn target_weights(
+fn base_target_weights(
     selected_len: usize,
     settings: &ValidatedTopKApyConfig,
 ) -> Result<&[u32], TopKApyError> {
@@ -282,12 +286,91 @@ fn target_weights(
     }
 }
 
+fn effective_target_weights(
+    selected: &[MarketId],
+    evidence: &[TopKMarketEvidence],
+    settings: &ValidatedTopKApyConfig,
+) -> Result<Vec<u32>, TopKApyError> {
+    let base = base_target_weights(selected.len(), settings)?;
+    let top_market = selected.first().ok_or(TopKApyError::IncompleteState)?;
+    let top_apy = evidence
+        .iter()
+        .find(|item| item.market == *top_market)
+        .map(|item| annualized_supply_yield(item.ranking_rate))
+        .ok_or(TopKApyError::IncompleteState)??;
+    let other_apy_sum = selected.iter().skip(1).try_fold(
+        U256::ZERO,
+        |sum, selected_market| -> Result<U256, TopKApyError> {
+            let apy = evidence
+                .iter()
+                .find(|item| item.market == *selected_market)
+                .map(|item| annualized_supply_yield(item.ranking_rate))
+                .ok_or(TopKApyError::IncompleteState)??;
+            sum.checked_add(apy).ok_or(TopKApyError::Arithmetic)
+        },
+    )?;
+    let other_count =
+        u32::try_from(selected.len().saturating_sub(1)).map_err(|_| TopKApyError::Arithmetic)?;
+    if !top_market_boost_required(
+        top_apy,
+        other_apy_sum,
+        other_count,
+        settings.top_market_boost_threshold_apy_wad,
+    )? {
+        return Ok(base.to_vec());
+    }
+
+    let base_top = base.first().copied().ok_or(TopKApyError::IncompleteState)?;
+    let base_remainder = 10_000_u32
+        .checked_sub(base_top)
+        .ok_or(TopKApyError::Arithmetic)?;
+    let boosted_remainder = 10_000_u32
+        .checked_sub(settings.top_market_boost_weight_bps)
+        .ok_or(TopKApyError::Arithmetic)?;
+    let mut boosted = Vec::with_capacity(base.len());
+    boosted.push(settings.top_market_boost_weight_bps);
+    let mut assigned = settings.top_market_boost_weight_bps;
+    for (offset, weight) in base.iter().copied().enumerate().skip(1) {
+        let scaled = if offset.saturating_add(1) == base.len() {
+            10_000_u32
+                .checked_sub(assigned)
+                .ok_or(TopKApyError::Arithmetic)?
+        } else {
+            boosted_remainder
+                .checked_mul(weight)
+                .and_then(|value| value.checked_div(base_remainder))
+                .ok_or(TopKApyError::Arithmetic)?
+        };
+        assigned = assigned
+            .checked_add(scaled)
+            .ok_or(TopKApyError::Arithmetic)?;
+        boosted.push(scaled);
+    }
+    Ok(boosted)
+}
+
+fn top_market_boost_required(
+    top_apy: U256,
+    other_apy_sum: U256,
+    other_count: u32,
+    threshold: U256,
+) -> Result<bool, TopKApyError> {
+    let other_average = other_apy_sum
+        .checked_div(U256::from(other_count))
+        .ok_or(TopKApyError::Arithmetic)?;
+    Ok(top_apy
+        .checked_sub(other_average)
+        .is_some_and(|gap| gap > threshold))
+}
+
 fn target_allocations(
     selected: &[MarketId],
     direct_assets: U256,
-    settings: &ValidatedTopKApyConfig,
+    weights: &[u32],
 ) -> Result<BTreeMap<MarketId, U256>, TopKApyError> {
-    let weights = target_weights(selected.len(), settings)?;
+    if selected.len() != weights.len() {
+        return Err(TopKApyError::IncompleteState);
+    }
     let mut targets = BTreeMap::new();
     let mut assigned = U256::ZERO;
     for (offset, market) in selected.iter().enumerate() {
@@ -385,15 +468,16 @@ fn proposed_membership(
         return Ok(Vec::new());
     }
     let mut desired_count = 3_usize;
-    if ranked.len() >= 4 && direct_assets >= settings.minimum_direct_assets_for_four_markets {
-        let third = ranked.get(2).ok_or(TopKApyError::IncompleteState)?;
+    if ranked.len() >= 4 {
+        let best = ranked.first().ok_or(TopKApyError::IncompleteState)?;
         let fourth = ranked.get(3).ok_or(TopKApyError::IncompleteState)?;
         let four = ranked
             .iter()
             .take(4)
             .map(|market| market.market)
             .collect::<Vec<_>>();
-        let fourth_target = target_allocations(&four, direct_assets, settings)?
+        let weights = effective_target_weights(&four, ranked, settings)?;
+        let fourth_target = target_allocations(&four, direct_assets, &weights)?
             .get(&fourth.market)
             .copied()
             .ok_or(TopKApyError::IncompleteState)?;
@@ -409,11 +493,9 @@ fn proposed_membership(
             .ok_or(TopKApyError::IncompleteState)?;
         if market_can_hold_target(fourth, fourth_current, fourth_target, fourth_minimum)
             && fourth_market_allowed(
-                memory.selected_markets.len() == 4,
-                annualized_supply_yield(third.ranking_rate)?,
+                annualized_supply_yield(best.ranking_rate)?,
                 annualized_supply_yield(fourth.ranking_rate)?,
-                settings.fourth_market_entry_gap_apy_wad,
-                settings.fourth_market_exit_gap_apy_wad,
+                settings.fourth_market_max_gap_apy_wad,
             )
         {
             desired_count = 4;
@@ -445,25 +527,9 @@ fn proposed_membership(
         .filter(|market| eligible.contains(market))
         .collect::<Vec<_>>();
     if current.len() != desired.len() {
-        // Adding the competitive fourth diversification slot is controlled by its own narrow
-        // gap/capacity policy above. Removing a still-valid funded market is yield-driven and
-        // therefore must also satisfy every configured APY transition guard.
-        if desired.len() > current.len() {
-            return Ok(desired);
-        }
-        let retained_floor = desired
-            .last()
-            .and_then(|market| ranked.iter().find(|item| item.market == *market))
-            .ok_or(TopKApyError::IncompleteState)?;
-        for outgoing in current.iter().filter(|market| !desired.contains(market)) {
-            let incumbent = ranked
-                .iter()
-                .find(|item| item.market == *outgoing)
-                .ok_or(TopKApyError::IncompleteState)?;
-            if !market_transition_allowed(retained_floor, incumbent, settings)? {
-                return Ok(current);
-            }
-        }
+        // The best-to-fourth APY gap is the sole diversification policy for choosing three
+        // versus four eligible, target-capable markets. Canonical-time membership confirmation
+        // is applied by the caller before either change becomes executable.
         return Ok(desired);
     }
     let incoming = desired
@@ -492,7 +558,7 @@ fn proposed_membership(
             return Ok(current);
         }
     }
-    // A rank-only change alters the 40/40/20 or 35/35/15/15 target even when membership is
+    // A rank-only change alters the weighted target even when membership is
     // unchanged. Gate each promotion exactly like a replacement so a tiny rate-ordering change
     // cannot move a large target weight and waste gas.
     for (desired_index, candidate) in desired.iter().enumerate() {
@@ -520,19 +586,8 @@ fn proposed_membership(
     Ok(desired)
 }
 
-fn fourth_market_allowed(
-    already_selected: bool,
-    third_rate: U256,
-    fourth_rate: U256,
-    entry_gap: U256,
-    exit_gap: U256,
-) -> bool {
-    let gap = third_rate.saturating_sub(fourth_rate);
-    if already_selected {
-        gap <= exit_gap
-    } else {
-        gap <= entry_gap
-    }
+fn fourth_market_allowed(best_apy: U256, fourth_apy: U256, maximum_gap: U256) -> bool {
+    best_apy.saturating_sub(fourth_apy) <= maximum_gap
 }
 
 fn market_can_hold_target(
@@ -651,8 +706,13 @@ pub fn observe_top_k_target(
             .maximum_position_assets
             .saturating_sub(current_assets)
             .min(
-                cap_limited_allocation(snapshot, projection, configured.position_key)
-                    .ok_or(TopKApyError::IncompleteState)?,
+                reallocation_cap_limited_allocation(
+                    snapshot,
+                    projection,
+                    vault,
+                    configured.position_key,
+                )
+                .ok_or(TopKApyError::IncompleteState)?,
             );
         if current_assets
             .checked_add(destination_capacity)
@@ -783,7 +843,8 @@ pub fn observe_top_k_target(
         next.pending_selected_markets.clear();
         next.pending_selection_since_timestamp = None;
     }
-    let targets = target_allocations(&next.selected_markets, target_direct_assets, settings)?;
+    let weights = effective_target_weights(&next.selected_markets, &evidence, settings)?;
+    let targets = target_allocations(&next.selected_markets, target_direct_assets, &weights)?;
     let score = allocation_score(&current_assets, &targets, target_direct_assets)?;
     Ok(TopKApyObservation {
         target: Some(TopKApyTarget {
@@ -837,6 +898,15 @@ pub fn solve_top_k_capital_deployment(
         .iter()
         .map(|position| (position.market_id, position))
         .collect::<BTreeMap<_, _>>();
+    let mut remaining_cap_headroom = snapshot
+        .caps
+        .keys()
+        .map(|reference| {
+            projected_cap_headroom(snapshot, projection, *reference)
+                .map(|headroom| (*reference, headroom))
+        })
+        .collect::<Option<BTreeMap<_, _>>>()
+        .ok_or(TopKApyError::IncompleteState)?;
     let mut remaining = deployment;
     let mut allocations = Vec::new();
     for market in &target.selected_markets {
@@ -861,11 +931,27 @@ pub fn solve_top_k_capital_deployment(
             .evidence_by_market
             .get(market)
             .map(|evidence| evidence.destination_capacity)
+            .ok_or(TopKApyError::IncompleteState)?
+            .min(
+                cap_limited_allocation(snapshot, projection, configured.position_key)
+                    .ok_or(TopKApyError::IncompleteState)?,
+            );
+        let position = snapshot
+            .positions
+            .get(&configured.position_key)
+            .ok_or(TopKApyError::IncompleteState)?;
+        let shared_cap_capacity = position
+            .affected_caps
+            .iter()
+            .map(|reference| remaining_cap_headroom.get(reference).copied())
+            .collect::<Option<Vec<_>>>()
+            .and_then(|headrooms| headrooms.into_iter().min())
             .ok_or(TopKApyError::IncompleteState)?;
         let amount = desired
             .saturating_sub(current)
             .min(configured.maximum_action_assets)
             .min(capacity)
+            .min(shared_cap_capacity)
             .min(remaining);
         if amount < vault.minimum_action_assets {
             continue;
@@ -876,6 +962,14 @@ pub fn solve_top_k_capital_deployment(
             data: crate::domain::encode_adapter_data(&configured.market_params),
             requested_assets: RequestedAssets(amount),
         });
+        for reference in position.affected_caps {
+            let headroom = remaining_cap_headroom
+                .get_mut(&reference)
+                .ok_or(TopKApyError::IncompleteState)?;
+            *headroom = headroom
+                .checked_sub(amount)
+                .ok_or(TopKApyError::Arithmetic)?;
+        }
         remaining = remaining
             .checked_sub(amount)
             .ok_or(TopKApyError::Arithmetic)?;
@@ -976,11 +1070,17 @@ pub fn solve_top_k_capital_deployment(
     })
 }
 
-fn movement_actions(
+struct MovementActionCandidates {
+    actions: Vec<Vec<V2Action>>,
+    search_complete: bool,
+}
+
+fn movement_action_candidates(
     target: &TopKApyTarget,
     vault: &ValidatedVaultConfig,
     requested_movement: U256,
-) -> Result<Vec<V2Action>, TopKApyError> {
+    maximum_nodes: u64,
+) -> Result<MovementActionCandidates, TopKApyError> {
     let positions = vault
         .positions
         .iter()
@@ -1009,7 +1109,7 @@ fn movement_actions(
             (!available.is_zero()).then_some((*market, available))
         })
         .collect::<Vec<_>>();
-    sources.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    sources.sort_by_key(|(market, _)| *market);
     let mut destinations = target
         .selected_markets
         .iter()
@@ -1025,69 +1125,110 @@ fn movement_actions(
             (!available.is_zero()).then_some((*market, available))
         })
         .collect::<Vec<_>>();
+    destinations.sort_by_key(|(market, _)| *market);
     let source_total = checked_sum(sources.iter().map(|(_, amount)| *amount))?;
     let destination_total = checked_sum(destinations.iter().map(|(_, amount)| *amount))?;
     let movement = requested_movement.min(source_total).min(destination_total);
     if movement.is_zero() {
-        return Ok(Vec::new());
-    }
-    let mut remaining = movement;
-    let mut actions = Vec::new();
-    for (market, available) in sources {
-        if remaining.is_zero() {
-            break;
-        }
-        let amount = remaining.min(available);
-        if amount < vault.minimum_action_assets {
-            continue;
-        }
-        let configured = positions
-            .get(&market)
-            .copied()
-            .ok_or(TopKApyError::IncompleteState)?;
-        actions.push(V2Action::Deallocate {
-            position: configured.position_key,
-            adapter: configured.adapter,
-            data: crate::domain::encode_adapter_data(&configured.market_params),
-            requested_assets: RequestedAssets(amount),
+        return Ok(MovementActionCandidates {
+            actions: Vec::new(),
+            search_complete: true,
         });
-        remaining = remaining
-            .checked_sub(amount)
-            .ok_or(TopKApyError::Arithmetic)?;
     }
-    let actual_movement = movement
-        .checked_sub(remaining)
-        .ok_or(TopKApyError::Arithmetic)?;
-    if actual_movement.is_zero() {
-        return Ok(Vec::new());
-    }
-    remaining = actual_movement;
-    for (market, available) in &mut destinations {
-        if remaining.is_zero() {
-            break;
-        }
-        let amount = remaining.min(*available);
-        if amount < vault.minimum_action_assets {
-            continue;
-        }
-        let configured = positions
-            .get(market)
-            .copied()
-            .ok_or(TopKApyError::IncompleteState)?;
-        actions.push(V2Action::Allocate {
-            position: configured.position_key,
-            adapter: configured.adapter,
-            data: crate::domain::encode_adapter_data(&configured.market_params),
-            requested_assets: RequestedAssets(amount),
+    let distribution_limit = usize::try_from(maximum_nodes)
+        .map_or(usize::MAX, |value| value)
+        .max(1);
+    let source_maximums = sources
+        .iter()
+        .map(|(_, maximum)| *maximum)
+        .collect::<Vec<_>>();
+    let destination_maximums = destinations
+        .iter()
+        .map(|(_, maximum)| *maximum)
+        .collect::<Vec<_>>();
+    let source_lattices = source_maximums
+        .iter()
+        .map(|maximum| {
+            build_candidate_lattice(vault.minimum_action_assets, *maximum, &[*maximum], 8).amounts
+        })
+        .collect::<Vec<_>>();
+    let destination_lattices = destination_maximums
+        .iter()
+        .map(|maximum| {
+            build_candidate_lattice(vault.minimum_action_assets, *maximum, &[*maximum], 8).amounts
+        })
+        .collect::<Vec<_>>();
+    let Some(source_distributions) = bounded_distributions(
+        &source_maximums,
+        &source_lattices,
+        movement,
+        vault.minimum_action_assets,
+        distribution_limit,
+    ) else {
+        return Ok(MovementActionCandidates {
+            actions: Vec::new(),
+            search_complete: false,
         });
-        remaining = remaining
-            .checked_sub(amount)
-            .ok_or(TopKApyError::Arithmetic)?;
+    };
+    let Some(destination_distributions) = bounded_distributions(
+        &destination_maximums,
+        &destination_lattices,
+        movement,
+        vault.minimum_action_assets,
+        distribution_limit,
+    ) else {
+        return Ok(MovementActionCandidates {
+            actions: Vec::new(),
+            search_complete: false,
+        });
+    };
+    let mut candidates = Vec::new();
+    for source_amounts in source_distributions {
+        for destination_amounts in &destination_distributions {
+            if candidates.len() >= distribution_limit {
+                return Ok(MovementActionCandidates {
+                    actions: candidates,
+                    search_complete: false,
+                });
+            }
+            let mut actions = Vec::new();
+            for ((market, _), amount) in sources.iter().zip(&source_amounts) {
+                if amount.is_zero() {
+                    continue;
+                }
+                let configured = positions
+                    .get(market)
+                    .copied()
+                    .ok_or(TopKApyError::IncompleteState)?;
+                actions.push(V2Action::Deallocate {
+                    position: configured.position_key,
+                    adapter: configured.adapter,
+                    data: crate::domain::encode_adapter_data(&configured.market_params),
+                    requested_assets: RequestedAssets(*amount),
+                });
+            }
+            for ((market, _), amount) in destinations.iter().zip(destination_amounts) {
+                if amount.is_zero() {
+                    continue;
+                }
+                let configured = positions
+                    .get(market)
+                    .copied()
+                    .ok_or(TopKApyError::IncompleteState)?;
+                actions.push(V2Action::Allocate {
+                    position: configured.position_key,
+                    adapter: configured.adapter,
+                    data: crate::domain::encode_adapter_data(&configured.market_params),
+                    requested_assets: RequestedAssets(*amount),
+                });
+            }
+            candidates.push(actions);
+        }
     }
-    if !remaining.is_zero() {
-        return Ok(Vec::new());
-    }
-    Ok(actions)
+    Ok(MovementActionCandidates {
+        actions: candidates,
+        search_complete: true,
+    })
 }
 
 fn candidate_amounts(
@@ -1168,96 +1309,132 @@ pub fn solve_top_k_rebalance(
     for amount in &amounts {
         lattice_bytes.extend_from_slice(&amount.to_be_bytes::<32>());
     }
-    certificate.candidate_lattice_hash = keccak256(lattice_bytes);
     let before_portfolio_rate =
         portfolio_rate(&target.current_assets_by_market, &projection.markets)?;
     let mut best: Option<TopKApyCandidate> = None;
-    for amount in amounts {
-        if certificate.nodes_evaluated >= certificate.node_limit {
+    'amounts: for amount in amounts {
+        let remaining_nodes = certificate
+            .node_limit
+            .saturating_sub(certificate.nodes_evaluated);
+        if remaining_nodes == 0 {
             certificate.search_complete = false;
             break;
         }
-        certificate.nodes_evaluated = certificate.nodes_evaluated.saturating_add(1);
-        let actions = movement_actions(target, vault, amount)?;
-        if actions.is_empty() || actions.len() > limits.maximum_actions {
-            certificate.reject(RejectionReason::Simulation);
-            continue;
+        let candidates = movement_action_candidates(target, vault, amount, remaining_nodes)?;
+        if !candidates.search_complete {
+            certificate.search_complete = false;
+            break;
         }
-        let state = match simulate_actions(snapshot, projection, vault, &actions) {
-            Ok(state) => state,
-            Err(_) => {
+        for actions in candidates.actions {
+            if certificate.nodes_evaluated >= certificate.node_limit {
+                certificate.search_complete = false;
+                break 'amounts;
+            }
+            certificate.nodes_evaluated = certificate.nodes_evaluated.saturating_add(1);
+            lattice_bytes.extend_from_slice(&amount.to_be_bytes::<32>());
+            for action in &actions {
+                match action {
+                    V2Action::Deallocate {
+                        position,
+                        requested_assets,
+                        ..
+                    } => {
+                        lattice_bytes.push(0);
+                        lattice_bytes.extend_from_slice(position.0.as_slice());
+                        lattice_bytes.extend_from_slice(&requested_assets.0.to_be_bytes::<32>());
+                    }
+                    V2Action::Allocate {
+                        position,
+                        requested_assets,
+                        ..
+                    } => {
+                        lattice_bytes.push(1);
+                        lattice_bytes.extend_from_slice(position.0.as_slice());
+                        lattice_bytes.extend_from_slice(&requested_assets.0.to_be_bytes::<32>());
+                    }
+                }
+            }
+            if actions.is_empty() || actions.len() > limits.maximum_actions {
                 certificate.reject(RejectionReason::Simulation);
                 continue;
             }
-        };
-        if state.validate_service_constraints(snapshot, vault).is_err() {
-            certificate.reject(RejectionReason::Service);
-            continue;
-        }
-        if state.immediate_loss_assets > vault.maximum_immediate_rebalance_loss_assets {
-            certificate.reject(RejectionReason::ImmediateLoss);
-            continue;
-        }
-        let after_assets = simulation_assets_by_market(&state, vault)?;
-        let after_score = allocation_score(
-            &after_assets,
-            &target.target_assets_by_market,
-            target.target_direct_assets,
-        )?;
-        let improvement = target.current_score_wad.saturating_sub(after_score);
-        if improvement < settings.minimum_improvement_score_wad {
-            certificate.reject(RejectionReason::SpreadWorsening);
-            continue;
-        }
-        let after_portfolio_rate = portfolio_rate(&after_assets, &state.markets)?;
-        let before_portfolio_apy = annualized_supply_yield(before_portfolio_rate)?;
-        let after_portfolio_apy = annualized_supply_yield(after_portfolio_rate)?;
-        if after_portfolio_apy
-            .checked_add(settings.maximum_diversification_cost_apy_wad)
-            .is_none_or(|with_budget| with_budget < before_portfolio_apy)
-        {
-            certificate.reject(RejectionReason::SpreadWorsening);
-            continue;
-        }
-        let movement_assets = actions.iter().try_fold(U256::ZERO, |total, action| {
-            if let V2Action::Deallocate {
-                requested_assets, ..
-            } = action
-            {
-                total
-                    .checked_add(requested_assets.0)
-                    .ok_or(TopKApyError::Arithmetic)
-            } else {
-                Ok(total)
+            let state = match simulate_actions(snapshot, projection, vault, &actions) {
+                Ok(state) => state,
+                Err(_) => {
+                    certificate.reject(RejectionReason::Simulation);
+                    continue;
+                }
+            };
+            if state.validate_service_constraints(snapshot, vault).is_err() {
+                certificate.reject(RejectionReason::Service);
+                continue;
             }
-        })?;
-        let candidate = TopKApyCandidate {
-            actions,
-            state,
-            before_score_wad: target.current_score_wad,
-            after_score_wad: after_score,
-            movement_assets,
-            before_portfolio_rate,
-            after_portfolio_rate,
-        };
-        if best.as_ref().is_none_or(|current| {
-            (
-                candidate.after_score_wad,
-                std::cmp::Reverse(candidate.after_portfolio_rate),
-                candidate.state.immediate_loss_assets,
-                candidate.movement_assets,
-                candidate.actions.len(),
-            ) < (
-                current.after_score_wad,
-                std::cmp::Reverse(current.after_portfolio_rate),
-                current.state.immediate_loss_assets,
-                current.movement_assets,
-                current.actions.len(),
-            )
-        }) {
-            best = Some(candidate);
+            if state.immediate_loss_assets > vault.maximum_immediate_rebalance_loss_assets {
+                certificate.reject(RejectionReason::ImmediateLoss);
+                continue;
+            }
+            let after_assets = simulation_assets_by_market(&state, vault)?;
+            let after_score = allocation_score(
+                &after_assets,
+                &target.target_assets_by_market,
+                target.target_direct_assets,
+            )?;
+            let improvement = target.current_score_wad.saturating_sub(after_score);
+            if improvement < settings.minimum_improvement_score_wad {
+                certificate.reject(RejectionReason::SpreadWorsening);
+                continue;
+            }
+            let after_portfolio_rate = portfolio_rate(&after_assets, &state.markets)?;
+            let before_portfolio_apy = annualized_supply_yield(before_portfolio_rate)?;
+            let after_portfolio_apy = annualized_supply_yield(after_portfolio_rate)?;
+            if after_portfolio_apy
+                .checked_add(settings.maximum_diversification_cost_apy_wad)
+                .is_none_or(|with_budget| with_budget < before_portfolio_apy)
+            {
+                certificate.reject(RejectionReason::SpreadWorsening);
+                continue;
+            }
+            let movement_assets = actions.iter().try_fold(U256::ZERO, |total, action| {
+                if let V2Action::Deallocate {
+                    requested_assets, ..
+                } = action
+                {
+                    total
+                        .checked_add(requested_assets.0)
+                        .ok_or(TopKApyError::Arithmetic)
+                } else {
+                    Ok(total)
+                }
+            })?;
+            let candidate = TopKApyCandidate {
+                actions,
+                state,
+                before_score_wad: target.current_score_wad,
+                after_score_wad: after_score,
+                movement_assets,
+                before_portfolio_rate,
+                after_portfolio_rate,
+            };
+            if best.as_ref().is_none_or(|current| {
+                (
+                    candidate.after_score_wad,
+                    std::cmp::Reverse(candidate.after_portfolio_rate),
+                    candidate.state.immediate_loss_assets,
+                    candidate.movement_assets,
+                    candidate.actions.len(),
+                ) < (
+                    current.after_score_wad,
+                    std::cmp::Reverse(current.after_portfolio_rate),
+                    current.state.immediate_loss_assets,
+                    current.movement_assets,
+                    current.actions.len(),
+                )
+            }) {
+                best = Some(candidate);
+            }
         }
     }
+    certificate.candidate_lattice_hash = keccak256(lattice_bytes);
     let no_action_reason = if !certificate.search_complete {
         Some(TopKApyNoActionReason::SearchIncomplete)
     } else if best.is_none() {
@@ -1274,16 +1451,20 @@ pub fn solve_top_k_rebalance(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use alloy::primitives::{B256, U256};
 
     use super::{
-        TopKMarketEvidence, annualized_supply_yield, candidate_amounts, fourth_market_allowed,
-        market_can_hold_target, membership_confirmed, smoothed_rate, target_allocations,
-        transition_apy_improvements_allowed,
+        TopKApyTarget, TopKMarketEvidence, annualized_supply_yield, candidate_amounts,
+        effective_target_weights, fourth_market_allowed, market_can_hold_target,
+        membership_confirmed, movement_action_candidates, proposed_membership, smoothed_rate,
+        target_allocations, top_market_boost_required, transition_apy_improvements_allowed,
     };
-    use crate::{config::AppConfig, domain::MarketId};
+    use crate::{
+        config::AppConfig,
+        domain::{MarketId, V2Action},
+    };
 
     #[test]
     fn downside_is_immediate_and_upside_uses_twenty_percent() {
@@ -1306,36 +1487,100 @@ mod tests {
     }
 
     #[test]
-    fn fourth_market_uses_independent_fifty_and_one_hundred_bps_gap_boundaries() {
-        let third = U256::from(1_000_u16);
+    fn movement_search_enumerates_the_source_that_releases_a_shared_destination_cap() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.hyperevm.json");
+        let validated = AppConfig::load(&path).and_then(AppConfig::validate);
+        assert!(validated.is_ok());
+        let Ok(validated) = validated else {
+            return;
+        };
+        let vault = &validated.app.vaults[0];
+        assert!(vault.positions.len() >= 3);
+        let [source_a, source_b, destination, ..] = vault.positions.as_slice() else {
+            return;
+        };
+        let unit = U256::from(1_000_000_u64);
+        let current = BTreeMap::from([
+            (source_a.market_id, unit * U256::from(500_u16)),
+            (source_b.market_id, unit * U256::from(200_u16)),
+            (destination.market_id, U256::ZERO),
+        ]);
+        let targets = BTreeMap::from([
+            (source_a.market_id, unit * U256::from(200_u16)),
+            (source_b.market_id, U256::ZERO),
+            (destination.market_id, unit * U256::from(500_u16)),
+        ]);
+        let evidence = [source_a, source_b, destination]
+            .into_iter()
+            .map(|position| {
+                (
+                    position.market_id,
+                    TopKMarketEvidence {
+                        market: position.market_id,
+                        current_rate: U256::ONE,
+                        post_probe_rate: U256::ONE,
+                        smoothed_rate: U256::ONE,
+                        ranking_rate: U256::ONE,
+                        destination_capacity: U256::MAX,
+                    },
+                )
+            })
+            .collect();
+        let target = TopKApyTarget {
+            selected_markets: vec![source_a.market_id, destination.market_id],
+            target_assets_by_market: targets,
+            current_assets_by_market: current,
+            evidence_by_market: evidence,
+            target_direct_assets: unit * U256::from(700_u16),
+            current_score_wad: U256::MAX,
+        };
+        let candidates =
+            movement_action_candidates(&target, vault, unit * U256::from(450_u16), 10_000);
+        assert!(candidates.is_ok());
+        let Ok(candidates) = candidates else {
+            return;
+        };
+        assert!(candidates.search_complete);
+        assert!(candidates.actions.iter().any(|actions| {
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    V2Action::Deallocate { position, requested_assets, .. }
+                        if *position == source_a.position_key
+                            && requested_assets.0 == unit * U256::from(250_u16)
+                )
+            }) && actions.iter().any(|action| {
+                matches!(
+                    action,
+                    V2Action::Deallocate { position, requested_assets, .. }
+                        if *position == source_b.position_key
+                            && requested_assets.0 == unit * U256::from(200_u16)
+                )
+            }) && actions.iter().any(|action| {
+                matches!(
+                    action,
+                    V2Action::Allocate { position, requested_assets, .. }
+                        if *position == destination.position_key
+                            && requested_assets.0 == unit * U256::from(450_u16)
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn fourth_market_uses_one_inclusive_best_to_fourth_250_bps_boundary() {
+        let best = U256::from(1_000_u16);
         assert!(fourth_market_allowed(
-            false,
-            third,
-            U256::from(950_u16),
-            U256::from(50_u16),
-            U256::from(100_u16),
+            best,
+            U256::from(750_u16),
+            U256::from(250_u16),
         ));
         assert!(!fourth_market_allowed(
-            false,
-            third,
-            U256::from(949_u16),
-            U256::from(50_u16),
-            U256::from(100_u16),
+            best,
+            U256::from(749_u16),
+            U256::from(250_u16),
         ));
-        assert!(fourth_market_allowed(
-            true,
-            third,
-            U256::from(900_u16),
-            U256::from(50_u16),
-            U256::from(100_u16),
-        ));
-        assert!(!fourth_market_allowed(
-            true,
-            third,
-            U256::from(899_u16),
-            U256::from(50_u16),
-            U256::from(100_u16),
-        ));
+        assert!(fourth_market_allowed(U256::from(999_u16), best, U256::ZERO,));
     }
 
     #[test]
@@ -1366,6 +1611,96 @@ mod tests {
             U256::from(9_u8),
             U256::from(10_u8),
         ));
+    }
+
+    #[test]
+    fn fourth_market_membership_depends_on_best_to_fourth_apy_not_vault_size() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.hyperevm.json");
+        let validated = AppConfig::load(&path).and_then(AppConfig::validate);
+        assert!(validated.is_ok());
+        let Ok(validated) = validated else {
+            return;
+        };
+        let vault = &validated.app.vaults[0];
+        let settings = &validated.app.strategy.top_k_apy;
+        let markets = vault
+            .positions
+            .iter()
+            .filter(|position| position.mode == crate::domain::MarketMode::Active)
+            .take(4)
+            .map(|position| position.market_id)
+            .collect::<Vec<_>>();
+        assert_eq!(markets.len(), 4);
+        let current = markets
+            .iter()
+            .copied()
+            .map(|market| (market, U256::ZERO))
+            .collect::<BTreeMap<_, _>>();
+        let equal = markets
+            .iter()
+            .copied()
+            .map(|market| TopKMarketEvidence {
+                market,
+                current_rate: U256::ONE,
+                post_probe_rate: U256::ONE,
+                smoothed_rate: U256::ONE,
+                ranking_rate: U256::ONE,
+                destination_capacity: U256::MAX,
+            })
+            .collect::<Vec<_>>();
+        let selected = proposed_membership(
+            &equal,
+            U256::from(100_u8),
+            &current,
+            vault,
+            &Default::default(),
+            settings,
+        );
+        assert_eq!(selected, Ok(markets.clone()));
+
+        let separated = markets
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(offset, market)| {
+                let rate = if offset == 0 {
+                    U256::from(3_170_979_198_u64)
+                } else {
+                    U256::ZERO
+                };
+                TopKMarketEvidence {
+                    market,
+                    current_rate: rate,
+                    post_probe_rate: rate,
+                    smoothed_rate: rate,
+                    ranking_rate: rate,
+                    destination_capacity: U256::MAX,
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected = proposed_membership(
+            &separated,
+            U256::from(100_u8),
+            &current,
+            vault,
+            &Default::default(),
+            settings,
+        );
+        assert_eq!(selected, Ok(markets[..3].to_vec()));
+
+        let previously_four = super::TopKApyMemory {
+            selected_markets: markets.clone(),
+            ..Default::default()
+        };
+        let selected = proposed_membership(
+            &separated,
+            U256::from(100_u8),
+            &current,
+            vault,
+            &previously_four,
+            settings,
+        );
+        assert_eq!(selected, Ok(markets[..3].to_vec()));
     }
 
     #[test]
@@ -1446,20 +1781,108 @@ mod tests {
             MarketId(B256::repeat_byte(2)),
             MarketId(B256::repeat_byte(3)),
         ];
-        let targets = target_allocations(&three, U256::from(1_000_u16), settings);
+        let targets = target_allocations(
+            &three,
+            U256::from(1_000_u16),
+            &settings.three_market_weights_bps,
+        );
         assert!(targets.is_ok());
         let targets = targets.unwrap_or_default();
-        assert_eq!(targets.get(&three[0]), Some(&U256::from(400_u16)));
-        assert_eq!(targets.get(&three[1]), Some(&U256::from(400_u16)));
+        assert_eq!(targets.get(&three[0]), Some(&U256::from(500_u16)));
+        assert_eq!(targets.get(&three[1]), Some(&U256::from(300_u16)));
         assert_eq!(targets.get(&three[2]), Some(&U256::from(200_u16)));
 
         let four = [three[0], three[1], three[2], MarketId(B256::repeat_byte(4))];
-        let targets = target_allocations(&four, U256::from(1_003_u16), settings);
+        let targets = target_allocations(
+            &four,
+            U256::from(1_003_u16),
+            &settings.four_market_weights_bps,
+        );
         assert!(targets.is_ok());
         let targets = targets.unwrap_or_default();
-        assert_eq!(targets.get(&four[0]), Some(&U256::from(351_u16)));
-        assert_eq!(targets.get(&four[1]), Some(&U256::from(351_u16)));
-        assert_eq!(targets.get(&four[2]), Some(&U256::from(150_u16)));
-        assert_eq!(targets.get(&four[3]), Some(&U256::from(151_u16)));
+        assert_eq!(targets.get(&four[0]), Some(&U256::from(401_u16)));
+        assert_eq!(targets.get(&four[1]), Some(&U256::from(300_u16)));
+        assert_eq!(targets.get(&four[2]), Some(&U256::from(200_u16)));
+        assert_eq!(targets.get(&four[3]), Some(&U256::from(102_u16)));
+    }
+
+    #[test]
+    fn top_market_boost_is_strictly_above_200_bps() {
+        let threshold = U256::from(200_u16);
+        let other_sum = U256::from(1_600_u16);
+        assert_eq!(
+            top_market_boost_required(U256::from(1_000_u16), other_sum, 2, threshold),
+            Ok(false)
+        );
+        assert_eq!(
+            top_market_boost_required(U256::from(1_001_u16), other_sum, 2, threshold),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn top_market_boost_caps_at_seventy_percent_and_preserves_other_proportions() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.hyperevm.json");
+        let validated = AppConfig::load(&path).and_then(AppConfig::validate);
+        assert!(validated.is_ok());
+        let Ok(validated) = validated else {
+            return;
+        };
+        let settings = &validated.app.strategy.top_k_apy;
+        let markets = [
+            MarketId(B256::repeat_byte(1)),
+            MarketId(B256::repeat_byte(2)),
+            MarketId(B256::repeat_byte(3)),
+            MarketId(B256::repeat_byte(4)),
+        ];
+        let equal_evidence = markets
+            .iter()
+            .copied()
+            .map(|market| TopKMarketEvidence {
+                market,
+                current_rate: U256::ONE,
+                post_probe_rate: U256::ONE,
+                smoothed_rate: U256::ONE,
+                ranking_rate: U256::ONE,
+                destination_capacity: U256::MAX,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            effective_target_weights(&markets[..3], &equal_evidence, settings),
+            Ok(vec![5_000, 3_000, 2_000])
+        );
+        assert_eq!(
+            effective_target_weights(&markets, &equal_evidence, settings),
+            Ok(vec![4_000, 3_000, 2_000, 1_000])
+        );
+
+        let evidence = markets
+            .iter()
+            .enumerate()
+            .map(|(offset, market)| {
+                let rate = if offset == 0 {
+                    U256::from(3_170_979_198_u64)
+                } else {
+                    U256::ZERO
+                };
+                TopKMarketEvidence {
+                    market: *market,
+                    current_rate: rate,
+                    post_probe_rate: rate,
+                    smoothed_rate: rate,
+                    ranking_rate: rate,
+                    destination_capacity: U256::MAX,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            effective_target_weights(&markets[..3], &evidence, settings),
+            Ok(vec![7_000, 1_800, 1_200])
+        );
+        assert_eq!(
+            effective_target_weights(&markets, &evidence, settings),
+            Ok(vec![7_000, 1_500, 1_000, 500])
+        );
     }
 }

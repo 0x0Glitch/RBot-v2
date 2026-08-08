@@ -201,18 +201,36 @@ impl Supervisor {
                                 }
                                 FailureDisposition::Retry { backoff } => {
                                     if !self.restart(name, backoff) {
-                                        tracing::error!(service = name, "retryable worker has no restart factory");
+                                        break Err(SupervisorError::FatalService {
+                                            name,
+                                            failure: ServiceFailure::fatal(
+                                                "retryable worker has no restart factory",
+                                            ),
+                                        });
                                     }
                                 }
                                 FailureDisposition::RestartWorker
                                 | FailureDisposition::RefreshAndReplan => {
                                     if !self.restart(name, Duration::from_secs(1)) {
-                                        tracing::error!(service = name, "failed worker has no restart factory");
+                                        break Err(SupervisorError::FatalService {
+                                            name,
+                                            failure: ServiceFailure::fatal(
+                                                "failed worker has no restart factory",
+                                            ),
+                                        });
                                     }
                                 }
                                 FailureDisposition::QuarantineVault { .. }
                                 | FailureDisposition::QuarantineSigner { .. } => {
-                                    tracing::warn!(service = name, "worker quarantined its execution scope and exited");
+                                    tracing::warn!(service = name, "worker quarantined its execution scope and will restart from durable state");
+                                    if !self.restart(name, Duration::from_secs(1)) {
+                                        break Err(SupervisorError::FatalService {
+                                            name,
+                                            failure: ServiceFailure::fatal(
+                                                "non-restartable worker exited after quarantine",
+                                            ),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -222,7 +240,12 @@ impl Supervisor {
                             if let Some(name) = name {
                                 tracing::error!(service = name, %join_error, "supervised worker panicked or was cancelled; restarting from owned state");
                                 if !self.restart(name, Duration::from_secs(1)) {
-                                    tracing::error!(service = name, "panicked worker has no restart factory");
+                                    break Err(SupervisorError::FatalService {
+                                        name,
+                                        failure: ServiceFailure::fatal(
+                                            "non-restartable supervised worker panicked",
+                                        ),
+                                    });
                                 }
                             }
                         }

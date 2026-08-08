@@ -1,6 +1,6 @@
 //! Static and deployed runtime-identity gates for live operation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use alloy::primitives::{Address, B256};
 use futures::{StreamExt, stream};
@@ -98,6 +98,34 @@ impl RuntimeIdentities {
         Ok(())
     }
 
+    /// Verifies only chain-wide dependencies whose failure invalidates every managed vault.
+    /// Vault-specific identities are checked by each exact snapshot and may be quarantined without
+    /// preventing the process or unrelated vaults from remaining live.
+    pub async fn verify_core_deployed<P: AtomicSnapshotProvider>(
+        &self,
+        provider: &P,
+    ) -> Result<(), RuntimeIdentityError> {
+        let identities = self
+            .contracts
+            .values()
+            .filter(|identity| {
+                matches!(
+                    identity.kind,
+                    IdentityKind::MorphoSingleton | IdentityKind::Multicall3
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let checks = stream::iter(identities)
+            .map(|identity| verify_deployed_identity(provider, identity))
+            .buffer_unordered(8);
+        futures::pin_mut!(checks);
+        while let Some(result) = checks.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
     /// Revalidates mutable proxy implementation links during final preflight.
     ///
     /// Runtime bytecode for every locked address is already checked at the exact snapshot
@@ -120,6 +148,101 @@ impl RuntimeIdentities {
             result?;
         }
         Ok(())
+    }
+
+    /// Revalidates only proxy links that can affect one vault's exact plan and transaction.
+    ///
+    /// A process can manage multiple vaults through one allocator. A changed proxy belonging only
+    /// to another vault must quarantine that vault without preventing an independent healthy vault
+    /// from signing. Chain-wide Morpho/Multicall dependencies remain in every vault scope.
+    pub async fn verify_proxy_links_for_vault<P: AtomicSnapshotProvider>(
+        &self,
+        provider: &P,
+        vault: &ValidatedVaultConfig,
+        snapshot: Option<&ExactVaultSnapshot>,
+    ) -> Result<(), RuntimeIdentityError> {
+        let scope = self.vault_identity_scope(vault, snapshot);
+        let identities = self
+            .contracts
+            .values()
+            .filter(|identity| {
+                identity.proxy_implementation.is_some() && scope.contains(&identity.address)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let checks = stream::iter(identities)
+            .map(|identity| verify_proxy_identity(provider, identity))
+            .buffer_unordered(8);
+        futures::pin_mut!(checks);
+        while let Some(result) = checks.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Verifies runtime bytecode and proxy links for every dependency that can affect one vault.
+    /// This is the vault-scoped replacement for the former process-wide startup gate used by the
+    /// fast background snapshot path.
+    pub async fn verify_vault_deployed<P: AtomicSnapshotProvider>(
+        &self,
+        provider: &P,
+        vault: &ValidatedVaultConfig,
+        snapshot: Option<&ExactVaultSnapshot>,
+    ) -> Result<(), RuntimeIdentityError> {
+        let scope = self.vault_identity_scope(vault, snapshot);
+        let identities = self
+            .contracts
+            .values()
+            .filter(|identity| scope.contains(&identity.address))
+            .cloned()
+            .collect::<Vec<_>>();
+        let checks = stream::iter(identities)
+            .map(|identity| verify_deployed_identity(provider, identity))
+            .buffer_unordered(8);
+        futures::pin_mut!(checks);
+        while let Some(result) = checks.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
+    fn vault_identity_scope(
+        &self,
+        vault: &ValidatedVaultConfig,
+        snapshot: Option<&ExactVaultSnapshot>,
+    ) -> BTreeSet<Address> {
+        let mut addresses = self
+            .contracts
+            .values()
+            .filter(|identity| {
+                matches!(
+                    identity.kind,
+                    IdentityKind::MorphoSingleton | IdentityKind::Multicall3
+                )
+            })
+            .map(|identity| identity.address)
+            .collect::<BTreeSet<_>>();
+        addresses.insert(vault.address.0);
+        addresses.insert(vault.asset.0);
+        addresses.extend(vault.adapters.iter().map(|adapter| adapter.address.0));
+        if let Some(adapter) = &vault.liquidity_adapter {
+            addresses.insert(adapter.address.0);
+            addresses.insert(adapter.morpho_vault_v1);
+        }
+        for position in &vault.positions {
+            addresses.insert(position.market_params.irm);
+        }
+        if let Some(snapshot) = snapshot {
+            addresses.insert(snapshot.parent.adapter_registry);
+            addresses.extend([
+                snapshot.parent.receive_shares_gate,
+                snapshot.parent.send_shares_gate,
+                snapshot.parent.receive_assets_gate,
+                snapshot.parent.send_assets_gate,
+            ]);
+        }
+        addresses.remove(&Address::ZERO);
+        addresses
     }
 
     /// Validates dependencies that are discovered only through the exact parent snapshot.
@@ -284,4 +407,40 @@ fn require_identity(
         return Err(RuntimeIdentityError::Configuration(label));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use alloy::primitives::Address;
+
+    use super::RuntimeIdentities;
+    use crate::{config::AppConfig, protocol_lock::ProtocolLock};
+
+    #[test]
+    fn one_vaults_proxy_scope_excludes_an_unrelated_locked_proxy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = AppConfig::load(&root.join("config.hyperevm.json"))?.validate()?;
+        let lock = ProtocolLock::load(&root.join("protocol-lock.hyperevm.toml"))?.validate()?;
+        let mut identities = RuntimeIdentities::from_config(&config, &lock)?;
+        let vault = config.app.vaults.first().ok_or("fixture has no vault")?;
+        let mut unrelated = identities
+            .contracts
+            .get(&vault.asset.0)
+            .cloned()
+            .ok_or("fixture asset identity is missing")?;
+        assert!(unrelated.proxy_implementation.is_some());
+        unrelated.address = Address::with_last_byte(0xfe);
+        identities
+            .contracts
+            .insert(unrelated.address, unrelated.clone());
+
+        let scope = identities.vault_identity_scope(vault, None);
+        assert!(scope.contains(&vault.address.0));
+        assert!(scope.contains(&vault.asset.0));
+        assert!(!scope.contains(&unrelated.address));
+        Ok(())
+    }
 }

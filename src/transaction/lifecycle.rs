@@ -76,7 +76,15 @@ pub async fn persist_unsigned_rebalance(
     storage
         .persist_plan(plan.plan().clone(), created_at)
         .await?;
-    reserve_durable_rebalance(storage, plan, transaction, transaction_id, created_at).await
+    reserve_durable_rebalance(
+        storage,
+        plan,
+        transaction,
+        transaction_id,
+        plan.plan().snapshot.block.number,
+        created_at,
+    )
+    .await
 }
 
 /// Reserves a nonce after plan and final-preflight evidence are already durable.
@@ -85,6 +93,7 @@ pub async fn reserve_durable_rebalance(
     plan: &ValidatedPlan,
     transaction: ValidatedRoutineTransaction,
     transaction_id: TransactionId,
+    created_block: u64,
     created_at: u64,
 ) -> Result<DurableSigningRequest, SigningBoundaryError> {
     if transaction.plan_hash() != plan.plan().plan_hash {
@@ -103,7 +112,7 @@ pub async fn reserve_durable_rebalance(
         max_priority_fee_per_gas: U256::from(fields.max_priority_fee_per_gas),
         gas_limit: fields.gas_limit,
         movement_assets: plan.plan().projection.movement_assets,
-        created_block: plan.plan().snapshot.block.number,
+        created_block,
         created_at,
     };
     let movement_reservation = if let Some(episode_id) = plan.plan().episode_id {
