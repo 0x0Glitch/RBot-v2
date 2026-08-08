@@ -62,9 +62,17 @@ systemctl restart morpho-v2-reallocator.service
 
 ready=false
 for _ in $(seq 1 45); do
+  readiness=$(curl --silent --show-error http://127.0.0.1:9190/health/ready 2>/dev/null || true)
   if systemctl is-active --quiet morpho-v2-reallocator.service \
     && curl --fail --silent --show-error http://127.0.0.1:9190/health/live >/dev/null \
-    && curl --fail --silent --show-error http://127.0.0.1:9190/health/ready >/dev/null; then
+    && jq -e '
+      .ready == true
+      or (
+        .ready_for_shadow == true
+        and .ready_for_execute == false
+        and .reasons == ["pending_transaction"]
+      )
+    ' <<<"$readiness" >/dev/null 2>&1; then
     ready=true
     break
   fi
