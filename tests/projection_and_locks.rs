@@ -37,6 +37,7 @@ use morpho_v2_reallocator::{
             solve_top_k_capital_deployment, solve_top_k_rebalance,
         },
     },
+    runtime::planning_service::build_validated_top_k_plan,
     state::{
         attribution::{OrderedAssetFlow, OrderedTransactionFlow},
         caps::{adapter_cap_id, direct_position_cap_data},
@@ -906,10 +907,10 @@ fn utilization_solver_matches_exhaustive_tiny_domain() -> Result<(), Box<dyn Err
 }
 
 #[test]
-fn top_k_reallocation_remains_live_when_the_shared_adapter_cap_is_full()
+fn top_k_reallocation_remains_live_with_full_shared_cap_and_subminimum_funding()
 -> Result<(), Box<dyn Error>> {
     let (mut snapshot, mut vault, mut validated) = two_market_fixture()?;
-    vault.minimum_action_assets = U256::ONE;
+    vault.minimum_action_assets = U256::from(1_000_000_u64);
     vault.maximum_immediate_rebalance_loss_assets = U256::MAX;
     vault.minimum_liquidity_adapter_assets = U256::ZERO;
     vault.minimum_deposit_headroom_assets = U256::ZERO;
@@ -1069,6 +1070,26 @@ fn top_k_reallocation_remains_live_when_the_shared_adapter_cap_is_full()
         best.actions.get(1),
         Some(V2Action::Allocate { position, .. }) if *position == destination.position_key
     ));
+    let residual_funding = TopKDeployableCapital {
+        idle_assets: U256::ZERO,
+        liquidity_assets: U256::from(250_000_u64),
+        total_assets: U256::from(250_000_u64),
+    };
+    validated.app.vaults[0] = vault.clone();
+    let prepared = build_validated_top_k_plan(
+        &validated,
+        &vault,
+        &snapshot,
+        &projection,
+        &target,
+        residual_funding,
+        None,
+    )?
+    .ok_or_else(|| std::io::Error::other("sub-minimum funding suppressed the rebalance"))?;
+    assert_eq!(
+        prepared.plan.plan().reason,
+        morpho_v2_reallocator::domain::PlanReason::TopKApyRebalance
+    );
     Ok(())
 }
 

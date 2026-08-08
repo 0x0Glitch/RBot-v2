@@ -178,21 +178,38 @@ pub async fn refresh_top_k_plan(
         clear_plan(vault, api, runtime, None).await?;
         return Ok(None);
     };
-    if !funding.total_assets.is_zero()
-        && let Some(prepared) = build_validated_top_k_capital_plan(
-            config, vault, snapshot, projection, &target, funding, revision,
-        )?
-    {
-        return publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await;
-    }
-    let Some(prepared) = build_validated_top_k_rebalance_plan(
-        config, vault, snapshot, projection, &target, revision,
+    let Some(prepared) = build_validated_top_k_plan(
+        config, vault, snapshot, projection, &target, funding, revision,
     )?
     else {
         clear_plan(vault, api, runtime, None).await?;
         return Ok(None);
     };
     publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await
+}
+
+/// Rebuilds the highest-priority executable top-K plan from one exact observation.
+///
+/// Deployable capital has priority only when it can produce a complete validated action. A
+/// sub-minimum or otherwise unusable remainder must not suppress an independent market-to-market
+/// rebalance.
+pub fn build_validated_top_k_plan(
+    config: &ValidatedConfig,
+    vault: &ValidatedVaultConfig,
+    snapshot: &ExactVaultSnapshot,
+    projection: &ProjectedVaultView,
+    target: &TopKApyTarget,
+    funding: crate::planner::top_k_apy::TopKDeployableCapital,
+    revision: Option<&PlanningRevision>,
+) -> Result<Option<PreparedRatePlan>, PlanningServiceError> {
+    if !funding.total_assets.is_zero()
+        && let Some(prepared) = build_validated_top_k_capital_plan(
+            config, vault, snapshot, projection, target, funding, revision,
+        )?
+    {
+        return Ok(Some(prepared));
+    }
+    build_validated_top_k_rebalance_plan(config, vault, snapshot, projection, target, revision)
 }
 
 /// Rebuilds a top-K capital deployment against one frozen confirmed target.

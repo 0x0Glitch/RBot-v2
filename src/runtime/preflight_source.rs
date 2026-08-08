@@ -30,8 +30,7 @@ use crate::{
         planning_revision::DirtyAccumulator,
         planning_service::{
             build_validated_capital_plan, build_validated_liquidity_plan,
-            build_validated_rate_plan, build_validated_top_k_capital_plan,
-            build_validated_top_k_rebalance_plan,
+            build_validated_rate_plan, build_validated_top_k_plan,
         },
         state_service::{EventSourceRegistry, StateServiceError, replay_topology_through},
     },
@@ -359,21 +358,13 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                 .map_err(|_| PreflightSourceError::FatalAt("top_k_memory_load"))?;
             let funding = verified_deployable_capital(&snapshot, vault)
                 .map_err(|_| PreflightSourceError::FailedAt("top_k_funding"))?;
-            let additional = if published_reason == PlanReason::CapitalDeployment {
-                funding.total_assets
-            } else {
-                if !funding.total_assets.is_zero() {
-                    return Err(PreflightSourceError::ContextChanged);
-                }
-                U256::ZERO
-            };
             let observation = observe_top_k_target(
                 &snapshot,
                 expected,
                 vault,
                 &self.config.app.strategy.top_k_apy,
                 memory.as_ref(),
-                additional,
+                funding.total_assets,
             )
             .map_err(|_| PreflightSourceError::FailedAt("top_k_target"))?;
             self.storage
@@ -393,13 +384,13 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             PlanReason::LiquidityMaintenance => {
                 build_validated_liquidity_plan(&self.config, vault, &snapshot, expected, None)
             }
-            PlanReason::CapitalDeployment
+            PlanReason::CapitalDeployment | PlanReason::TopKApyRebalance
                 if vault.strategy == VaultStrategy::TopKApyDiversified =>
             {
                 let (target, funding) = top_k_preflight
                     .as_ref()
                     .ok_or(PreflightSourceError::FailedAt("top_k_target"))?;
-                build_validated_top_k_capital_plan(
+                let rebuilt = build_validated_top_k_plan(
                     &self.config,
                     vault,
                     &snapshot,
@@ -407,7 +398,14 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                     target,
                     *funding,
                     None,
-                )
+                );
+                if let Ok(Some(prepared)) = &rebuilt {
+                    require_unchanged_top_k_priority(
+                        published_reason,
+                        prepared.plan.plan().reason,
+                    )?;
+                }
+                rebuilt
             }
             PlanReason::CapitalDeployment => {
                 build_validated_capital_plan(&self.config, vault, &snapshot, expected, None)
@@ -421,17 +419,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                 None,
             ),
             PlanReason::TopKApyRebalance => {
-                let (target, _) = top_k_preflight
-                    .as_ref()
-                    .ok_or(PreflightSourceError::FailedAt("top_k_target"))?;
-                build_validated_top_k_rebalance_plan(
-                    &self.config,
-                    vault,
-                    &snapshot,
-                    expected,
-                    target,
-                    None,
-                )
+                return Err(PreflightSourceError::FailedAt("top_k_strategy"));
             }
             PlanReason::PositionSyncRequired => return Err(PreflightSourceError::Failed),
         }
@@ -506,6 +494,17 @@ fn top_k_preflight_required(strategy: VaultStrategy, reason: PlanReason) -> bool
             reason,
             PlanReason::CapitalDeployment | PlanReason::TopKApyRebalance
         )
+}
+
+fn require_unchanged_top_k_priority(
+    published_reason: PlanReason,
+    rebuilt_reason: PlanReason,
+) -> Result<(), PreflightSourceError> {
+    if rebuilt_reason == published_reason {
+        Ok(())
+    } else {
+        Err(PreflightSourceError::ContextChanged)
+    }
 }
 
 fn classify_identity_error(error: RuntimeIdentityError) -> PreflightSourceError {
@@ -647,7 +646,9 @@ fn validate_scenario(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_snapshot_error, top_k_preflight_required};
+    use super::{
+        classify_snapshot_error, require_unchanged_top_k_priority, top_k_preflight_required,
+    };
     use crate::{
         chain::{
             multicall::MulticallError,
@@ -696,5 +697,30 @@ mod tests {
             VaultStrategy::TopKApyDiversified,
             PlanReason::TopKApyRebalance,
         ));
+    }
+
+    #[test]
+    fn top_k_preflight_accepts_stable_priority_and_replans_on_priority_drift() {
+        assert_eq!(
+            require_unchanged_top_k_priority(
+                PlanReason::TopKApyRebalance,
+                PlanReason::TopKApyRebalance,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            require_unchanged_top_k_priority(
+                PlanReason::TopKApyRebalance,
+                PlanReason::CapitalDeployment,
+            ),
+            Err(PreflightSourceError::ContextChanged)
+        );
+        assert_eq!(
+            require_unchanged_top_k_priority(
+                PlanReason::CapitalDeployment,
+                PlanReason::TopKApyRebalance,
+            ),
+            Err(PreflightSourceError::ContextChanged)
+        );
     }
 }
