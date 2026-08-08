@@ -5,19 +5,27 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     path::PathBuf,
+    sync::Arc,
 };
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, I256, IntoLogData, U256};
+use async_trait::async_trait;
 use morpho_v2_reallocator::{
-    chain::logs::FlowOrigin,
+    api::{ApiDataStore, ApiStatePublication, dto::RateSnapshotView},
+    chain::{
+        logs::FlowOrigin,
+        multicall::AtomicSnapshotProvider,
+        provider::{ProviderError, RpcTransaction, TransactionLookupProvider},
+    },
     config::{AppConfig, LiquidityAdapterKind, StrategyObjective, ValidatedLiquidityAdapterConfig},
+    contracts::bindings::IERC20,
     domain::{
         AdapterAddress, Assets, BlockHashBinding, BlockRef, CapId, CapRef, CapState,
         DirectAdapterState, DirectMarketPositionState, ExactVaultSnapshot, IdleLockLedgerSnapshot,
-        MarketId, ParentVaultState, RateObjectiveBranch, RequestedAssets, StateContext,
-        StoredMarketState, TokenAddress, V2Action, VaultAddress, VaultCapabilities,
-        VaultV1LiquidityAdapterState, derive_liquidity_position_key, derive_market_id,
-        derive_position_key, encode_adapter_data,
+        MarketId, ParentVaultState, PlanId, PlanProjection, PlanReason, RateObjectiveBranch,
+        RequestedAssets, SolverCertificate, StateContext, StoredMarketState, TokenAddress,
+        V2Action, V2Plan, VaultAddress, VaultCapabilities, VaultV1LiquidityAdapterState,
+        derive_liquidity_position_key, derive_market_id, derive_position_key, encode_adapter_data,
     },
     planner::{
         candidates::build_candidate_lattice,
@@ -37,7 +45,11 @@ use morpho_v2_reallocator::{
             solve_top_k_capital_deployment, solve_top_k_rebalance,
         },
     },
-    runtime::planning_service::build_validated_top_k_plan,
+    protocol_lock::ProtocolLock,
+    runtime::{
+        current_state_source::LiveCurrentStateSource, identity::RuntimeIdentities,
+        planning_service::build_validated_top_k_plan,
+    },
     state::{
         attribution::{OrderedAssetFlow, OrderedTransactionFlow},
         caps::{adapter_cap_id, direct_position_cap_data},
@@ -46,12 +58,98 @@ use morpho_v2_reallocator::{
             ProjectionError, ProjectionFreshness, RefreshReason, project_snapshot_to_head,
             refresh_reasons,
         },
+        snapshot::hash_exact_snapshot,
+        topology::TopologyIndex,
     },
+    storage::{actor::StorageService, models::CanonicalBlockRecord},
 };
+
+#[derive(Clone, Copy, Debug)]
+struct UnusedRecoveryProvider;
+
+#[async_trait]
+impl AtomicSnapshotProvider for UnusedRecoveryProvider {
+    async fn latest_header(&self) -> Result<BlockRef, ProviderError> {
+        Err(ProviderError::MissingBlock)
+    }
+
+    async fn call_latest(&self, _target: Address, _data: &Bytes) -> Result<Bytes, ProviderError> {
+        Err(ProviderError::MissingBlock)
+    }
+
+    async fn call_at_block(
+        &self,
+        _target: Address,
+        _data: &Bytes,
+        _block: BlockRef,
+    ) -> Result<Bytes, ProviderError> {
+        Err(ProviderError::MissingBlock)
+    }
+
+    async fn code_at(&self, _target: Address) -> Result<Bytes, ProviderError> {
+        Err(ProviderError::MissingBlock)
+    }
+
+    async fn code_at_block(
+        &self,
+        _target: Address,
+        _block: BlockRef,
+    ) -> Result<Bytes, ProviderError> {
+        Err(ProviderError::MissingBlock)
+    }
+}
+
+#[async_trait]
+impl TransactionLookupProvider for UnusedRecoveryProvider {
+    async fn transaction_by_hash(
+        &self,
+        _hash: B256,
+    ) -> Result<Option<RpcTransaction>, ProviderError> {
+        Err(ProviderError::MissingBlock)
+    }
+
+    async fn transaction_by_sender_nonce_in_block(
+        &self,
+        _signer: Address,
+        _nonce: u64,
+        _block: BlockRef,
+    ) -> Result<Option<RpcTransaction>, ProviderError> {
+        Err(ProviderError::MissingBlock)
+    }
+}
 
 fn config() -> Result<morpho_v2_reallocator::config::ValidatedConfig, Box<dyn Error>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
     Ok(AppConfig::load(&path)?.validate()?)
+}
+
+fn recovery_identities() -> Result<RuntimeIdentities, Box<dyn Error>> {
+    let identity_config =
+        AppConfig::load(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.hyperevm.json"))?
+            .validate()?;
+    let protocol_lock = ProtocolLock::load(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("protocol-lock.hyperevm.toml"),
+    )?
+    .validate()?;
+    Ok(RuntimeIdentities::from_config(
+        &identity_config,
+        &protocol_lock,
+    )?)
+}
+
+fn recovery_topology(
+    snapshot: &ExactVaultSnapshot,
+    vault: &morpho_v2_reallocator::config::ValidatedVaultConfig,
+) -> TopologyIndex {
+    TopologyIndex::new(
+        vault.address,
+        vault.deployment_block,
+        snapshot.adapters.keys().copied(),
+        snapshot
+            .positions
+            .values()
+            .map(|position| (position.adapter, position.market_id, position.position_key)),
+    )
 }
 
 fn projection_fixture() -> Result<
@@ -270,6 +368,411 @@ fn projection_restarts_from_exact_snapshot_and_computes_service_constraints()
     assert_eq!(
         project_snapshot_to_head(&snapshot, stale, &config),
         Err(ProjectionError::IncompatibleHead)
+    );
+    Ok(())
+}
+
+fn api_rate_view(
+    snapshot: &ExactVaultSnapshot,
+    vault: &morpho_v2_reallocator::config::ValidatedVaultConfig,
+) -> RateSnapshotView {
+    api_rate_view_at(snapshot, vault, snapshot.context.block)
+}
+
+fn api_rate_view_at(
+    snapshot: &ExactVaultSnapshot,
+    vault: &morpho_v2_reallocator::config::ValidatedVaultConfig,
+    block: BlockRef,
+) -> RateSnapshotView {
+    RateSnapshotView {
+        vault: vault.address,
+        snapshot_hash: snapshot.snapshot_hash,
+        block,
+        spread_rate_per_second_wad: U256::ZERO,
+        spread_apr_bps: 0,
+        utilization_spread_wad: U256::ZERO,
+        utilization_spread_bps: 0,
+        selected_objective: StrategyObjective::SpotBorrowRateSpread,
+        vault_strategy: vault.strategy,
+        selected_objective_spread_wad: U256::ZERO,
+        markets: Vec::new(),
+    }
+}
+
+fn api_publication(
+    snapshot: &ExactVaultSnapshot,
+    vault: &morpho_v2_reallocator::config::ValidatedVaultConfig,
+) -> Result<ApiStatePublication, std::io::Error> {
+    ApiStatePublication::from_validated_projection(
+        snapshot.clone(),
+        api_rate_view(snapshot, vault),
+        snapshot.context.block,
+    )
+    .ok_or_else(|| std::io::Error::other("valid API publication rejected"))
+}
+
+fn api_plan(snapshot: &ExactVaultSnapshot, generation: u64, id: u8) -> V2Plan {
+    V2Plan {
+        plan_id: PlanId(B256::repeat_byte(id)),
+        reason: PlanReason::CapitalDeployment,
+        vault: VaultAddress(snapshot.parent.vault),
+        snapshot: snapshot.context.clone(),
+        config_revision: snapshot.context.static_config_revision,
+        topology_revision: snapshot.context.dynamic_topology_revision,
+        read_set_revision: 0,
+        latest_relevant_event_block: snapshot.context.block.number,
+        planner_generation: generation,
+        actions: Vec::new(),
+        projection: PlanProjection {
+            movement_assets: U256::ZERO,
+            before_spread: U256::ZERO,
+            after_spread: U256::ZERO,
+            immediate_loss_assets: U256::ZERO,
+            terminal_value_delta_assets: I256::ZERO,
+            expected_gain_assets: U256::ZERO,
+        },
+        solver_certificate: SolverCertificate {
+            candidate_lattice_hash: B256::repeat_byte(0x55),
+            nodes_evaluated: 0,
+            node_limit: 1,
+            search_complete_for_lattice: true,
+            rate_episode_id: None,
+            objective_branch: None,
+            target_reachable: true,
+            target_reached: true,
+        },
+        episode_id: None,
+        plan_hash: B256::repeat_byte(id.saturating_add(1)),
+    }
+}
+
+#[tokio::test]
+async fn api_artifacts_are_atomic_monotonic_and_plan_cas_guarded() -> Result<(), Box<dyn Error>> {
+    let (snapshot, vault) = projection_fixture()?;
+    let api = ApiDataStore::default();
+    let epoch = api
+        .state_epoch(snapshot.context.chain_id, vault.address)
+        .await
+        .ok_or_else(|| std::io::Error::other("API state epoch unavailable"))?;
+    assert!(
+        api.record_state(epoch, api_publication(&snapshot, &vault)?)
+            .await
+    );
+    let current_plan = api_plan(&snapshot, 2, 0x61);
+    assert!(api.record_plan(current_plan.clone()).await);
+    assert!(!api.record_plan(api_plan(&snapshot, 2, 0x62)).await);
+    assert!(!api.record_plan(api_plan(&snapshot, 1, 0x62)).await);
+    assert!(!api.clear_plan_through(vault.address, 100, 1).await);
+    assert!(api.plan(vault.address).await.is_some());
+    assert!(!api.clear_plan_if(vault.address, PlanId(B256::ZERO)).await);
+    assert!(api.clear_plan_if(vault.address, current_plan.plan_id).await);
+
+    let mut newer = snapshot.clone();
+    newer.context.block.number = 101;
+    newer.context.block.hash = B256::repeat_byte(0x11);
+    newer.snapshot_hash = B256::repeat_byte(0x91);
+    assert!(
+        api.record_state(epoch, api_publication(&newer, &vault)?)
+            .await
+    );
+    assert!(api.record_plan(api_plan(&newer, 3, 0x63)).await);
+    assert!(
+        !api.record_state(epoch, api_publication(&snapshot, &vault)?)
+            .await
+    );
+    assert_eq!(
+        api.snapshot(vault.address)
+            .await
+            .map(|item| item.snapshot_hash),
+        Some(newer.snapshot_hash)
+    );
+    let mut mismatched_rates = api_rate_view(&newer, &vault);
+    mismatched_rates.snapshot_hash = B256::repeat_byte(0xff);
+    let mismatched_publication = ApiStatePublication::from_validated_projection(
+        newer.clone(),
+        mismatched_rates,
+        newer.context.block,
+    )
+    .ok_or_else(|| std::io::Error::other("mismatched test publication rejected too early"))?;
+    assert!(!api.record_state(epoch, mismatched_publication).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn api_accepts_validated_later_projection_and_rejects_stale_or_mismatched_views()
+-> Result<(), Box<dyn Error>> {
+    let (snapshot, vault) = projection_fixture()?;
+    let api = ApiDataStore::default();
+    let epoch = api
+        .state_epoch(snapshot.context.chain_id, vault.address)
+        .await
+        .ok_or_else(|| std::io::Error::other("API state epoch unavailable"))?;
+    let projected_head = BlockRef {
+        number: snapshot.context.block.number.saturating_add(5),
+        hash: B256::repeat_byte(0xa5),
+        parent_hash: B256::repeat_byte(0xa4),
+        timestamp: snapshot.context.block.timestamp.saturating_add(5),
+        gas_limit: snapshot.context.block.gas_limit,
+    };
+    let publication = ApiStatePublication::from_validated_projection(
+        snapshot.clone(),
+        api_rate_view_at(&snapshot, &vault, projected_head),
+        projected_head,
+    )
+    .ok_or_else(|| std::io::Error::other("later projection publication rejected"))?;
+    assert!(api.record_state(epoch, publication).await);
+    assert_eq!(
+        api.snapshot(vault.address)
+            .await
+            .map(|item| item.context.block),
+        Some(snapshot.context.block)
+    );
+    assert_eq!(
+        api.rates(vault.address).await.map(|item| item.block),
+        Some(projected_head)
+    );
+    let (atomic_snapshot, atomic_rates, atomic_projection) = api
+        .validated_state(vault.address)
+        .await
+        .ok_or_else(|| std::io::Error::other("atomic API state unavailable"))?
+        .into_parts();
+    assert_eq!(atomic_snapshot.context.block, snapshot.context.block);
+    assert_eq!(atomic_rates.snapshot_hash, atomic_snapshot.snapshot_hash);
+    assert_eq!(atomic_rates.block, projected_head);
+    assert_eq!(atomic_projection, projected_head);
+
+    let stale_head = BlockRef {
+        number: projected_head.number.saturating_sub(1),
+        hash: B256::repeat_byte(0x94),
+        parent_hash: B256::repeat_byte(0x93),
+        timestamp: projected_head.timestamp.saturating_sub(1),
+        gas_limit: projected_head.gas_limit,
+    };
+    let stale = ApiStatePublication::from_validated_projection(
+        snapshot.clone(),
+        api_rate_view_at(&snapshot, &vault, stale_head),
+        stale_head,
+    )
+    .ok_or_else(|| std::io::Error::other("stale test publication rejected too early"))?;
+    assert!(!api.record_state(epoch, stale).await);
+    assert!(
+        ApiStatePublication::from_validated_projection(
+            snapshot.clone(),
+            api_rate_view_at(&snapshot, &vault, projected_head),
+            stale_head,
+        )
+        .is_none()
+    );
+    assert_eq!(
+        api.rates(vault.address).await.map(|item| item.block),
+        Some(projected_head)
+    );
+    let (_, current_rates, current_projection) = api
+        .validated_state(vault.address)
+        .await
+        .ok_or_else(|| std::io::Error::other("valid publication was torn"))?
+        .into_parts();
+    assert_eq!(current_rates.snapshot_hash, snapshot.snapshot_hash);
+    assert_eq!(current_projection, projected_head);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_recovery_projects_a_validated_lagged_api_pair_to_the_current_cursor()
+-> Result<(), Box<dyn Error>> {
+    let (mut snapshot, vault) = projection_fixture()?;
+    let mut validated = config()?;
+    let mut unrelated_vault = vault.clone();
+    unrelated_vault.name = "same-asset-unrelated-vault".to_owned();
+    unrelated_vault.address = VaultAddress(Address::repeat_byte(0xb2));
+    validated.app.vaults.push(unrelated_vault.clone());
+    let config = Arc::new(validated);
+    snapshot.parent.adapter_registry = Address::ZERO;
+    let topology = recovery_topology(&snapshot, &vault);
+    snapshot.context.dynamic_topology_revision = topology.revision()?;
+    snapshot.snapshot_hash = hash_exact_snapshot(&snapshot)?;
+
+    let projection_head = BlockRef {
+        number: snapshot.context.block.number.saturating_add(1),
+        hash: B256::repeat_byte(0x11),
+        parent_hash: snapshot.context.block.hash,
+        timestamp: snapshot.context.block.timestamp.saturating_add(1),
+        gas_limit: snapshot.context.block.gas_limit,
+    };
+    let cursor = BlockRef {
+        number: projection_head.number.saturating_add(1),
+        hash: B256::repeat_byte(0x12),
+        parent_hash: projection_head.hash,
+        timestamp: projection_head.timestamp.saturating_add(1),
+        gas_limit: projection_head.gas_limit,
+    };
+
+    let temporary = tempfile::tempdir()?;
+    let service = StorageService::start(&temporary.path().join("state.json"), 32, 1)?;
+    let storage = service.handle();
+    for block in [snapshot.context.block, projection_head] {
+        storage
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: config.app.chain.chain_id,
+                    block,
+                },
+                Vec::new(),
+                block.timestamp,
+            )
+            .await?;
+    }
+    let transfer = IERC20::Transfer {
+        from: Address::repeat_byte(0x71),
+        to: unrelated_vault.address.0,
+        value: U256::ONE,
+    }
+    .to_log_data();
+    let mut topics = [None; 4];
+    for (slot, topic) in topics.iter_mut().zip(transfer.topics()) {
+        *slot = Some(*topic);
+    }
+    storage
+        .apply_canonical_block(
+            CanonicalBlockRecord {
+                chain_id: config.app.chain.chain_id,
+                block: cursor,
+            },
+            vec![morpho_v2_reallocator::storage::models::CanonicalLogRecord {
+                chain_id: config.app.chain.chain_id,
+                block_number: cursor.number,
+                block_hash: cursor.hash,
+                transaction_hash: B256::repeat_byte(0x72),
+                transaction_index: 0,
+                log_index: 0,
+                address: vault.asset.0,
+                topics,
+                data: transfer.data,
+            }],
+            cursor.timestamp,
+        )
+        .await?;
+    storage.persist_topology(topology, projection_head).await?;
+
+    let api = ApiDataStore::default();
+    let epoch = api
+        .state_epoch(config.app.chain.chain_id, vault.address)
+        .await
+        .ok_or_else(|| std::io::Error::other("API state epoch unavailable"))?;
+    let publication = ApiStatePublication::from_validated_projection(
+        snapshot.clone(),
+        api_rate_view_at(&snapshot, &vault, projection_head),
+        projection_head,
+    )
+    .ok_or_else(|| std::io::Error::other("lagged publication rejected"))?;
+    assert!(api.record_state(epoch, publication).await);
+
+    let source = LiveCurrentStateSource::new(
+        Arc::clone(&config),
+        vault.address,
+        recovery_identities()?,
+        Arc::new(UnusedRecoveryProvider),
+        storage,
+        api,
+    );
+    let assessment = source.rebuild_latest_for_replan().await?;
+    assert_eq!(assessment.snapshot.context.block, snapshot.context.block);
+    assert_eq!(assessment.projection.head, cursor);
+    drop(source);
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_recovery_accepts_only_an_exact_cursor_durable_fallback()
+-> Result<(), Box<dyn Error>> {
+    let (mut snapshot, vault) = projection_fixture()?;
+    let config = Arc::new(config()?);
+    snapshot.parent.adapter_registry = Address::ZERO;
+    snapshot.snapshot_hash = hash_exact_snapshot(&snapshot)?;
+
+    let temporary = tempfile::tempdir()?;
+    let service = StorageService::start(&temporary.path().join("state.json"), 32, 1)?;
+    let storage = service.handle();
+    storage
+        .apply_canonical_block(
+            CanonicalBlockRecord {
+                chain_id: config.app.chain.chain_id,
+                block: snapshot.context.block,
+            },
+            Vec::new(),
+            snapshot.context.block.timestamp,
+        )
+        .await?;
+    storage
+        .persist_snapshot(snapshot.clone(), snapshot.context.block.timestamp)
+        .await?;
+
+    let source = LiveCurrentStateSource::new(
+        Arc::clone(&config),
+        vault.address,
+        recovery_identities()?,
+        Arc::new(UnusedRecoveryProvider),
+        storage,
+        ApiDataStore::default(),
+    );
+    let assessment = source.rebuild_latest_for_replan().await?;
+    assert_eq!(assessment.snapshot.context.block, snapshot.context.block);
+    assert_eq!(assessment.projection.head, snapshot.context.block);
+    drop(source);
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn api_reorg_epoch_accepts_lower_canonical_state_and_fences_old_writers()
+-> Result<(), Box<dyn Error>> {
+    let (mut orphaned, vault) = projection_fixture()?;
+    orphaned.context.block.number = 105;
+    orphaned.context.block.hash = B256::repeat_byte(0xa5);
+    orphaned.snapshot_hash = B256::repeat_byte(0xb5);
+    let api = ApiDataStore::default();
+    let old_epoch = api
+        .state_epoch(orphaned.context.chain_id, vault.address)
+        .await
+        .ok_or_else(|| std::io::Error::other("initial API state epoch unavailable"))?;
+    assert!(
+        api.record_state(old_epoch, api_publication(&orphaned, &vault)?)
+            .await
+    );
+    assert!(api.record_plan(api_plan(&orphaned, 1, 0x71)).await);
+
+    let new_epoch = api
+        .rewind_vault(orphaned.context.chain_id, vault.address)
+        .await
+        .ok_or_else(|| std::io::Error::other("API state epoch rewind failed"))?;
+    assert_ne!(new_epoch, old_epoch);
+    assert!(api.snapshot(vault.address).await.is_none());
+    assert!(api.rates(vault.address).await.is_none());
+    assert!(api.plan(vault.address).await.is_none());
+
+    let mut replacement = orphaned.clone();
+    replacement.context.block.number = 101;
+    replacement.context.block.hash = B256::repeat_byte(0xc1);
+    replacement.snapshot_hash = B256::repeat_byte(0xd1);
+    assert!(
+        api.record_state(new_epoch, api_publication(&replacement, &vault)?)
+            .await
+    );
+
+    let mut delayed_orphan = orphaned;
+    delayed_orphan.context.block.number = 106;
+    delayed_orphan.context.block.hash = B256::repeat_byte(0xa6);
+    delayed_orphan.snapshot_hash = B256::repeat_byte(0xb6);
+    assert!(
+        !api.record_state(old_epoch, api_publication(&delayed_orphan, &vault)?)
+            .await
+    );
+    assert_eq!(
+        api.snapshot(vault.address)
+            .await
+            .map(|snapshot| snapshot.snapshot_hash),
+        Some(replacement.snapshot_hash)
     );
     Ok(())
 }

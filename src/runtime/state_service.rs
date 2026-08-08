@@ -11,7 +11,7 @@ use tokio::sync::watch;
 
 use crate::{
     api::{
-        ApiDataStore,
+        ApiDataStore, ApiStateEpoch, ApiStatePublication,
         dto::{MarketRateView, RateSnapshotView},
     },
     chain::{
@@ -95,6 +95,9 @@ pub enum StateServiceError {
     /// A canonical update does not extend the locally replayed cursor.
     #[error("state update is not the next canonical block")]
     NonCanonicalUpdate,
+    /// The API cache could not establish or advance this chain/vault's canonical branch epoch.
+    #[error("API canonical-state epoch is unavailable")]
+    ApiStateEpochUnavailable,
     /// A latest-state snapshot was captured ahead of canonical event replay.
     #[error("latest snapshot is waiting for canonical event replay")]
     SnapshotAwaitingCanonicalReplay,
@@ -262,6 +265,7 @@ pub struct CanonicalStateService<P> {
     last_exact_head: Option<BlockRef>,
     last_strategy_tick_timestamp: Option<u64>,
     pending_latest_snapshots: BTreeMap<VaultAddress, ExactVaultSnapshot>,
+    api_state_epochs: BTreeMap<VaultAddress, ApiStateEpoch>,
     consecutive_snapshot_provider_failures: u32,
     dirty: DirtyAccumulator,
     planning_work: PlanningWorkSet,
@@ -301,6 +305,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
             last_exact_head: None,
             last_strategy_tick_timestamp: None,
             pending_latest_snapshots: BTreeMap::new(),
+            api_state_epochs: BTreeMap::new(),
             consecutive_snapshot_provider_failures: 0,
             dirty,
             planning_work: PlanningWorkSet::default(),
@@ -395,12 +400,10 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                     self.config.app.strategy.top_k_apy.tick_interval_seconds,
                 ) {
                     self.dirty.mark_strategy_tick(&self.config, head.number);
-                    for vault in self.dirty.dirty_vaults() {
-                        self.planning_work.vaults.remove(&vault);
-                    }
-                    if let Some(sender) = &self.planning_triggers {
-                        sender.send_replace(self.planning_work.clone());
-                    }
+                    self.supersede_dirty_plans(
+                        "a canonical strategy evaluation requires exact refresh",
+                    )
+                    .await?;
                     self.last_strategy_tick_timestamp = Some(head.timestamp);
                     self.metrics.increment(OperationalCounter::StrategyTicks);
                     tracing::info!(
@@ -449,6 +452,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 common_ancestor, ..
             } => {
                 self.mark_catching_up().await?;
+                self.rewind_api_state().await?;
                 self.vaults.clear();
                 self.last_exact_head = None;
                 self.last_strategy_tick_timestamp = None;
@@ -665,7 +669,9 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         let dirty_vaults = self.dirty.dirty_vaults().collect::<Vec<_>>();
         for vault in dirty_vaults {
             self.planning_work.vaults.remove(&vault);
-            self.api.clear_plan(vault).await;
+            if let Some(plan) = self.api.plan(vault).await {
+                self.api.clear_plan_if(vault, plan.plan_id).await;
+            }
             self.runtime
                 .update(vault, |status| {
                     status.record_planning(None, status.episode_id)?;
@@ -697,6 +703,29 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
     ) -> Result<bool, StateServiceError> {
         let snapshot_block = candidate.context.block;
         if snapshot_block.number > replay_head.number {
+            return Ok(false);
+        }
+        let candidate_vault = VaultAddress(candidate.parent.vault);
+        let Some(configured_vault) = self
+            .config
+            .app
+            .vaults
+            .iter()
+            .find(|vault| vault.address == candidate_vault)
+        else {
+            return Ok(false);
+        };
+        if topology.vault != candidate_vault
+            || candidate.context.chain_id != self.config.app.chain.chain_id
+            || candidate.context.static_config_revision != self.config.revision
+            || candidate.parent.asset != configured_vault.asset.0
+        {
+            tracing::debug!(
+                vault = %candidate.parent.vault,
+                snapshot_block = snapshot_block.number,
+                replay_head = replay_head.number,
+                "reported latest candidate rejected because its static read-set identity changed"
+            );
             return Ok(false);
         }
         let mut exact_topology = topology.clone();
@@ -756,15 +785,18 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 replay_head.number,
             )
             .await?;
-        if !intervening_logs.is_empty() {
+        let relevant_intervening_logs =
+            canonical_logs_affect_candidate(&self.sources, candidate, topology, &intervening_logs)?;
+        if relevant_intervening_logs {
             tracing::debug!(
+                vault = %candidate.parent.vault,
                 snapshot_block = snapshot_block.number,
                 replay_head = replay_head.number,
                 intervening_logs = intervening_logs.len(),
                 "reported latest candidate rejected by a newer relevant event"
             );
         }
-        Ok(intervening_logs.is_empty())
+        Ok(!relevant_intervening_logs)
     }
 
     async fn refresh_exact_at_head(&mut self, head: BlockRef) -> Result<(), StateServiceError> {
@@ -784,6 +816,10 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                 .get(&vault.address)
                 .map(|state| (state.topology.clone(), state.idle_ledger.clone()))
                 .ok_or(StateServiceError::NonCanonicalUpdate)?;
+            // Capture branch ownership before any asynchronous exact-state work. If a reorg reset
+            // advances the API epoch while this refresh is in flight, its eventual publication is
+            // rejected instead of restoring orphaned-branch state.
+            let state_epoch = self.api_state_epoch(vault.address).await?;
             let previous_snapshot = self.api.snapshot(vault.address).await;
             if !self.dirty.is_vault_dirty(vault.address)
                 && let Some(previous) = previous_snapshot.as_ref()
@@ -898,10 +934,9 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                             .insert(vault.address, candidate);
                         return Err(StateServiceError::SnapshotAwaitingCanonicalReplay);
                     }
-                    if candidate.context.block != head
-                        || !self
-                            .reported_candidate_is_current(&candidate, &topology, head)
-                            .await?
+                    if !self
+                        .reported_candidate_is_current(&candidate, &topology, head)
+                        .await?
                     {
                         return Err(StateServiceError::SnapshotAwaitingCanonicalReplay);
                     }
@@ -1086,8 +1121,30 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                     })
                     .collect(),
             };
-            self.api.record_snapshot(snapshot.clone()).await;
-            self.api.record_rates(rate_snapshot.clone()).await;
+            if !self
+                .api
+                .record_state(
+                    state_epoch,
+                    ApiStatePublication::from_validated_projection(
+                        snapshot.clone(),
+                        rate_snapshot.clone(),
+                        projection.head,
+                    )
+                    .ok_or(StateServiceError::NonCanonicalUpdate)?,
+                )
+                .await
+            {
+                // A restarted or superseded state owner may finish after a newer canonical
+                // generation already owns the API cache. Keep Execute unready and let canonical
+                // replay drive the next refresh instead of publishing this stale projection.
+                all_exact_ready = false;
+                tracing::debug!(
+                    vault = %vault.address.0,
+                    snapshot_block = snapshot.context.block.number,
+                    "state publication was superseded by a newer exact snapshot"
+                );
+                continue;
+            }
             self.metrics.record_rate_snapshot(&rate_snapshot);
             let pending_transaction = self.storage.load_unresolved(vault.signer_address).await?;
             let calculated_state = desired_runtime_state(
@@ -1142,6 +1199,7 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                     self.config.revision,
                     snapshot.context.block,
                     snapshot.snapshot_hash,
+                    projection.head,
                 ) {
                     self.planning_work.vaults.insert(vault.address, revision);
                     if let Some(sender) = &self.planning_triggers {
@@ -1149,7 +1207,9 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
                     }
                 }
             } else {
-                self.api.clear_plan(vault.address).await;
+                self.api
+                    .clear_plan_through(vault.address, head.number, u64::MAX)
+                    .await;
                 self.runtime
                     .update(vault.address, |status| status.record_planning(None, None))
                     .await?;
@@ -1171,6 +1231,35 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         self.publish_readiness(true, all_exact_ready).await
     }
 
+    async fn api_state_epoch(
+        &mut self,
+        vault: VaultAddress,
+    ) -> Result<ApiStateEpoch, StateServiceError> {
+        if let Some(epoch) = self.api_state_epochs.get(&vault).copied() {
+            return Ok(epoch);
+        }
+        let epoch = self
+            .api
+            .state_epoch(self.config.app.chain.chain_id, vault)
+            .await
+            .ok_or(StateServiceError::ApiStateEpochUnavailable)?;
+        self.api_state_epochs.insert(vault, epoch);
+        Ok(epoch)
+    }
+
+    async fn rewind_api_state(&mut self) -> Result<(), StateServiceError> {
+        let chain_id = self.config.app.chain.chain_id;
+        for vault in &self.config.app.vaults {
+            let epoch = self
+                .api
+                .rewind_vault(chain_id, vault.address)
+                .await
+                .ok_or(StateServiceError::ApiStateEpochUnavailable)?;
+            self.api_state_epochs.insert(vault.address, epoch);
+        }
+        Ok(())
+    }
+
     async fn record_vault_refresh_failure(
         &mut self,
         vault: VaultAddress,
@@ -1189,7 +1278,9 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> CanonicalStateServic
         });
         self.pending_latest_snapshots.remove(&vault);
         self.planning_work.vaults.remove(&vault);
-        self.api.clear_plan(vault).await;
+        self.api
+            .clear_plan_through(vault, head.number, u64::MAX)
+            .await;
         self.runtime
             .update(vault, |status| {
                 status.canonical_head = Some(head);
@@ -1529,6 +1620,137 @@ fn merge_canonical_invalidations(
         }
     }
     Ok(())
+}
+
+/// Returns whether one already-persisted canonical log changes the complete exact read set or
+/// authoritative state of a reported-latest candidate.
+///
+/// Canonical ingestion retains the ordered raw log for replay and audit independently of this
+/// predicate. This is only the vault-local projection gate: a log belonging exclusively to a
+/// different vault must not make a valid candidate stale, while shared market, Morpho-liquidity,
+/// adapter, token-account, and topology changes remain fail-closed.
+pub(crate) fn canonical_log_affects_candidate(
+    sources: &EventSourceRegistry,
+    candidate: &ExactVaultSnapshot,
+    topology: &TopologyIndex,
+    log: &CanonicalLogRecord,
+) -> Result<bool, StateServiceError> {
+    let Some(source) = sources.source(log.address) else {
+        return Ok(false);
+    };
+    let raw = RawEventLog {
+        address: log.address,
+        topics: log.topics.into_iter().flatten().collect(),
+        data: log.data.clone(),
+    };
+    let Some(decoded) = decode_watched_event(source, &raw)? else {
+        return Ok(false);
+    };
+    let candidate_vault = VaultAddress(candidate.parent.vault);
+    let affects = match (&decoded.source, &decoded.event) {
+        (EventSource::Vault(vault), ProtocolEvent::Vault(_)) => *vault == candidate_vault,
+        (EventSource::Adapter(adapter), ProtocolEvent::Adapter(_)) => {
+            candidate_reads_adapter(candidate, topology, *adapter)
+        }
+        (EventSource::Morpho(_), ProtocolEvent::Morpho(_))
+        | (EventSource::AdaptiveCurveIrm(_), ProtocolEvent::AdaptiveCurveIrm(_)) => {
+            decoded.invalidations.iter().any(|invalidation| {
+                matches!(
+                    invalidation,
+                    StateInvalidation::MarketState(market)
+                        if candidate_reads_market(candidate, topology, *market)
+                )
+            })
+        }
+        (
+            EventSource::Token(token),
+            ProtocolEvent::Token(IERC20::IERC20Events::Transfer(event)),
+        ) => {
+            token.0 == candidate.parent.asset
+                && (candidate_reads_token_account(candidate, topology, event.from)
+                    || candidate_reads_token_account(candidate, topology, event.to))
+        }
+        _ => false,
+    };
+    Ok(affects)
+}
+
+/// Returns whether any ordered canonical log changes one candidate's exact read set or state.
+///
+/// State publication, final preflight, and terminal recovery share this exact predicate so a
+/// same-token event for an unrelated configured vault cannot be classified differently at those
+/// three liveness boundaries.
+pub(crate) fn canonical_logs_affect_candidate(
+    sources: &EventSourceRegistry,
+    candidate: &ExactVaultSnapshot,
+    topology: &TopologyIndex,
+    logs: &[CanonicalLogRecord],
+) -> Result<bool, StateServiceError> {
+    for log in logs {
+        if canonical_log_affects_candidate(sources, candidate, topology, log)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn candidate_reads_adapter(
+    candidate: &ExactVaultSnapshot,
+    topology: &TopologyIndex,
+    adapter: crate::domain::AdapterAddress,
+) -> bool {
+    topology.adapters.contains_key(&adapter)
+        || candidate.adapters.contains_key(&adapter)
+        || candidate
+            .liquidity_adapter
+            .as_ref()
+            .is_some_and(|liquidity| liquidity.adapter == adapter)
+}
+
+fn candidate_reads_market(
+    candidate: &ExactVaultSnapshot,
+    topology: &TopologyIndex,
+    market: MarketId,
+) -> bool {
+    candidate.markets.contains_key(&market)
+        || candidate
+            .positions
+            .values()
+            .any(|position| position.market_id == market)
+        || candidate
+            .liquidity_adapter
+            .as_ref()
+            .is_some_and(|liquidity| liquidity.idle_market_id == market)
+        || topology
+            .configured_positions
+            .values()
+            .any(|position| position.market_id == market)
+        || topology.adapters.values().any(|adapter| {
+            adapter.historical_market_ids.contains(&market)
+                || adapter.current_market_ids.contains(&market)
+                || adapter.sync_required_market_ids.contains(&market)
+        })
+}
+
+fn candidate_reads_token_account(
+    candidate: &ExactVaultSnapshot,
+    topology: &TopologyIndex,
+    account: Address,
+) -> bool {
+    account == candidate.parent.vault
+        || topology
+            .adapters
+            .contains_key(&crate::domain::AdapterAddress(account))
+        || candidate
+            .adapters
+            .values()
+            .any(|adapter| adapter.adapter.0 == account || adapter.morpho == account)
+        || candidate
+            .liquidity_adapter
+            .as_ref()
+            .is_some_and(|liquidity| {
+                liquidity.adapter.0 == account || liquidity.morpho_vault_v1 == account
+            })
 }
 
 /// Finds a sole borrower-side economic event across an exact snapshot interval. Multiple relevant
@@ -2065,15 +2287,577 @@ fn unverified_idle_ledger_snapshot(exact_idle_assets: U256) -> IdleLockLedgerSna
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{error::Error, path::PathBuf, sync::Arc};
 
-    use alloy::primitives::IntoLogData;
+    use alloy::primitives::{Bytes, IntoLogData};
+    use tempfile::TempDir;
 
     use super::*;
     use crate::{
+        chain::provider::{ProviderError, RpcTransaction},
         config::AppConfig,
-        domain::{Assets, RateGroupId},
+        contracts::bindings::IVaultV2,
+        domain::{
+            Assets, BlockHashBinding, ParentVaultState, RateGroupId, StateContext,
+            VaultCapabilities,
+        },
+        protocol_lock::ProtocolLock,
+        storage::{actor::StorageService, models::CanonicalBlockRecord},
     };
+
+    #[derive(Clone, Copy, Debug)]
+    struct UnusedProvider;
+
+    #[async_trait::async_trait]
+    impl AtomicSnapshotProvider for UnusedProvider {
+        async fn latest_header(&self) -> Result<BlockRef, ProviderError> {
+            Err(ProviderError::MethodUnsupported {
+                method: "test provider latest header",
+            })
+        }
+
+        async fn call_latest(
+            &self,
+            _target: Address,
+            _data: &Bytes,
+        ) -> Result<Bytes, ProviderError> {
+            Err(ProviderError::MethodUnsupported {
+                method: "test provider latest call",
+            })
+        }
+
+        async fn call_at_block(
+            &self,
+            _target: Address,
+            _data: &Bytes,
+            _block: BlockRef,
+        ) -> Result<Bytes, ProviderError> {
+            Err(ProviderError::MethodUnsupported {
+                method: "test provider block call",
+            })
+        }
+
+        async fn code_at(&self, _target: Address) -> Result<Bytes, ProviderError> {
+            Err(ProviderError::MethodUnsupported {
+                method: "test provider latest code",
+            })
+        }
+
+        async fn code_at_block(
+            &self,
+            _target: Address,
+            _block: BlockRef,
+        ) -> Result<Bytes, ProviderError> {
+            Err(ProviderError::MethodUnsupported {
+                method: "test provider block code",
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TransactionLookupProvider for UnusedProvider {
+        async fn transaction_by_hash(
+            &self,
+            _hash: B256,
+        ) -> Result<Option<RpcTransaction>, ProviderError> {
+            Ok(None)
+        }
+
+        async fn transaction_by_sender_nonce_in_block(
+            &self,
+            _signer: Address,
+            _nonce: u64,
+            _block: BlockRef,
+        ) -> Result<Option<RpcTransaction>, ProviderError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CandidateIntervalEvent {
+        None,
+        VaultADeposit,
+        VaultBDeposit,
+        VaultATokenTransfer,
+        VaultBTokenTransfer,
+        VaultATopology,
+    }
+
+    struct CandidateCurrentnessFixture {
+        directory: TempDir,
+        storage_service: StorageService,
+        service: CanonicalStateService<UnusedProvider>,
+        candidate: ExactVaultSnapshot,
+        topology: TopologyIndex,
+        head: BlockRef,
+        vault_a: VaultAddress,
+    }
+
+    async fn candidate_currentness_fixture(
+        event: CandidateIntervalEvent,
+    ) -> Result<CandidateCurrentnessFixture, Box<dyn Error>> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut config = AppConfig::load(&root.join("config.hyperevm.json"))?.validate()?;
+        let lock = ProtocolLock::load(&root.join("protocol-lock.hyperevm.toml"))?.validate()?;
+        let identities = RuntimeIdentities::from_config(&config, &lock)?;
+        let vault_a_config = config
+            .app
+            .vaults
+            .first()
+            .cloned()
+            .ok_or("fixture configuration has no vault")?;
+        let vault_a = vault_a_config.address;
+        let mut vault_b_config = vault_a_config.clone();
+        vault_b_config.name = "unrelated-vault-b".to_owned();
+        vault_b_config.address = VaultAddress(Address::repeat_byte(0xb2));
+        let vault_b = vault_b_config.address;
+        config.app.vaults.push(vault_b_config);
+        let config = Arc::new(config);
+
+        let snapshot_block = BlockRef {
+            number: vault_a_config.deployment_block.saturating_add(10),
+            hash: B256::repeat_byte(0xa0),
+            parent_hash: B256::repeat_byte(0x9f),
+            timestamp: 1_900_000_000,
+            gas_limit: 10_000_000,
+        };
+        let head = BlockRef {
+            number: snapshot_block.number.saturating_add(1),
+            hash: B256::repeat_byte(0xa1),
+            parent_hash: snapshot_block.hash,
+            timestamp: snapshot_block.timestamp.saturating_add(1),
+            gas_limit: snapshot_block.gas_limit,
+        };
+        let topology = TopologyIndex::new(vault_a, vault_a_config.deployment_block, [], []);
+        let topology_revision = topology.revision()?;
+        let candidate = minimal_reported_candidate(
+            vault_a,
+            vault_a_config.asset.0,
+            snapshot_block,
+            config.revision,
+            topology_revision,
+        );
+        let log = match event {
+            CandidateIntervalEvent::None => None,
+            CandidateIntervalEvent::VaultADeposit => Some(canonical_event_log(
+                config.app.chain.chain_id,
+                head,
+                vault_a.0,
+                IVaultV2::Deposit {
+                    sender: Address::with_last_byte(1),
+                    onBehalf: Address::with_last_byte(2),
+                    assets: U256::ONE,
+                    shares: U256::ONE,
+                },
+            )),
+            CandidateIntervalEvent::VaultBDeposit => Some(canonical_event_log(
+                config.app.chain.chain_id,
+                head,
+                vault_b.0,
+                IVaultV2::Deposit {
+                    sender: Address::with_last_byte(1),
+                    onBehalf: Address::with_last_byte(2),
+                    assets: U256::ONE,
+                    shares: U256::ONE,
+                },
+            )),
+            CandidateIntervalEvent::VaultATokenTransfer => Some(canonical_event_log(
+                config.app.chain.chain_id,
+                head,
+                vault_a_config.asset.0,
+                IERC20::Transfer {
+                    from: Address::repeat_byte(0x71),
+                    to: vault_a.0,
+                    value: U256::ONE,
+                },
+            )),
+            CandidateIntervalEvent::VaultBTokenTransfer => Some(canonical_event_log(
+                config.app.chain.chain_id,
+                head,
+                vault_a_config.asset.0,
+                IERC20::Transfer {
+                    from: Address::repeat_byte(0x71),
+                    to: vault_b.0,
+                    value: U256::ONE,
+                },
+            )),
+            CandidateIntervalEvent::VaultATopology => Some(canonical_event_log(
+                config.app.chain.chain_id,
+                head,
+                vault_a.0,
+                IVaultV2::AddAdapter {
+                    account: Address::repeat_byte(0xad),
+                },
+            )),
+        };
+
+        let directory = TempDir::new()?;
+        let storage_service = StorageService::start(&directory.path().join("state.json"), 16, 0)?;
+        let storage = storage_service.handle();
+        storage
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: config.app.chain.chain_id,
+                    block: snapshot_block,
+                },
+                Vec::new(),
+                snapshot_block.timestamp,
+            )
+            .await?;
+        storage
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: config.app.chain.chain_id,
+                    block: head,
+                },
+                log.into_iter().collect(),
+                head.timestamp,
+            )
+            .await?;
+
+        let runtime = RuntimeRegistry::default();
+        runtime.initialize([vault_a, vault_b]).await;
+        for vault in [vault_a, vault_b] {
+            runtime
+                .update(vault, |status| {
+                    status.transition(RuntimeVaultState::CatchingUp, None)?;
+                    status.transition(RuntimeVaultState::Automatic, None)
+                })
+                .await?;
+        }
+        let api = ApiDataStore::default();
+        let health = HealthState::default();
+        let service = CanonicalStateService::new(
+            config,
+            identities,
+            Arc::new(UnusedProvider),
+            storage,
+            runtime,
+            api,
+            health,
+            Arc::new(OperationalMetrics::new()),
+        )?
+        .with_signer_ready(true);
+        Ok(CandidateCurrentnessFixture {
+            directory,
+            storage_service,
+            service,
+            candidate,
+            topology,
+            head,
+            vault_a,
+        })
+    }
+
+    fn minimal_reported_candidate(
+        vault: VaultAddress,
+        asset: Address,
+        block: BlockRef,
+        config_revision: B256,
+        topology_revision: B256,
+    ) -> ExactVaultSnapshot {
+        ExactVaultSnapshot {
+            context: StateContext {
+                chain_id: 999,
+                block,
+                evm_timestamp: block.timestamp,
+                block_hash_binding: BlockHashBinding::Unproven,
+                static_config_revision: config_revision,
+                dynamic_topology_revision: topology_revision,
+            },
+            parent: ParentVaultState {
+                vault: vault.0,
+                asset,
+                idle_assets: U256::ZERO,
+                stored_total_assets: U256::ZERO,
+                last_update: block.timestamp,
+                max_rate: U256::ZERO,
+                total_supply: U256::ZERO,
+                virtual_shares: U256::ONE,
+                performance_fee: U256::ZERO,
+                performance_fee_recipient: Address::ZERO,
+                performance_fee_recipient_allowed: true,
+                management_fee: U256::ZERO,
+                management_fee_recipient: Address::ZERO,
+                management_fee_recipient_allowed: true,
+                receive_shares_gate: Address::ZERO,
+                send_shares_gate: Address::ZERO,
+                receive_assets_gate: Address::ZERO,
+                send_assets_gate: Address::ZERO,
+                adapter_registry: Address::ZERO,
+                liquidity_adapter: Address::ZERO,
+                liquidity_data: Bytes::new(),
+                force_deallocate_penalties: BTreeMap::new(),
+                approved_allocators: BTreeSet::new(),
+                approved_sentinels: BTreeSet::new(),
+                dead_address: Address::with_last_byte(0xde),
+                dead_share_balance: U256::ONE,
+                required_dead_shares: U256::ONE,
+            },
+            adapters: BTreeMap::new(),
+            enabled_adapters: BTreeSet::new(),
+            liquidity_adapter: None,
+            positions: BTreeMap::new(),
+            markets: BTreeMap::new(),
+            caps: BTreeMap::new(),
+            pending_admin: Vec::new(),
+            capabilities: VaultCapabilities {
+                can_observe: true,
+                can_project: true,
+                can_allocate: true,
+                can_deallocate_supported_position: true,
+                can_model_user_deposit: true,
+                can_model_user_withdrawal: true,
+                lock_ledger_verified: true,
+                seed_requirements_verified: true,
+                reward_policy_ready: true,
+                rate_episode_state_verified: true,
+            },
+            idle_locks: IdleLockLedgerSnapshot {
+                locks: Vec::new(),
+                unattributed_idle_assets: U256::ZERO,
+                verified: true,
+            },
+            snapshot_hash: B256::repeat_byte(0x55),
+        }
+    }
+
+    fn canonical_event_log<E: IntoLogData>(
+        chain_id: u64,
+        block: BlockRef,
+        address: Address,
+        event: E,
+    ) -> CanonicalLogRecord {
+        let encoded = event.to_log_data();
+        let mut topics = [None; 4];
+        for (slot, topic) in topics.iter_mut().zip(encoded.topics()) {
+            *slot = Some(*topic);
+        }
+        CanonicalLogRecord {
+            chain_id,
+            block_number: block.number,
+            block_hash: block.hash,
+            transaction_hash: B256::repeat_byte(0xee),
+            transaction_index: 0,
+            log_index: 0,
+            address,
+            topics,
+            data: encoded.data,
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_latest_fresh_candidate_one_block_behind_publishes_and_is_ready()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = candidate_currentness_fixture(CandidateIntervalEvent::None).await?;
+        assert_eq!(
+            fixture.candidate.context.block.number.saturating_add(1),
+            fixture.head.number
+        );
+        assert!(
+            fixture
+                .service
+                .reported_candidate_is_current(&fixture.candidate, &fixture.topology, fixture.head,)
+                .await?
+        );
+
+        let vault_config = fixture
+            .service
+            .config
+            .app
+            .vaults
+            .first()
+            .ok_or("fixture configuration has no vault")?;
+        let projection = project_snapshot_to_head(&fixture.candidate, fixture.head, vault_config)?;
+        assert_eq!(projection.head, fixture.head);
+        let rate_view = RateSnapshotView {
+            vault: fixture.vault_a,
+            snapshot_hash: fixture.candidate.snapshot_hash,
+            block: fixture.head,
+            spread_rate_per_second_wad: U256::ZERO,
+            spread_apr_bps: 0,
+            utilization_spread_wad: U256::ZERO,
+            utilization_spread_bps: 0,
+            selected_objective: fixture.service.config.app.strategy.objective,
+            vault_strategy: vault_config.strategy,
+            selected_objective_spread_wad: U256::ZERO,
+            markets: Vec::new(),
+        };
+        let epoch = fixture
+            .service
+            .api
+            .state_epoch(fixture.service.config.app.chain.chain_id, fixture.vault_a)
+            .await
+            .ok_or("state epoch unavailable")?;
+        let publication = ApiStatePublication::from_validated_projection(
+            fixture.candidate.clone(),
+            rate_view,
+            fixture.head,
+        )
+        .ok_or("S to H publication rejected")?;
+        assert!(fixture.service.api.record_state(epoch, publication).await);
+        assert_eq!(
+            fixture
+                .service
+                .api
+                .snapshot(fixture.vault_a)
+                .await
+                .ok_or("published snapshot missing")?
+                .context
+                .block,
+            fixture.candidate.context.block
+        );
+        assert_eq!(
+            fixture
+                .service
+                .api
+                .rates(fixture.vault_a)
+                .await
+                .ok_or("published rates missing")?
+                .block,
+            fixture.head
+        );
+        fixture.service.publish_readiness(true, true).await?;
+        let readiness = fixture
+            .service
+            .health
+            .readiness()
+            .await
+            .ok_or("readiness was not published")?;
+        assert!(readiness.ready);
+        assert!(readiness.ready_for_execute);
+
+        fixture.storage_service.shutdown().await?;
+        drop(fixture.directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unrelated_vault_event_does_not_reject_candidate() -> Result<(), Box<dyn Error>> {
+        let fixture = candidate_currentness_fixture(CandidateIntervalEvent::VaultBDeposit).await?;
+        assert!(
+            fixture
+                .service
+                .reported_candidate_is_current(&fixture.candidate, &fixture.topology, fixture.head,)
+                .await?
+        );
+        fixture.storage_service.shutdown().await?;
+        drop(fixture.directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relevant_vault_event_rejects_candidate() -> Result<(), Box<dyn Error>> {
+        let fixture = candidate_currentness_fixture(CandidateIntervalEvent::VaultADeposit).await?;
+        assert!(
+            !fixture
+                .service
+                .reported_candidate_is_current(&fixture.candidate, &fixture.topology, fixture.head,)
+                .await?
+        );
+        fixture.storage_service.shutdown().await?;
+        drop(fixture.directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unrelated_same_asset_vault_transfer_does_not_reject_candidate()
+    -> Result<(), Box<dyn Error>> {
+        let fixture =
+            candidate_currentness_fixture(CandidateIntervalEvent::VaultBTokenTransfer).await?;
+        assert!(
+            fixture
+                .service
+                .reported_candidate_is_current(&fixture.candidate, &fixture.topology, fixture.head,)
+                .await?
+        );
+        fixture.storage_service.shutdown().await?;
+        drop(fixture.directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_same_asset_transfer_rejects_candidate() -> Result<(), Box<dyn Error>> {
+        let fixture =
+            candidate_currentness_fixture(CandidateIntervalEvent::VaultATokenTransfer).await?;
+        assert!(
+            !fixture
+                .service
+                .reported_candidate_is_current(&fixture.candidate, &fixture.topology, fixture.head,)
+                .await?
+        );
+        fixture.storage_service.shutdown().await?;
+        drop(fixture.directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_preflight_filter_ignores_unrelated_same_asset_vault_deposit_and_transfer()
+    -> Result<(), Box<dyn Error>> {
+        for event in [
+            CandidateIntervalEvent::VaultBDeposit,
+            CandidateIntervalEvent::VaultBTokenTransfer,
+        ] {
+            let fixture = candidate_currentness_fixture(event).await?;
+            let logs = fixture
+                .service
+                .storage
+                .load_canonical_logs(
+                    fixture.service.config.app.chain.chain_id,
+                    fixture.head.number,
+                    fixture.head.number,
+                )
+                .await?;
+            assert!(!canonical_logs_affect_candidate(
+                &fixture.service.sources,
+                &fixture.candidate,
+                &fixture.topology,
+                &logs,
+            )?);
+            fixture.storage_service.shutdown().await?;
+            drop(fixture.directory);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_preflight_filter_rejects_candidate_same_asset_transfer()
+    -> Result<(), Box<dyn Error>> {
+        let fixture =
+            candidate_currentness_fixture(CandidateIntervalEvent::VaultATokenTransfer).await?;
+        let logs = fixture
+            .service
+            .storage
+            .load_canonical_logs(
+                fixture.service.config.app.chain.chain_id,
+                fixture.head.number,
+                fixture.head.number,
+            )
+            .await?;
+        assert!(canonical_logs_affect_candidate(
+            &fixture.service.sources,
+            &fixture.candidate,
+            &fixture.topology,
+            &logs,
+        )?);
+        fixture.storage_service.shutdown().await?;
+        drop(fixture.directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vault_topology_event_rejects_candidate() -> Result<(), Box<dyn Error>> {
+        let fixture = candidate_currentness_fixture(CandidateIntervalEvent::VaultATopology).await?;
+        assert!(
+            !fixture
+                .service
+                .reported_candidate_is_current(&fixture.candidate, &fixture.topology, fixture.head,)
+                .await?
+        );
+        fixture.storage_service.shutdown().await?;
+        drop(fixture.directory);
+        Ok(())
+    }
 
     #[test]
     fn strategy_tick_uses_canonical_five_minute_boundaries() {
@@ -2218,6 +3002,7 @@ mod tests {
                 B256::repeat_byte(2),
                 block,
                 B256::repeat_byte(3),
+                block,
             )
             .unwrap_or_else(|| panic!("dirty fixture did not bind"));
         let mut planning_work = PlanningWorkSet::default();

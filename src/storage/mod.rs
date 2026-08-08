@@ -34,6 +34,16 @@ pub enum StorageError {
     /// A bounded command send or durability acknowledgment exceeded its deadline.
     #[error("storage actor command timed out")]
     CommandTimeout,
+    /// A checkpoint, manifest, or journal input exceeded its audited startup ceiling.
+    #[error("storage {kind} input is {actual} bytes; maximum is {maximum} bytes")]
+    InputTooLarge {
+        /// Stable non-secret input class.
+        kind: &'static str,
+        /// Observed byte length.
+        actual: u64,
+        /// Maximum accepted byte length.
+        maximum: u64,
+    },
     /// Dedicated actor thread panicked.
     #[error("storage actor panicked")]
     ActorPanicked,

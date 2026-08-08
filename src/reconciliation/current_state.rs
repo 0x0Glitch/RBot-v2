@@ -156,8 +156,22 @@ pub async fn reconcile_current_state(
             assessment.snapshot,
             assessment.confirmed_episode,
         )
-        .await?;
+        .await
+        .map_err(classify_reconciliation_storage_error)?;
     Ok(report)
+}
+
+fn classify_reconciliation_storage_error(error: StorageError) -> CurrentStateError {
+    match error {
+        // The state owner checked this block immediately before submitting the storage command,
+        // but a serialized canonical rewind can win that race. This is stale chain context, not a
+        // durability failure, so retain ConformanceValidated and retry from the new canonical
+        // state instead of quarantining the signer.
+        StorageError::StaleTransition => {
+            CurrentStateError::Source(CurrentStateSourceError::ContextNotReady)
+        }
+        other => CurrentStateError::Storage(other),
+    }
 }
 
 fn validate_snapshot(
@@ -244,4 +258,24 @@ fn validate_snapshot(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CurrentStateError, CurrentStateSourceError, classify_reconciliation_storage_error,
+    };
+    use crate::storage::StorageError;
+
+    #[test]
+    fn canonical_rewind_race_retries_without_quarantining_durability() {
+        assert!(matches!(
+            classify_reconciliation_storage_error(StorageError::StaleTransition),
+            CurrentStateError::Source(CurrentStateSourceError::ContextNotReady)
+        ));
+        assert!(matches!(
+            classify_reconciliation_storage_error(StorageError::CommandTimeout),
+            CurrentStateError::Storage(StorageError::CommandTimeout)
+        ));
+    }
 }

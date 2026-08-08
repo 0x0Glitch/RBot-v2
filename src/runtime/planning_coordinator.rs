@@ -111,8 +111,7 @@ impl PlanningCoordinator {
                     }
                 }
                 Err(error) if error.is_vault_scoped() => {
-                    self.quarantine_planning_scope(revision.vault, &error)
-                        .await?;
+                    self.quarantine_planning_scope(revision, &error).await?;
                     self.processed.insert(revision.vault, revision.clone());
                 }
                 Err(error) => return Err(error),
@@ -148,9 +147,16 @@ impl PlanningCoordinator {
         let Some(snapshot) = self.api.snapshot(vault.address).await else {
             return Ok(true);
         };
-        let Some(effective_revision) = revision.rebind_to_covered_snapshot(
+        let Some(rates) = self.api.rates(vault.address).await else {
+            return Ok(true);
+        };
+        if rates.vault != vault.address || rates.snapshot_hash != snapshot.snapshot_hash {
+            return Ok(true);
+        }
+        let Some(effective_revision) = revision.rebind_to_covered_state(
             snapshot.context.block,
             snapshot.snapshot_hash,
+            rates.block,
             snapshot.context.dynamic_topology_revision,
             snapshot.context.static_config_revision,
         ) else {
@@ -163,12 +169,19 @@ impl PlanningCoordinator {
             || !snapshot.capabilities.can_project
             || !snapshot.capabilities.can_allocate
         {
-            self.api.clear_plan(vault.address).await;
+            self.api
+                .clear_plan_through(
+                    vault.address,
+                    effective_revision.snapshot_block.number,
+                    effective_revision.planner_generation,
+                )
+                .await;
             return Ok(false);
         }
-        let projection = project_snapshot_to_head(&snapshot, snapshot.context.block, vault)?;
+        let projection =
+            project_snapshot_to_head(&snapshot, effective_revision.projection_block, vault)?;
         if !self.is_current(revision) {
-            self.record_superseded(vault.address).await?;
+            self.record_superseded(&effective_revision).await?;
             return Ok(false);
         }
         let _ = refresh_priority_plan(
@@ -183,7 +196,7 @@ impl PlanningCoordinator {
         )
         .await?;
         if !self.is_current(revision) {
-            self.record_superseded(vault.address).await?;
+            self.record_superseded(&effective_revision).await?;
         }
         Ok(false)
     }
@@ -198,9 +211,16 @@ impl PlanningCoordinator {
 
     async fn record_superseded(
         &self,
-        vault: crate::domain::VaultAddress,
+        revision: &PlanningRevision,
     ) -> Result<(), PlanningCoordinatorError> {
-        self.api.clear_plan(vault).await;
+        let vault = revision.vault;
+        self.api
+            .clear_plan_through(
+                vault,
+                revision.snapshot_block.number,
+                revision.planner_generation,
+            )
+            .await;
         self.runtime
             .update(vault, |status| {
                 status.record_planning(None, status.episode_id)
@@ -213,10 +233,17 @@ impl PlanningCoordinator {
 
     async fn quarantine_planning_scope(
         &self,
-        vault: crate::domain::VaultAddress,
+        revision: &PlanningRevision,
         error: &PlanningCoordinatorError,
     ) -> Result<(), PlanningCoordinatorError> {
-        self.api.clear_plan(vault).await;
+        let vault = revision.vault;
+        self.api
+            .clear_plan_through(
+                vault,
+                revision.snapshot_block.number,
+                revision.planner_generation,
+            )
+            .await;
         let current = self
             .runtime
             .get(vault)
@@ -323,6 +350,7 @@ mod tests {
             config_revision: config.revision,
             snapshot_block,
             snapshot_fingerprint: B256::repeat_byte(2),
+            projection_block: snapshot_block,
             planner_generation: 1,
             dirty_reasons: BTreeSet::from([DirtyReason::EconomicState]),
         };

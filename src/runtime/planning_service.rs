@@ -175,14 +175,30 @@ pub async fn refresh_top_k_plan(
         "top-K target refreshed"
     );
     let Some(target) = observation.target else {
-        clear_plan(vault, api, runtime, None).await?;
+        clear_plan(
+            vault,
+            api,
+            runtime,
+            None,
+            snapshot.context.block.number,
+            revision.map_or(0, |item| item.planner_generation),
+        )
+        .await?;
         return Ok(None);
     };
     let Some(prepared) = build_validated_top_k_plan(
         config, vault, snapshot, projection, &target, funding, revision,
     )?
     else {
-        clear_plan(vault, api, runtime, None).await?;
+        clear_plan(
+            vault,
+            api,
+            runtime,
+            None,
+            snapshot.context.block.number,
+            revision.map_or(0, |item| item.planner_generation),
+        )
+        .await?;
         return Ok(None);
     };
     publish_plan(prepared.plan.plan().clone(), storage, api, runtime, None).await
@@ -456,12 +472,28 @@ pub async fn refresh_rate_plan(
     }
 
     let Some(mut episode) = episode else {
-        clear_plan(vault, api, runtime, None).await?;
+        clear_plan(
+            vault,
+            api,
+            runtime,
+            None,
+            projection.head.number,
+            revision.map_or(0, |item| item.planner_generation),
+        )
+        .await?;
         return Ok(None);
     };
     if episode.state == RateEpisodeState::Detecting {
         let Some(current) = signal.as_ref() else {
-            clear_plan(vault, api, runtime, Some(episode.episode_id)).await?;
+            clear_plan(
+                vault,
+                api,
+                runtime,
+                Some(episode.episode_id),
+                projection.head.number,
+                revision.map_or(0, |item| item.planner_generation),
+            )
+            .await?;
             return Ok(None);
         };
         match episode.observe_short_confirmation(
@@ -480,7 +512,15 @@ pub async fn refresh_rate_plan(
                     .persist_rate_episode(episode.clone(), projection.head.timestamp)
                     .await?;
                 api.record_episode(episode).await;
-                clear_plan(vault, api, runtime, None).await?;
+                clear_plan(
+                    vault,
+                    api,
+                    runtime,
+                    None,
+                    projection.head.number,
+                    revision.map_or(0, |item| item.planner_generation),
+                )
+                .await?;
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
@@ -488,7 +528,15 @@ pub async fn refresh_rate_plan(
     }
     api.record_episode(episode.clone()).await;
     if episode.state == RateEpisodeState::Detecting {
-        clear_plan(vault, api, runtime, Some(episode.episode_id)).await?;
+        clear_plan(
+            vault,
+            api,
+            runtime,
+            Some(episode.episode_id),
+            projection.head.number,
+            revision.map_or(0, |item| item.planner_generation),
+        )
+        .await?;
         return Ok(None);
     }
     if episode.state == RateEpisodeState::Immediate {
@@ -497,7 +545,15 @@ pub async fn refresh_rate_plan(
         let independent_span_seconds =
             duration_seconds_ceil(config.app.strategy.minimum_independent_event_span_millis)?;
         let Some(confirmation_block) = episode.confirmation_block else {
-            clear_plan(vault, api, runtime, Some(episode.episode_id)).await?;
+            clear_plan(
+                vault,
+                api,
+                runtime,
+                Some(episode.episode_id),
+                projection.head.number,
+                revision.map_or(0, |item| item.planner_generation),
+            )
+            .await?;
             return Ok(None);
         };
         let persistent_at = confirmation_block
@@ -527,14 +583,24 @@ pub async fn refresh_rate_plan(
     let Some(prepared) =
         build_validated_rate_plan(config, vault, snapshot, projection, &episode, revision)?
     else {
-        clear_plan(vault, api, runtime, Some(episode.episode_id)).await?;
+        clear_plan(
+            vault,
+            api,
+            runtime,
+            Some(episode.episode_id),
+            projection.head.number,
+            revision.map_or(0, |item| item.planner_generation),
+        )
+        .await?;
         return Ok(None);
     };
     let plan = prepared.plan.plan().clone();
     storage
         .persist_plan(plan.clone(), projection.head.timestamp)
         .await?;
-    api.record_plan(plan.clone()).await;
+    if !api.record_plan(plan.clone()).await {
+        return Ok(None);
+    }
     runtime
         .update(vault.address, |status| {
             status.record_planning(Some(plan.plan_id), Some(episode.episode_id))
@@ -876,7 +942,9 @@ async fn publish_plan(
     storage
         .persist_plan(plan.clone(), plan.snapshot.block.timestamp)
         .await?;
-    api.record_plan(plan.clone()).await;
+    if !api.record_plan(plan.clone()).await {
+        return Ok(None);
+    }
     runtime
         .update(plan.vault, |status| {
             status.record_planning(Some(plan.plan_id), episode_id)
@@ -1065,8 +1133,11 @@ async fn clear_plan(
     api: &ApiDataStore,
     runtime: &RuntimeRegistry,
     episode_id: Option<crate::domain::EpisodeId>,
+    block_number: u64,
+    planner_generation: u64,
 ) -> Result<(), ControllerError> {
-    api.clear_plan(vault.address).await;
+    api.clear_plan_through(vault.address, block_number, planner_generation)
+        .await;
     runtime
         .update(vault.address, |status| {
             status.record_planning(None, episode_id)

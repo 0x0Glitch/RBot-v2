@@ -18,6 +18,12 @@ pub struct ReadOnlyApiBinding {
 impl ReadOnlyApiBinding {
     /// Binds and owns the production listener before any background worker starts.
     pub async fn bind(address: SocketAddr) -> io::Result<Self> {
+        if !address.ip().is_loopback() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the unauthenticated read-only API may bind only to a loopback address",
+            ));
+        }
         let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         Ok(Self {
@@ -59,5 +65,14 @@ mod tests {
         let listener = binding.listener().await?;
         assert_eq!(listener.local_addr()?, binding.local_addr());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_loopback_binding_is_rejected_before_opening_a_socket() {
+        let result = ReadOnlyApiBinding::bind((Ipv4Addr::UNSPECIFIED, 0).into()).await;
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied
+        ));
     }
 }

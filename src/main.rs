@@ -567,8 +567,16 @@ async fn run_supervised(
     let signal_joined = signal_task
         .await
         .map_err(|_| "OS shutdown task failed".to_owned());
+    let alerts_drained = if alerts.drain(DEFAULT_SHUTDOWN_TIMEOUT).await {
+        Ok(())
+    } else {
+        Err("operator alert delivery did not drain before shutdown deadline".to_owned())
+    };
     let storage_stopped = storage.shutdown().await.map_err(|error| error.to_string());
-    supervised.and(signal_joined).and(storage_stopped)
+    supervised
+        .and(signal_joined)
+        .and(alerts_drained)
+        .and(storage_stopped)
 }
 
 fn provider_for_roles<'a>(

@@ -2,7 +2,10 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use alloy::primitives::{B256, keccak256};
@@ -10,7 +13,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 use crate::domain::VaultAddress;
 
@@ -189,6 +192,21 @@ pub struct AlertDispatcher {
     state: Mutex<AlertState>,
     deduplication_seconds: u64,
     delivery_slots: Arc<Semaphore>,
+    in_flight: Arc<AtomicUsize>,
+    drained: Arc<Notify>,
+}
+
+struct AlertDeliveryGuard {
+    in_flight: Arc<AtomicUsize>,
+    drained: Arc<Notify>,
+}
+
+impl Drop for AlertDeliveryGuard {
+    fn drop(&mut self) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
 }
 
 impl AlertDispatcher {
@@ -208,6 +226,8 @@ impl AlertDispatcher {
             }),
             deduplication_seconds,
             delivery_slots: Arc::new(Semaphore::new(ALERT_IN_FLIGHT_CAPACITY)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drained: Arc::new(Notify::new()),
         })
     }
 
@@ -220,13 +240,53 @@ impl AlertDispatcher {
             .map_err(|_| AlertError::Delivery)?;
         let dispatcher = Arc::clone(self);
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| AlertError::Delivery)?;
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
         runtime.spawn(async move {
+            let _delivery = AlertDeliveryGuard {
+                in_flight: Arc::clone(&dispatcher.in_flight),
+                drained: Arc::clone(&dispatcher.drained),
+            };
             let _permit = permit;
             if dispatcher.emit(alert).await.is_err() {
                 tracing::error!("bounded operator alert delivery failed");
             }
         });
         Ok(())
+    }
+
+    /// Waits for every accepted background delivery to finish within one shutdown deadline.
+    pub async fn drain(&self, timeout: std::time::Duration) -> bool {
+        self.drain_with_hook(timeout, || std::future::ready(()))
+            .await
+    }
+
+    async fn drain_with_hook<F, Fut>(
+        &self,
+        timeout: std::time::Duration,
+        mut before_wait: F,
+    ) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let Some(deadline) = tokio::time::Instant::now().checked_add(timeout) else {
+            return false;
+        };
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            // `notify_waiters` does not retain a permit when no waiter is registered. Register
+            // before observing the counter so the final delivery cannot reach zero in the gap
+            // between the load and the first poll of `Notified`.
+            notified.as_mut().enable();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            before_wait().await;
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.in_flight.load(Ordering::Acquire) == 0;
+            }
+        }
     }
 
     /// Delivers a non-duplicate alert and records bounded read-only history.
@@ -300,6 +360,7 @@ mod tests {
 
     use alloy::primitives::B256;
     use async_trait::async_trait;
+    use tokio::sync::Notify;
 
     use super::{
         Alert, AlertDispatcher, AlertKind, AlertSeverity, AlertTransport, AlertTransportError,
@@ -531,6 +592,98 @@ mod tests {
             )?),
             Err(super::AlertError::Delivery)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_waits_for_accepted_background_delivery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let dispatcher = Arc::new(AlertDispatcher::new(
+            vec![Arc::new(CountingTransport(Arc::clone(&deliveries)))],
+            3_600,
+        )?);
+        dispatcher.dispatch(alert(
+            AlertSeverity::P0,
+            "final shutdown incident",
+            B256::repeat_byte(0x77),
+            60_000,
+        )?)?;
+        assert!(dispatcher.drain(std::time::Duration::from_secs(1)).await);
+        assert_eq!(deliveries.load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_cannot_lose_the_final_delivery_notification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct GatedTransport {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl AlertTransport for GatedTransport {
+            fn name(&self) -> &'static str {
+                "gated"
+            }
+
+            async fn send(&self, _alert: &Alert) -> Result<(), super::AlertTransportError> {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+        }
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let checked_nonzero = Arc::new(Notify::new());
+        let continue_to_wait = Arc::new(Notify::new());
+        let dispatcher = Arc::new(AlertDispatcher::new(
+            vec![Arc::new(GatedTransport {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            })],
+            3_600,
+        )?);
+        dispatcher.dispatch(alert(
+            AlertSeverity::P0,
+            "final shutdown race",
+            B256::repeat_byte(0x78),
+            60_001,
+        )?)?;
+        started.notified().await;
+
+        let drain = tokio::spawn({
+            let dispatcher = Arc::clone(&dispatcher);
+            let checked_nonzero = Arc::clone(&checked_nonzero);
+            let continue_to_wait = Arc::clone(&continue_to_wait);
+            async move {
+                dispatcher
+                    .drain_with_hook(std::time::Duration::from_secs(5), move || {
+                        let checked_nonzero = Arc::clone(&checked_nonzero);
+                        let continue_to_wait = Arc::clone(&continue_to_wait);
+                        async move {
+                            checked_nonzero.notify_one();
+                            continue_to_wait.notified().await;
+                        }
+                    })
+                    .await
+            }
+        });
+        checked_nonzero.notified().await;
+
+        // Complete the last delivery after drain observed a nonzero count but before it awaits
+        // the notification. The waiter was already enabled, so this wakeup must be retained.
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while dispatcher.in_flight.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        continue_to_wait.notify_one();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), drain).await??);
         Ok(())
     }
 }

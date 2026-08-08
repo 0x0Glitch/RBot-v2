@@ -54,6 +54,8 @@ pub enum CancellationReason {
 /// Non-event facts that invalidate a pending semantic plan.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PendingSafetySignals {
+    /// Static configuration or reconstructed topology differs from the signed plan.
+    pub material_invalidation: bool,
     /// Exact direction differs from the frozen direction.
     pub direction_reversed: bool,
     /// A required service constraint would fail.
@@ -221,11 +223,43 @@ pub fn assess_pending(
         .0
         .checked_sub(clock.last_attempt_at.0)
         .ok_or(PendingPolicyError::Clock)?;
-    // Signed bytes own the nonce until a receipt or bounded pending horizon resolves it. Ordinary
-    // market/config churn supersedes only the next plan; cancelling on every touched event creates
-    // an unbounded original-versus-cancellation race. During provider ambiguity, sign nothing new.
+    // During provider ambiguity, sign nothing new. Once exact state proves a material safety
+    // invalidation, cancellation takes precedence over fee replacement and the pending horizon.
     if signals.provider_ambiguous {
         return Ok(PendingDecision::Wait);
+    }
+    if signals.signer_role_lost {
+        return Ok(PendingDecision::Cancel(CancellationReason::SignerRoleLost));
+    }
+    if signals.external_idle_lock_created {
+        return Ok(PendingDecision::Cancel(
+            CancellationReason::ExternalIdleLock,
+        ));
+    }
+    // A liquidity-maintenance transaction exists precisely because the pre-action vault state
+    // violates a service constraint. Until that transaction lands, observing the same failed
+    // constraint is expected and must not make the transaction cancel itself. All independent
+    // invalidations above and below (role loss, idle locks, policy expiry, direction/config
+    // changes, and the pending horizon) remain effective.
+    if signals.service_constraint_failed && clock.reason != PlanReason::LiquidityMaintenance {
+        return Ok(PendingDecision::Cancel(
+            CancellationReason::ServiceConstraint,
+        ));
+    }
+    if signals.reward_policy_expired {
+        return Ok(PendingDecision::Cancel(
+            CancellationReason::RewardPolicyExpired,
+        ));
+    }
+    if signals.direction_reversed {
+        return Ok(PendingDecision::Cancel(
+            CancellationReason::DirectionReversed,
+        ));
+    }
+    if signals.material_invalidation {
+        return Ok(PendingDecision::Cancel(
+            CancellationReason::MaterialInvalidation,
+        ));
     }
     let horizon = pending_horizon(clock.reason, execution)?;
     let remaining = horizon.saturating_sub(age);
@@ -497,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_nonce_ignores_state_churn_and_waits_during_provider_ambiguity() {
+    fn material_safety_signals_cancel_while_provider_ambiguity_waits() {
         let config = test_config();
         assert!(config.is_some(), "test configuration must validate");
         let Some(config) = config else {
@@ -509,6 +543,7 @@ mod tests {
                 &clock,
                 InclusionOpportunity(12),
                 PendingSafetySignals {
+                    material_invalidation: true,
                     direction_reversed: true,
                     service_constraint_failed: true,
                     reward_policy_expired: true,
@@ -519,7 +554,7 @@ mod tests {
                 &config.app.execution,
             )
             .ok(),
-            Some(PendingDecision::Replace)
+            Some(PendingDecision::Cancel(CancellationReason::SignerRoleLost))
         );
         assert_eq!(
             assess_pending(
@@ -533,6 +568,65 @@ mod tests {
             )
             .ok(),
             Some(PendingDecision::Wait)
+        );
+        assert_eq!(
+            assess_pending(
+                &clock,
+                InclusionOpportunity(12),
+                PendingSafetySignals {
+                    material_invalidation: true,
+                    ..PendingSafetySignals::default()
+                },
+                &config.app.execution,
+            )
+            .ok(),
+            Some(PendingDecision::Cancel(
+                CancellationReason::MaterialInvalidation
+            ))
+        );
+    }
+
+    #[test]
+    fn liquidity_maintenance_does_not_cancel_the_constraint_it_is_repairing() {
+        let config = test_config();
+        assert!(config.is_some(), "test configuration must validate");
+        let Some(config) = config else {
+            return;
+        };
+        let mut clock = pending_clock();
+        clock.reason = PlanReason::LiquidityMaintenance;
+
+        assert_eq!(
+            assess_pending(
+                &clock,
+                InclusionOpportunity(11),
+                PendingSafetySignals {
+                    service_constraint_failed: true,
+                    ..PendingSafetySignals::default()
+                },
+                &config.app.execution,
+            )
+            .ok(),
+            Some(PendingDecision::Wait)
+        );
+
+        // The exception is deliberately narrow: an independent material invalidation still
+        // cancels the same liquidity-maintenance transaction.
+        assert_eq!(
+            assess_pending(
+                &clock,
+                InclusionOpportunity(11),
+                PendingSafetySignals {
+                    material_invalidation: true,
+                    service_constraint_failed: true,
+                    ..PendingSafetySignals::default()
+                },
+                &config.app.execution,
+            )
+            .ok(),
+            Some(PendingDecision::Cancel(
+                CancellationReason::MaterialInvalidation
+            ))
         );
     }
 }

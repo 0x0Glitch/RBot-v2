@@ -13,7 +13,6 @@ use tokio::sync::RwLock;
 use crate::{
     api::ApiDataStore,
     chain::{
-        logs::{RawEventLog, decode_watched_event},
         multicall::{AtomicSnapshotProvider, MulticallError},
         provider::TransactionLookupProvider,
     },
@@ -27,12 +26,14 @@ use crate::{
     runtime::{
         identity::{RuntimeIdentities, RuntimeIdentityError},
         idle_ledger_service::{IdleLedgerServiceError, rebuild_idle_ledger},
-        planning_revision::DirtyAccumulator,
         planning_service::{
             build_validated_capital_plan, build_validated_liquidity_plan,
             build_validated_rate_plan, build_validated_top_k_plan,
         },
-        state_service::{EventSourceRegistry, StateServiceError, replay_topology_through},
+        state_service::{
+            EventSourceRegistry, StateServiceError, canonical_logs_affect_candidate,
+            replay_topology_through,
+        },
     },
     state::{
         idle_locks::IdleLockLedger,
@@ -41,6 +42,7 @@ use crate::{
             CanonicalSnapshotTimestamps, SnapshotBlueprint, SnapshotError, bind_idle_lock_ledger,
             build_exact_snapshot,
         },
+        topology::TopologyIndex,
     },
     storage::actor::StorageHandle,
     transaction::final_preflight::{
@@ -58,8 +60,15 @@ pub struct LiveRatePreflightSource<P> {
     provider: Arc<P>,
     storage: StorageHandle,
     api: ApiDataStore,
-    rebuilding_head: Arc<RwLock<Option<BlockRef>>>,
+    rebuilding_context: Arc<RwLock<Option<PreflightReadSet>>>,
     provider_ready: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug)]
+struct PreflightReadSet {
+    head: BlockRef,
+    snapshot: crate::domain::ExactVaultSnapshot,
+    topology: TopologyIndex,
 }
 
 impl<P> LiveRatePreflightSource<P> {
@@ -84,7 +93,7 @@ impl<P> LiveRatePreflightSource<P> {
             provider,
             storage,
             api,
-            rebuilding_head: Arc::new(RwLock::new(None)),
+            rebuilding_context: Arc::new(RwLock::new(None)),
             provider_ready,
         }
     }
@@ -113,27 +122,35 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> ExactPreflightSource
             return Err(PreflightSourceError::ContextChanged);
         }
         let result = self.rebuild_at_head(head, scenarios).await;
-        match &result {
-            Ok(prepared) => {
-                *self.rebuilding_head.write().await = prepared
+        match result {
+            Ok((prepared, snapshot, topology)) => {
+                let rebuilt_head = prepared
                     .scenarios
                     .first()
-                    .map(|scenario| scenario.canonical_block);
+                    .map(|scenario| scenario.canonical_block)
+                    .ok_or(PreflightSourceError::Failed)?;
+                *self.rebuilding_context.write().await = Some(PreflightReadSet {
+                    head: rebuilt_head,
+                    snapshot,
+                    topology,
+                });
+                Ok(prepared)
             }
-            Err(_) => {
-                *self.rebuilding_head.write().await = None;
+            Err(error) => {
+                *self.rebuilding_context.write().await = None;
+                Err(error)
             }
         }
-        result
     }
 
     async fn invalidation_queued(&self) -> Result<bool, PreflightSourceError> {
         if !self.provider_ready.load(Ordering::Acquire) {
             return Ok(true);
         }
-        let Some(expected) = *self.rebuilding_head.read().await else {
+        let Some(context) = self.rebuilding_context.read().await.clone() else {
             return Ok(true);
         };
+        let expected = context.head;
         let current = self.event_cursor().await?;
         if current == expected {
             return Ok(false);
@@ -141,17 +158,16 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> ExactPreflightSource
         if current.number <= expected.number {
             return Ok(true);
         }
-        let vault = self
-            .config
-            .app
-            .vaults
-            .iter()
-            .find(|vault| vault.address == self.vault)
-            .ok_or(PreflightSourceError::FailedAt("configured_vault"))?;
         let sources = EventSourceRegistry::from_config(&self.config)
             .map_err(|_| PreflightSourceError::FatalAt("event_source_registry"))?;
-        self.relevant_event_between(&sources, vault, expected.number, current.number)
-            .await
+        self.relevant_event_between(
+            &sources,
+            &context.snapshot,
+            &context.topology,
+            expected.number,
+            current.number,
+        )
+        .await
     }
 }
 
@@ -160,7 +176,14 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
         &self,
         head: BlockRef,
         scenarios: &[InclusionAssumption; 3],
-    ) -> Result<PreparedPreflightPlan, PreflightSourceError> {
+    ) -> Result<
+        (
+            PreparedPreflightPlan,
+            crate::domain::ExactVaultSnapshot,
+            TopologyIndex,
+        ),
+        PreflightSourceError,
+    > {
         let started = Instant::now();
         let vault = self
             .config
@@ -253,7 +276,8 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                 || self
                     .relevant_event_between(
                         &sources,
-                        vault,
+                        &snapshot,
+                        &topology,
                         snapshot_head.number,
                         replay_head.number,
                     )
@@ -330,7 +354,6 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             .persist_snapshot(snapshot.clone(), snapshot_head.timestamp)
             .await
             .map_err(|_| PreflightSourceError::FatalAt("snapshot_persist"))?;
-        self.api.record_snapshot(snapshot.clone()).await;
         tracing::debug!(
             stage = "snapshot_durable",
             elapsed_ms = started.elapsed().as_millis(),
@@ -441,17 +464,22 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
                 prepared.plan.actions(),
             )?;
         }
-        Ok(PreparedPreflightPlan {
-            plan: prepared.plan,
-            action_projections: prepared.action_projections,
-            scenarios,
-        })
+        Ok((
+            PreparedPreflightPlan {
+                plan: prepared.plan,
+                action_projections: prepared.action_projections,
+                scenarios,
+            },
+            snapshot,
+            topology,
+        ))
     }
 
     async fn relevant_event_between(
         &self,
         sources: &EventSourceRegistry,
-        vault: &crate::config::ValidatedVaultConfig,
+        candidate: &crate::domain::ExactVaultSnapshot,
+        topology: &TopologyIndex,
         from_exclusive: u64,
         to_inclusive: u64,
     ) -> Result<bool, PreflightSourceError> {
@@ -467,24 +495,8 @@ impl<P: AtomicSnapshotProvider + TransactionLookupProvider> LiveRatePreflightSou
             )
             .await
             .map_err(|_| PreflightSourceError::FatalAt("canonical_log_load"))?;
-        let mut dirty = DirtyAccumulator::default();
-        for log in logs {
-            let Some(source) = sources.source(log.address) else {
-                continue;
-            };
-            let raw = RawEventLog {
-                address: log.address,
-                topics: log.topics.into_iter().flatten().collect(),
-                data: log.data,
-            };
-            let Some(decoded) = decode_watched_event(source, &raw)
-                .map_err(|_| PreflightSourceError::FatalAt("canonical_log_decode"))?
-            else {
-                continue;
-            };
-            dirty.merge_invalidations(&self.config, log.block_number, decoded.invalidations);
-        }
-        Ok(dirty.is_vault_dirty(vault.address))
+        canonical_logs_affect_candidate(sources, candidate, topology, &logs)
+            .map_err(|_| PreflightSourceError::FatalAt("canonical_log_decode"))
     }
 }
 
@@ -513,16 +525,21 @@ fn classify_identity_error(error: RuntimeIdentityError) -> PreflightSourceError 
             PreflightSourceError::ProviderOutageAt("runtime_identity")
         }
         RuntimeIdentityError::Provider(_) => PreflightSourceError::RetryableAt("runtime_identity"),
-        RuntimeIdentityError::ChainMismatch
-        | RuntimeIdentityError::Configuration(_)
-        | RuntimeIdentityError::Runtime(_) => PreflightSourceError::FatalAt("runtime_identity"),
+        RuntimeIdentityError::ChainMismatch => PreflightSourceError::FatalAt("runtime_identity"),
+        RuntimeIdentityError::Configuration(_) | RuntimeIdentityError::Runtime(_) => {
+            // Both proxy-link checks in this source are scoped to `self.vault`. A deterministic
+            // mismatch disables that vault, not the shared allocator signer used by other vaults.
+            PreflightSourceError::VaultFatalAt("runtime_identity")
+        }
     }
 }
 
 fn classify_topology_error(error: StateServiceError) -> PreflightSourceError {
     match error {
         StateServiceError::Storage(_) => PreflightSourceError::FatalAt("topology_replay_storage"),
-        _ => PreflightSourceError::FatalAt("topology_replay"),
+        // `replay_topology_through` reads durable state and reconstructs exactly one configured
+        // vault. Its non-storage failures cannot invalidate another vault sharing the signer.
+        _ => PreflightSourceError::VaultFatalAt("topology_replay"),
     }
 }
 
@@ -540,7 +557,13 @@ fn classify_snapshot_error(error: SnapshotError) -> PreflightSourceError {
             | MulticallError::ContextMismatch
             | MulticallError::CursorNotAtHead,
         ) => PreflightSourceError::ContextChanged,
-        _ => PreflightSourceError::FatalAt("exact_snapshot"),
+        SnapshotError::Multicall(MulticallError::AuthoritativeCallFailed { .. }) => {
+            // A required view can temporarily revert while the vault, adapter, or underlying
+            // market is changing. No transaction bytes exist at this stage, so refresh exact
+            // state after a bounded retry instead of quarantining an otherwise valid vault.
+            PreflightSourceError::RetryableAt("exact_snapshot_authoritative_call")
+        }
+        _ => PreflightSourceError::VaultFatalAt("exact_snapshot"),
     }
 }
 
@@ -559,7 +582,7 @@ fn classify_idle_ledger_error(error: IdleLedgerServiceError) -> PreflightSourceE
         | IdleLedgerServiceError::Ledger(_)
         | IdleLedgerServiceError::Arithmetic
         | IdleLedgerServiceError::EndBalanceMismatch => {
-            PreflightSourceError::FatalAt("idle_ledger_replay")
+            PreflightSourceError::VaultFatalAt("idle_ledger_replay")
         }
     }
 }
@@ -646,18 +669,32 @@ fn validate_scenario(
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::Address;
+
     use super::{
-        classify_snapshot_error, require_unchanged_top_k_priority, top_k_preflight_required,
+        classify_identity_error, classify_idle_ledger_error, classify_snapshot_error,
+        classify_topology_error, require_unchanged_top_k_priority, top_k_preflight_required,
     };
     use crate::{
         chain::{
+            logs::EventDecodeError,
             multicall::MulticallError,
             provider::{ProviderError, RpcErrorCategory},
         },
         config::VaultStrategy,
+        contracts::code_identity::CodeIdentityError,
         domain::PlanReason,
-        state::snapshot::SnapshotError,
-        transaction::final_preflight::PreflightSourceError,
+        runtime::{
+            execution_service::ExecutionServiceError, failure::FailureDisposition,
+            identity::RuntimeIdentityError, idle_ledger_service::IdleLedgerServiceError,
+            state_service::StateServiceError,
+        },
+        state::{
+            capability::CapabilityError, idle_locks::IdleLockError, snapshot::SnapshotError,
+            topology::TopologyError,
+        },
+        storage::StorageError,
+        transaction::final_preflight::{PreflightError, PreflightSourceError},
     };
 
     #[test]
@@ -681,6 +718,149 @@ mod tests {
             deterministic,
             PreflightSourceError::RetryableAt("exact_snapshot_provider")
         );
+
+        assert_eq!(
+            classify_snapshot_error(SnapshotError::MissingResult {
+                key: "vault.total_assets".to_owned(),
+            }),
+            PreflightSourceError::VaultFatalAt("exact_snapshot")
+        );
+    }
+
+    #[test]
+    fn authoritative_snapshot_subcall_failure_is_always_retryable() {
+        for index in [0, 1, usize::MAX] {
+            assert_eq!(
+                classify_snapshot_error(SnapshotError::Multicall(
+                    MulticallError::AuthoritativeCallFailed { index },
+                )),
+                PreflightSourceError::RetryableAt("exact_snapshot_authoritative_call")
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_snapshot_identity_schema_and_capability_failures_remain_vault_fatal() {
+        let failures = [
+            SnapshotError::Topology(TopologyError::UncataloguedTopology),
+            SnapshotError::Capability(CapabilityError::ParentSeedOverflow),
+            SnapshotError::MissingCodeIdentity,
+            SnapshotError::CodeIdentityMismatch,
+            SnapshotError::InvalidManifest,
+            SnapshotError::DuplicateKey,
+            SnapshotError::ReturnSchemaMismatch,
+            SnapshotError::MissingResult {
+                key: "vault.total_assets".to_owned(),
+            },
+            SnapshotError::IdentityMismatch,
+            SnapshotError::Serialization,
+            SnapshotError::NumericRange,
+            SnapshotError::Multicall(MulticallError::InvalidRetryBound),
+            SnapshotError::Multicall(MulticallError::MalformedAggregate),
+        ];
+        for failure in failures {
+            assert_eq!(
+                classify_snapshot_error(failure),
+                PreflightSourceError::VaultFatalAt("exact_snapshot")
+            );
+        }
+    }
+
+    #[test]
+    fn per_vault_identity_failures_do_not_quarantine_a_shared_signer() {
+        assert_eq!(
+            classify_identity_error(RuntimeIdentityError::Configuration("vault proxy")),
+            PreflightSourceError::VaultFatalAt("runtime_identity")
+        );
+        assert_eq!(
+            classify_identity_error(RuntimeIdentityError::Runtime(
+                CodeIdentityError::EmptyCode {
+                    address: Address::with_last_byte(1),
+                },
+            )),
+            PreflightSourceError::VaultFatalAt("runtime_identity")
+        );
+        assert_eq!(
+            classify_identity_error(RuntimeIdentityError::ChainMismatch),
+            PreflightSourceError::FatalAt("runtime_identity")
+        );
+        assert_eq!(
+            classify_identity_error(RuntimeIdentityError::Provider(
+                RpcErrorCategory::TransportUnavailable,
+            )),
+            PreflightSourceError::ProviderOutageAt("runtime_identity")
+        );
+        assert_eq!(
+            classify_identity_error(RuntimeIdentityError::Provider(RpcErrorCategory::Unknown)),
+            PreflightSourceError::RetryableAt("runtime_identity")
+        );
+
+        // Multiple configured vaults may share one allocator. A failure scoped to either vault
+        // must take the vault disposition and leave that common signer available to the other.
+        let disposition = ExecutionServiceError::Preflight(PreflightError::Source(
+            PreflightSourceError::VaultFatalAt("runtime_identity"),
+        ))
+        .disposition();
+        assert!(matches!(
+            disposition,
+            FailureDisposition::QuarantineVault { .. }
+        ));
+        assert!(!matches!(
+            disposition,
+            FailureDisposition::QuarantineSigner { .. }
+        ));
+    }
+
+    #[test]
+    fn per_vault_topology_and_idle_ledger_failures_have_exhaustive_scope() {
+        assert_eq!(
+            classify_topology_error(StateServiceError::Storage(StorageError::ActorStopped)),
+            PreflightSourceError::FatalAt("topology_replay_storage")
+        );
+        assert_eq!(
+            classify_topology_error(StateServiceError::Topology(
+                TopologyError::UncataloguedTopology,
+            )),
+            PreflightSourceError::VaultFatalAt("topology_replay")
+        );
+
+        assert_eq!(
+            classify_idle_ledger_error(
+                IdleLedgerServiceError::Storage(StorageError::ActorStopped,)
+            ),
+            PreflightSourceError::FatalAt("idle_ledger_replay_storage")
+        );
+        assert_eq!(
+            classify_idle_ledger_error(IdleLedgerServiceError::Provider(
+                ProviderError::Transport {
+                    method: "eth_getTransactionByHash"
+                },
+            )),
+            PreflightSourceError::ProviderOutageAt("idle_ledger_replay_provider")
+        );
+        assert_eq!(
+            classify_idle_ledger_error(IdleLedgerServiceError::Provider(ProviderError::Rpc {
+                method: "eth_getTransactionByHash",
+                code: 3,
+                category: RpcErrorCategory::Unknown,
+            })),
+            PreflightSourceError::RetryableAt("idle_ledger_replay_provider")
+        );
+        assert_eq!(
+            classify_idle_ledger_error(IdleLedgerServiceError::TransactionIdentity),
+            PreflightSourceError::RetryableAt("idle_ledger_replay_provider")
+        );
+        for failure in [
+            IdleLedgerServiceError::Event(EventDecodeError::AddressMismatch),
+            IdleLedgerServiceError::Ledger(IdleLockError::LockInvariant),
+            IdleLedgerServiceError::Arithmetic,
+            IdleLedgerServiceError::EndBalanceMismatch,
+        ] {
+            assert_eq!(
+                classify_idle_ledger_error(failure),
+                PreflightSourceError::VaultFatalAt("idle_ledger_replay")
+            );
+        }
     }
 
     #[test]

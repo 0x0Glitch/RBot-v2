@@ -240,6 +240,9 @@ pub enum TransactionState {
     ReplacementSigned = 15,
     /// Same-nonce cancellation bytes are durable but not yet durably broadcast.
     CancellationSigned = 16,
+    /// Canonical inclusion and conformance remain valid, but a rewound post-state snapshot must
+    /// be reconciled again. This state does not own the signer's nonce lane.
+    ReconciliationPending = 17,
 }
 
 impl TransactionState {
@@ -261,6 +264,21 @@ impl TransactionState {
                 | Self::ConformanceValidated
                 | Self::ForeignNonceConsumed
         )
+    }
+
+    /// Returns whether lifecycle evidence must remain pinned until post-state reconciliation.
+    #[must_use]
+    pub const fn requires_reconciliation(self) -> bool {
+        matches!(
+            self,
+            Self::ConformanceValidated | Self::ReconciliationPending
+        )
+    }
+
+    /// Returns whether compaction must retain the row and all evidence it references.
+    #[must_use]
+    pub const fn is_active_lifecycle(self) -> bool {
+        self.is_unresolved() || matches!(self, Self::ReconciliationPending)
     }
 
     /// Returns whether a transition follows the durable lifecycle graph.
@@ -334,6 +352,7 @@ impl TransactionState {
                     | Self::Failed
             ),
             Self::ConformanceValidated => matches!(next, Self::Reconciled | Self::Failed),
+            Self::ReconciliationPending => matches!(next, Self::Reconciled | Self::Failed),
             Self::AbortedBeforeSigning
             | Self::Reverted
             | Self::Reconciled
@@ -560,6 +579,31 @@ pub struct UnresolvedTransaction {
     pub last_broadcast_block: Option<u64>,
     /// Restricted kind of the latest durable signed attempt.
     pub last_attempt_kind: TransactionAttemptKind,
+}
+
+/// Secret-free durable view of a canonical transaction awaiting post-state reconciliation only.
+///
+/// These rows do not own a nonce and deliberately omit calldata and signed bytes. The executor
+/// may use them only to resume the existing current-state reconciliation path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingReconciliationTransaction {
+    /// Stable lifecycle identity.
+    pub transaction_id: TransactionId,
+    /// Vault whose already-canonical action must be revalidated.
+    pub vault: VaultAddress,
+    /// Historical signer identity. Only this vault is excluded from new work while the row is
+    /// pending; a nonce-owning unresolved transaction is what excludes the full signer lane.
+    pub signer: Address,
+    /// Original nonce, used only for deterministic oldest-first ordering.
+    pub nonce: u64,
+    /// Current durable state. This is always `ReconciliationPending`.
+    pub state: TransactionState,
+    /// Canonically included signed-attempt hash.
+    pub transaction_hash: Option<B256>,
+    /// Still-canonical inclusion block number.
+    pub included_block: u64,
+    /// Still-canonical inclusion block hash.
+    pub included_block_hash: B256,
 }
 
 /// Secret-free durable transaction summary for operator observability.

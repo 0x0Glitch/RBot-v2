@@ -32,19 +32,29 @@ use super::{
     models::{
         CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
         DurableTransactionSummary, FinalPreflightRecord, NonceReservation, PendingConformance,
-        PendingReconciliationContext, PersistedTopology, RateMovementReservationRecord,
-        RateMovementReservationState, ReconciliationRecord, RewindResult, SignedAttemptRecord,
-        SignedTransactionRecord, TransactionAttemptKind, TransactionState, TransactionTransition,
-        UnresolvedTransaction,
+        PendingReconciliationContext, PendingReconciliationTransaction, PersistedTopology,
+        RateMovementReservationRecord, RateMovementReservationState, ReconciliationRecord,
+        RewindResult, SignedAttemptRecord, SignedTransactionRecord, TransactionAttemptKind,
+        TransactionState, TransactionTransition, UnresolvedTransaction,
     },
 };
 
 /// Default bounded storage mailbox capacity.
 pub const DEFAULT_STORAGE_CHANNEL_CAPACITY: usize = 128;
+/// Maximum reconciliation-only rows returned by one bounded actor request.
+pub const MAX_PENDING_RECONCILIATIONS_PER_LOAD: usize = 1_024;
 const STORAGE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const JSON_FORMAT_VERSION: u32 = 4;
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const JOURNAL_SEGMENT_EVENTS: u64 = 128;
+/// Maximum accepted checkpoint size before JSON parsing.
+pub const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum accepted journal manifest size before JSON parsing.
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// Maximum accepted size of one append-only journal segment.
+pub const MAX_JOURNAL_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum number of journal segments considered during one startup.
+pub const MAX_JOURNAL_SEGMENTS: usize = 16;
 const HOT_BLOCK_RETENTION: u64 = 512;
 const HOT_SNAPSHOT_RETENTION: usize = 32;
 const HOT_PLAN_RETENTION: usize = 32;
@@ -197,7 +207,7 @@ impl JsonStore {
         let mut movement_migration = false;
         let checkpoint_exists = path.exists();
         let mut state = if checkpoint_exists {
-            let bytes = std::fs::read(&path)?;
+            let bytes = read_bounded(&path, MAX_CHECKPOINT_BYTES, "checkpoint")?;
             let mut state: JsonState = serde_json::from_slice(&bytes)?;
             match state.format_version {
                 JSON_FORMAT_VERSION => {}
@@ -225,8 +235,10 @@ impl JsonStore {
         let (manifest_path, journal_dir) = journal_paths(&path)?;
         std::fs::create_dir_all(&journal_dir)?;
         let manifest = if manifest_path.exists() {
-            Some(serde_json::from_slice::<JournalManifest>(&std::fs::read(
+            Some(serde_json::from_slice::<JournalManifest>(&read_bounded(
                 &manifest_path,
+                MAX_MANIFEST_BYTES,
+                "manifest",
             )?)?)
         } else {
             None
@@ -470,17 +482,27 @@ fn journal_segment_start(path: &Path) -> Option<u64> {
 }
 
 fn journal_segment_paths(directory: &Path) -> Result<Vec<PathBuf>, StorageError> {
-    let mut paths = std::fs::read_dir(directory)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| journal_segment_start(path).is_some())
-        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if journal_segment_start(&path).is_none() {
+            continue;
+        }
+        paths.push(path);
+        if paths.len() > MAX_JOURNAL_SEGMENTS {
+            return Err(StorageError::InputTooLarge {
+                kind: "journal segment count",
+                actual: u64::try_from(paths.len()).unwrap_or(u64::MAX),
+                maximum: u64::try_from(MAX_JOURNAL_SEGMENTS).unwrap_or(u64::MAX),
+            });
+        }
+    }
     paths.sort_by_key(|path| journal_segment_start(path).unwrap_or(u64::MAX));
     Ok(paths)
 }
 
 fn read_journal_segment(path: &Path) -> Result<Vec<JournalRecord>, StorageError> {
-    let bytes = std::fs::read(path)?;
+    let bytes = read_bounded(path, MAX_JOURNAL_SEGMENT_BYTES, "journal segment")?;
     let mut records = Vec::new();
     let mut offset = 0_usize;
     for chunk in bytes.split_inclusive(|byte| *byte == b'\n') {
@@ -505,6 +527,27 @@ fn read_journal_segment(path: &Path) -> Result<Vec<JournalRecord>, StorageError>
             .ok_or(StorageError::Invariant("journal offset overflow"))?;
     }
     Ok(records)
+}
+
+fn read_bounded(path: &Path, maximum: u64, kind: &'static str) -> Result<Vec<u8>, StorageError> {
+    let declared = std::fs::metadata(path)?.len();
+    if declared > maximum {
+        return Err(StorageError::InputTooLarge {
+            kind,
+            actual: declared,
+            maximum,
+        });
+    }
+    let bytes = std::fs::read(path)?;
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual > maximum {
+        return Err(StorageError::InputTooLarge {
+            kind,
+            actual,
+            maximum,
+        });
+    }
+    Ok(bytes)
 }
 
 fn replay_journal(
@@ -561,7 +604,7 @@ fn compact_hot_state(state: &mut JsonState) {
     let referenced_plan_ids = state
         .transactions
         .iter()
-        .filter(|transaction| transaction.state.is_unresolved())
+        .filter(|transaction| transaction.state.is_active_lifecycle())
         .filter_map(|transaction| transaction.reservation.plan_id)
         .collect::<std::collections::BTreeSet<_>>();
     let referenced_plans = state
@@ -648,7 +691,7 @@ fn compact_hot_state(state: &mut JsonState) {
     let mut pinned_blocks = state
         .transactions
         .iter()
-        .filter(|transaction| transaction.state.is_unresolved())
+        .filter(|transaction| transaction.state.is_active_lifecycle())
         .flat_map(|transaction| {
             [
                 Some(transaction.reservation.created_block),
@@ -764,7 +807,7 @@ fn compact_lifecycle_history(state: &mut JsonState) {
     let mut terminal = state
         .transactions
         .iter()
-        .filter(|row| !row.state.is_unresolved())
+        .filter(|row| !row.state.is_active_lifecycle())
         .map(|row| (row.reservation.created_at, row.reservation.transaction_id))
         .collect::<Vec<_>>();
     terminal.sort();
@@ -775,7 +818,7 @@ fn compact_lifecycle_history(state: &mut JsonState) {
         .map(|(_, transaction_id)| transaction_id)
         .collect::<BTreeSet<_>>();
     state.transactions.retain(|row| {
-        row.state.is_unresolved()
+        row.state.is_active_lifecycle()
             || row.reservation.created_at >= rolling_cutoff
             || retained_terminal.contains(&row.reservation.transaction_id)
     });
@@ -1026,6 +1069,18 @@ enum StorageCommand {
         /// Completion acknowledgment.
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
+    /// Atomically closes a successfully conformed transaction whose later exact-state check
+    /// failed, preserving the movement that already happened on-chain.
+    FinalizeConformedPostStateFailure {
+        /// Stable transaction identity.
+        transaction_id: crate::domain::TransactionId,
+        /// Reconciliation lifecycle state observed by the caller.
+        expected_state: TransactionState,
+        /// Unix failure-classification timestamp.
+        updated_at: u64,
+        /// Completion acknowledgment.
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
     /// Load exact data required to validate one confirmed transaction.
     LoadPendingConformance {
         /// Stable lifecycle identity.
@@ -1039,6 +1094,12 @@ enum StorageCommand {
         transaction_id: crate::domain::TransactionId,
         /// Reconciliation context.
         reply: oneshot::Sender<Result<Option<PendingReconciliationContext>, StorageError>>,
+    },
+    /// Load a bounded oldest-first set of reconciliation-only rows across all affected vaults.
+    /// Exceeding the audited bound fails explicitly; it never returns an incomplete exclusion set.
+    LoadPendingReconciliations {
+        /// Reconciliation-only rows in deterministic signer/nonce order.
+        reply: oneshot::Sender<Result<Vec<PendingReconciliationTransaction>, StorageError>>,
     },
     /// Load one exact snapshot for a vault and complete canonical block identity.
     LoadExactSnapshot {
@@ -1055,6 +1116,8 @@ enum StorageCommand {
         vault: VaultAddress,
         /// Oldest acceptable block number.
         minimum_block: u64,
+        /// Newest acceptable block number, or no upper bound.
+        maximum_block: Option<u64>,
         /// Snapshot result.
         reply: oneshot::Sender<Result<Option<ExactVaultSnapshot>, StorageError>>,
     },
@@ -1634,6 +1697,23 @@ impl StorageHandle {
         .await
     }
 
+    /// Marks a successfully conformed transaction failed after post-state validation while
+    /// atomically accounting its already-executed rate movement as confirmed.
+    pub async fn finalize_conformed_post_state_failure(
+        &self,
+        transaction_id: crate::domain::TransactionId,
+        expected_state: TransactionState,
+        updated_at: u64,
+    ) -> Result<(), StorageError> {
+        self.request(|reply| StorageCommand::FinalizeConformedPostStateFailure {
+            transaction_id,
+            expected_state,
+            updated_at,
+            reply,
+        })
+        .await
+    }
+
     /// Loads the immutable plan/envelope context for one confirmed transaction.
     pub async fn load_pending_conformance(
         &self,
@@ -1656,6 +1736,15 @@ impl StorageHandle {
             reply,
         })
         .await
+    }
+
+    /// Loads bounded oldest-first post-state reconciliation work for every affected vault.
+    /// An over-capacity active set fails closed instead of being silently truncated.
+    pub async fn load_pending_reconciliations(
+        &self,
+    ) -> Result<Vec<PendingReconciliationTransaction>, StorageError> {
+        self.request(|reply| StorageCommand::LoadPendingReconciliations { reply })
+            .await
     }
 
     /// Loads a snapshot bound to the exact canonical block, preferring verified idle evidence.
@@ -1681,6 +1770,26 @@ impl StorageHandle {
         self.request(|reply| StorageCommand::LoadLatestExactSnapshot {
             vault,
             minimum_block,
+            maximum_block: None,
+            reply,
+        })
+        .await
+    }
+
+    /// Loads the newest durable exact snapshot inside an inclusive canonical-height window.
+    pub async fn load_latest_exact_snapshot_in_range(
+        &self,
+        vault: VaultAddress,
+        minimum_block: u64,
+        maximum_block: u64,
+    ) -> Result<Option<ExactVaultSnapshot>, StorageError> {
+        if minimum_block > maximum_block {
+            return Err(StorageError::Invariant("exact snapshot range is inverted"));
+        }
+        self.request(|reply| StorageCommand::LoadLatestExactSnapshot {
+            vault,
+            minimum_block,
+            maximum_block: Some(maximum_block),
             reply,
         })
         .await
@@ -2163,6 +2272,21 @@ fn run_actor(
                     )
                 }));
             }
+            StorageCommand::FinalizeConformedPostStateFailure {
+                transaction_id,
+                expected_state,
+                updated_at,
+                reply,
+            } => {
+                let _ = reply.send(store.commit(|state| {
+                    finalize_conformed_post_state_failure(
+                        state,
+                        transaction_id,
+                        expected_state,
+                        updated_at,
+                    )
+                }));
+            }
             StorageCommand::LoadPendingConformance {
                 transaction_id,
                 reply,
@@ -2177,6 +2301,9 @@ fn run_actor(
                     &store.state,
                     transaction_id,
                 ));
+            }
+            StorageCommand::LoadPendingReconciliations { reply } => {
+                let _ = reply.send(load_pending_reconciliations(&store.state));
             }
             StorageCommand::LoadExactSnapshot {
                 vault,
@@ -2203,35 +2330,15 @@ fn run_actor(
             StorageCommand::LoadLatestExactSnapshot {
                 vault,
                 minimum_block,
+                maximum_block,
                 reply,
             } => {
-                let latest_number = store
-                    .state
-                    .exact_snapshots
-                    .iter()
-                    .filter(|entry| {
-                        entry.snapshot.parent.vault == vault.0
-                            && entry.snapshot.context.block.number >= minimum_block
-                    })
-                    .map(|entry| entry.snapshot.context.block.number)
-                    .max();
-                let snapshot = latest_number.and_then(|number| {
-                    let matching = store
-                        .state
-                        .exact_snapshots
-                        .iter()
-                        .rev()
-                        .filter(|entry| {
-                            entry.snapshot.parent.vault == vault.0
-                                && entry.snapshot.context.block.number == number
-                        })
-                        .collect::<Vec<_>>();
-                    matching
-                        .iter()
-                        .find(|entry| entry.snapshot.idle_locks.verified)
-                        .or_else(|| matching.first())
-                        .map(|entry| entry.snapshot.clone())
-                });
+                let snapshot = load_latest_exact_snapshot_in_range(
+                    &store.state,
+                    vault,
+                    minimum_block,
+                    maximum_block.unwrap_or(u64::MAX),
+                );
                 let _ = reply.send(Ok(snapshot));
             }
             StorageCommand::LoadUnresolved { signer, reply } => {
@@ -2821,6 +2928,40 @@ fn confirmed_gas_spend_since(
     Ok(spend)
 }
 
+fn load_latest_exact_snapshot_in_range(
+    state: &JsonState,
+    vault: VaultAddress,
+    minimum_block: u64,
+    maximum_block: u64,
+) -> Option<ExactVaultSnapshot> {
+    let latest_number = state
+        .exact_snapshots
+        .iter()
+        .filter(|entry| {
+            entry.snapshot.parent.vault == vault.0
+                && entry.snapshot.context.block.number >= minimum_block
+                && entry.snapshot.context.block.number <= maximum_block
+        })
+        .map(|entry| entry.snapshot.context.block.number)
+        .max()?;
+    state
+        .exact_snapshots
+        .iter()
+        .rev()
+        .filter(|entry| {
+            entry.snapshot.parent.vault == vault.0
+                && entry.snapshot.context.block.number == latest_number
+        })
+        .find(|entry| entry.snapshot.idle_locks.verified)
+        .or_else(|| {
+            state.exact_snapshots.iter().rev().find(|entry| {
+                entry.snapshot.parent.vault == vault.0
+                    && entry.snapshot.context.block.number == latest_number
+            })
+        })
+        .map(|entry| entry.snapshot.clone())
+}
+
 fn rewind(
     state: &mut JsonState,
     chain_id: u64,
@@ -2828,6 +2969,15 @@ fn rewind(
 ) -> Result<RewindResult, StorageError> {
     let old_blocks = state.canonical_blocks.len();
     let old_logs = state.canonical_logs.len();
+    // A transaction may have been included before the common ancestor but reconciled from a
+    // later exact snapshot. Losing only that snapshot invalidates the terminal reconciliation,
+    // not the still-canonical inclusion and conformance proof.
+    let orphaned_reconciliation_transaction_ids = state
+        .reconciliation_records
+        .iter()
+        .filter(|record| record.block.number > ancestor.number)
+        .map(|record| record.transaction_id)
+        .collect::<BTreeSet<_>>();
     // Capture receipt ownership before removing orphaned canonical evidence. Older durable rows
     // did not store inclusion coordinates for terminal reverts/cancellations, so attempt hashes
     // are also required to migrate them safely through a reorg.
@@ -2865,7 +3015,7 @@ fn rewind(
         entry.snapshot.context.chain_id != chain_id
             || entry.snapshot.context.block.number <= ancestor.number
     });
-    let orphaned_transaction_ids = state
+    let mut orphaned_transaction_ids = state
         .transactions
         .iter()
         .filter(|transaction| {
@@ -2882,12 +3032,52 @@ fn rewind(
                         | TransactionState::Cancelled
                         | TransactionState::ForeignNonceConsumed
                         | TransactionState::ConformanceValidated
+                        | TransactionState::ReconciliationPending
                         | TransactionState::Reconciled
                         | TransactionState::Failed
                 )
         })
         .map(|transaction| transaction.reservation.transaction_id)
         .collect::<BTreeSet<_>>();
+    let mut reconciliation_revalidation_ids = BTreeSet::new();
+    for transaction_id in &orphaned_reconciliation_transaction_ids {
+        if orphaned_transaction_ids.contains(transaction_id) {
+            continue;
+        }
+        let transaction = state
+            .transactions
+            .iter()
+            .find(|transaction| transaction.reservation.transaction_id == *transaction_id)
+            .ok_or(StorageError::Invariant(
+                "orphaned reconciliation lost its transaction",
+            ))?;
+        if transaction.state != TransactionState::Reconciled {
+            return Err(StorageError::Invariant(
+                "reconciliation record belongs to a non-reconciled transaction",
+            ));
+        }
+        let canonical_inclusion = transaction
+            .included_block
+            .zip(transaction.included_block_hash)
+            .is_some_and(|(number, hash)| {
+                state.canonical_blocks.iter().any(|canonical| {
+                    canonical.chain_id == chain_id
+                        && canonical.block.number == number
+                        && canonical.block.hash == hash
+                }) && state.conformance_records.iter().any(|conformance| {
+                    conformance.transaction_id == *transaction_id
+                        && conformance.block_number == number
+                        && conformance.block_hash == hash
+                })
+            });
+        if canonical_inclusion {
+            reconciliation_revalidation_ids.insert(*transaction_id);
+        } else {
+            // Without retained canonical inclusion evidence, fall back to the existing receipt
+            // recovery path instead of preserving an unprovable terminal transaction.
+            orphaned_transaction_ids.insert(*transaction_id);
+        }
+    }
     for reservation in state
         .rate_movement_reservations
         .iter_mut()
@@ -2944,6 +3134,12 @@ fn rewind(
     state
         .top_k_apy_memory
         .retain(|entry| entry.memory.last_observed_block <= ancestor.number);
+    for transaction in &mut state.transactions {
+        if reconciliation_revalidation_ids.contains(&transaction.reservation.transaction_id) {
+            transaction.state = TransactionState::ReconciliationPending;
+            transaction.updated_at = ancestor.timestamp;
+        }
+    }
     let mut transactions_orphaned = 0_u64;
     for transaction in &mut state.transactions {
         if orphaned_transaction_ids.contains(&transaction.reservation.transaction_id)
@@ -2955,6 +3151,7 @@ fn rewind(
                     | TransactionState::Cancelled
                     | TransactionState::ForeignNonceConsumed
                     | TransactionState::ConformanceValidated
+                    | TransactionState::ReconciliationPending
                     | TransactionState::Reconciled
                     | TransactionState::Failed
             )
@@ -3453,9 +3650,11 @@ fn load_pending_reconciliation_context(
     else {
         return Ok(None);
     };
-    if row.state != TransactionState::ConformanceValidated {
-        return Ok(None);
-    }
+    let expected_movement_state = match row.state {
+        TransactionState::ConformanceValidated => RateMovementReservationState::Pending,
+        TransactionState::ReconciliationPending => RateMovementReservationState::Confirmed,
+        _ => return Ok(None),
+    };
     let plan_id = row
         .reservation
         .plan_id
@@ -3473,7 +3672,7 @@ fn load_pending_reconciliation_context(
         .iter()
         .filter(|reservation| {
             reservation.transaction_id == transaction_id
-                && reservation.state == RateMovementReservationState::Pending
+                && reservation.state == expected_movement_state
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -3505,6 +3704,57 @@ fn load_pending_reconciliation_context(
         rate_movement,
         rate_episode,
     }))
+}
+
+fn load_pending_reconciliations(
+    state: &JsonState,
+) -> Result<Vec<PendingReconciliationTransaction>, StorageError> {
+    let mut rows = state
+        .transactions
+        .iter()
+        .filter(|row| row.state == TransactionState::ReconciliationPending)
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| {
+        (
+            row.reservation.signer,
+            row.reservation.nonce,
+            row.reservation.transaction_id,
+        )
+    });
+    if rows.len() > MAX_PENDING_RECONCILIATIONS_PER_LOAD {
+        return Err(StorageError::Invariant(
+            "pending reconciliation set exceeds bounded executor capacity",
+        ));
+    }
+    rows.into_iter()
+        .map(|row| {
+            let included_block = row.included_block.ok_or(StorageError::Invariant(
+                "reconciliation-pending transaction lost its inclusion block",
+            ))?;
+            let included_block_hash = row.included_block_hash.ok_or(StorageError::Invariant(
+                "reconciliation-pending transaction lost its inclusion hash",
+            ))?;
+            if !state.conformance_records.iter().any(|record| {
+                record.transaction_id == row.reservation.transaction_id
+                    && record.block_number == included_block
+                    && record.block_hash == included_block_hash
+            }) {
+                return Err(StorageError::Invariant(
+                    "reconciliation-pending transaction lost conformance evidence",
+                ));
+            }
+            Ok(PendingReconciliationTransaction {
+                transaction_id: row.reservation.transaction_id,
+                vault: row.reservation.vault,
+                signer: row.reservation.signer,
+                nonce: row.reservation.nonce,
+                state: row.state,
+                transaction_hash: row.transaction_hash,
+                included_block,
+                included_block_hash,
+            })
+        })
+        .collect()
 }
 
 fn persist_conformance(
@@ -3548,6 +3798,170 @@ fn persist_conformance(
     Ok(())
 }
 
+fn finalize_conformed_post_state_failure(
+    state: &mut JsonState,
+    transaction_id: crate::domain::TransactionId,
+    expected_state: TransactionState,
+    updated_at: u64,
+) -> Result<(), StorageError> {
+    if !expected_state.requires_reconciliation()
+        || !expected_state.permits(TransactionState::Failed)
+    {
+        return Err(StorageError::InvalidTransition {
+            from: expected_state,
+            to: TransactionState::Failed,
+        });
+    }
+    let row_index = state
+        .transactions
+        .iter()
+        .position(|row| row.reservation.transaction_id == transaction_id)
+        .ok_or(StorageError::StaleTransition)?;
+    let row = state
+        .transactions
+        .get(row_index)
+        .ok_or(StorageError::StaleTransition)?;
+    if row.state != expected_state {
+        return Err(StorageError::StaleTransition);
+    }
+    let plan_id = row
+        .reservation
+        .plan_id
+        .ok_or(StorageError::Invariant("conformed transaction has no plan"))?;
+    let included_block = row.included_block.ok_or(StorageError::Invariant(
+        "conformed transaction has no inclusion block",
+    ))?;
+    let included_block_hash = row.included_block_hash.ok_or(StorageError::Invariant(
+        "conformed transaction has no inclusion hash",
+    ))?;
+    let transaction_hash = row.transaction_hash.ok_or(StorageError::Invariant(
+        "conformed transaction has no included attempt hash",
+    ))?;
+    let plan = state
+        .plans
+        .iter()
+        .find(|entry| entry.plan.plan_id == plan_id)
+        .map(|entry| &entry.plan)
+        .ok_or(StorageError::Invariant(
+            "conformed transaction has no durable plan",
+        ))?;
+    if !state.canonical_blocks.iter().any(|canonical| {
+        canonical.chain_id == plan.snapshot.chain_id
+            && canonical.block.number == included_block
+            && canonical.block.hash == included_block_hash
+    }) {
+        return Err(StorageError::StaleTransition);
+    }
+    let conformances = state
+        .conformance_records
+        .iter()
+        .filter(|record| record.transaction_id == transaction_id)
+        .collect::<Vec<_>>();
+    if conformances.len() != 1 {
+        return Err(StorageError::Invariant(
+            "post-state failure requires one conformance record",
+        ));
+    }
+    let conformance = conformances
+        .first()
+        .copied()
+        .ok_or(StorageError::Invariant("conformance record disappeared"))?;
+    if conformance.transaction_hash != transaction_hash
+        || conformance.block_number != included_block
+        || conformance.block_hash != included_block_hash
+    {
+        return Err(StorageError::Invariant(
+            "post-state failure conformance identity mismatch",
+        ));
+    }
+
+    let movement_indexes = state
+        .rate_movement_reservations
+        .iter()
+        .enumerate()
+        .filter(|(_, reservation)| reservation.transaction_id == transaction_id)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if movement_indexes.len() > 1 {
+        return Err(StorageError::Invariant(
+            "transaction owns multiple rate movements",
+        ));
+    }
+    let rate_plan = plan.reason == crate::domain::PlanReason::RateRebalance;
+    if rate_plan != !movement_indexes.is_empty() {
+        return Err(StorageError::Invariant(
+            "conformed plan and rate movement disagree",
+        ));
+    }
+    if let Some(movement_index) = movement_indexes.first().copied() {
+        let reservation = state
+            .rate_movement_reservations
+            .get(movement_index)
+            .cloned()
+            .ok_or(StorageError::Invariant("rate movement disappeared"))?;
+        if plan.episode_id != Some(reservation.episode_id)
+            || plan.projection.movement_assets != reservation.movement_assets
+            || conformance.movement_assets != reservation.movement_assets
+        {
+            return Err(StorageError::Invariant(
+                "conformed rate movement does not match its plan or receipt",
+            ));
+        }
+        let episode = state
+            .rate_episodes
+            .iter_mut()
+            .find(|entry| entry.episode.episode_id == reservation.episode_id)
+            .ok_or(StorageError::Invariant("reserved rate episode disappeared"))?;
+        match expected_state {
+            TransactionState::ConformanceValidated => {
+                if reservation.state != RateMovementReservationState::Pending {
+                    return Err(StorageError::Invariant(
+                        "new conformance failure has no pending rate movement",
+                    ));
+                }
+                episode
+                    .episode
+                    .confirm_pending(reservation.movement_assets)
+                    .map_err(|_| {
+                        StorageError::Invariant("conformed rate movement cannot be confirmed")
+                    })?;
+                let persisted = state
+                    .rate_movement_reservations
+                    .get_mut(movement_index)
+                    .ok_or(StorageError::Invariant("rate movement disappeared"))?;
+                persisted.state = RateMovementReservationState::Confirmed;
+            }
+            TransactionState::ReconciliationPending => {
+                if reservation.state != RateMovementReservationState::Confirmed
+                    || episode.episode.confirmed_movement.0 < reservation.movement_assets
+                {
+                    return Err(StorageError::Invariant(
+                        "revalidation failure lost its confirmed rate movement",
+                    ));
+                }
+            }
+            _ => {
+                return Err(StorageError::InvalidTransition {
+                    from: expected_state,
+                    to: TransactionState::Failed,
+                });
+            }
+        }
+    }
+    let row = state
+        .transactions
+        .get_mut(row_index)
+        .ok_or(StorageError::StaleTransition)?;
+    if row.state != expected_state {
+        return Err(StorageError::StaleTransition);
+    }
+    // Do not route this through `transition_transaction`: `Failed` ordinarily releases an
+    // unresolved movement, but conformance proves this movement already executed on-chain.
+    row.state = TransactionState::Failed;
+    row.updated_at = updated_at;
+    Ok(())
+}
+
 fn persist_reconciliation(
     state: &mut JsonState,
     record: ReconciliationRecord,
@@ -3570,19 +3984,38 @@ fn persist_reconciliation(
             "invalid or duplicate reconciliation record",
         ));
     }
+    if !state.canonical_blocks.iter().any(|canonical| {
+        canonical.chain_id == snapshot.context.chain_id && canonical.block == record.block
+    }) {
+        // The source may have checked this header immediately before submitting the storage
+        // command, but a serialized canonical rewind can win that race. Never make the
+        // reconciliation terminal against an orphaned or untracked post-state snapshot.
+        return Err(StorageError::StaleTransition);
+    }
+    let (lifecycle_state, included_block) = state
+        .transactions
+        .iter()
+        .find(|row| row.reservation.transaction_id == record.transaction_id)
+        .map(|row| (row.state, row.included_block))
+        .ok_or(StorageError::StaleTransition)?;
+    let expected_movement_state = match lifecycle_state {
+        TransactionState::ConformanceValidated => RateMovementReservationState::Pending,
+        TransactionState::ReconciliationPending => RateMovementReservationState::Confirmed,
+        _ => return Err(StorageError::StaleTransition),
+    };
+    if included_block.is_none_or(|included| record.block.number < included) {
+        return Err(StorageError::StaleTransition);
+    }
     let movement_indexes = state
         .rate_movement_reservations
         .iter()
         .enumerate()
-        .filter(|(_, reservation)| {
-            reservation.transaction_id == record.transaction_id
-                && reservation.state == RateMovementReservationState::Pending
-        })
+        .filter(|(_, reservation)| reservation.transaction_id == record.transaction_id)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     if movement_indexes.len() > 1 {
         return Err(StorageError::Invariant(
-            "transaction owns multiple pending rate movements",
+            "transaction owns multiple rate movements",
         ));
     }
     match (
@@ -3599,15 +4032,22 @@ fn persist_reconciliation(
                     "reconciliation confirms the wrong rate episode",
                 ));
             }
+            if reservation.state != expected_movement_state {
+                return Err(StorageError::Invariant(
+                    "reconciliation lifecycle and rate movement state disagree",
+                ));
+            }
             let mut expected = state
                 .rate_episodes
                 .iter()
                 .find(|entry| entry.episode.episode_id == reservation.episode_id)
                 .map(|entry| entry.episode.clone())
                 .ok_or(StorageError::Invariant("reserved rate episode disappeared"))?;
-            expected
-                .confirm_pending(reservation.movement_assets)
-                .map_err(|_| StorageError::Invariant("rate movement cannot be confirmed"))?;
+            if lifecycle_state == TransactionState::ConformanceValidated {
+                expected
+                    .confirm_pending(reservation.movement_assets)
+                    .map_err(|_| StorageError::Invariant("rate movement cannot be confirmed"))?;
+            }
             if &expected != confirmed {
                 return Err(StorageError::Invariant(
                     "confirmed rate episode does not match reserved movement",
@@ -3626,11 +4066,7 @@ fn persist_reconciliation(
         .iter_mut()
         .find(|row| row.reservation.transaction_id == record.transaction_id)
         .ok_or(StorageError::StaleTransition)?;
-    if row.state != TransactionState::ConformanceValidated
-        || row
-            .included_block
-            .is_none_or(|included| record.block.number < included)
-    {
+    if row.state != lifecycle_state {
         return Err(StorageError::StaleTransition);
     }
     row.state = TransactionState::Reconciled;
@@ -3648,7 +4084,9 @@ fn persist_reconciliation(
     if let Some(episode) = confirmed_episode {
         persist_episode(state, episode, record.reconciled_at)?;
     }
-    if let Some(index) = movement_indexes.first().copied() {
+    if lifecycle_state == TransactionState::ConformanceValidated
+        && let Some(index) = movement_indexes.first().copied()
+    {
         let reservation = state
             .rate_movement_reservations
             .get_mut(index)
@@ -3775,22 +4213,150 @@ fn persist_episode(
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod compaction_tests {
+    use std::collections::BTreeSet;
+
     use alloy::primitives::{Address, B256, Bytes, U256};
     use tempfile::TempDir;
 
     use super::{
         HOT_BLOCK_RETENTION, HOT_TOPOLOGY_RETENTION_PER_VAULT, HOT_TRANSACTION_RETENTION,
         JOURNAL_SEGMENT_EVENTS, JsonState, JsonStore, MAX_DURABLE_REORG_RESCAN_BLOCKS,
-        TopologyRevision, TransactionRow, compact_hot_state,
+        MAX_PENDING_RECONCILIATIONS_PER_LOAD, TopologyRevision, TransactionRow, compact_hot_state,
+        load_pending_reconciliations,
     };
     use crate::{
         domain::{AdapterAddress, BlockRef, TransactionId, VaultAddress},
         state::topology::TopologyIndex,
-        storage::models::{
-            CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, NonceReservation,
-            SignedAttemptRecord, TransactionAttemptKind, TransactionState,
+        storage::{
+            StorageError,
+            models::{
+                CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord,
+                ConformanceRecord, NonceReservation, SignedAttemptRecord, TransactionAttemptKind,
+                TransactionState,
+            },
         },
     };
+
+    #[test]
+    fn pending_reconciliation_load_is_per_vault_not_per_signer() {
+        let mut state = JsonState::default();
+        let signer = Address::with_last_byte(0x44);
+        for (nonce, vault_byte, transaction_byte, block_number) in
+            [(7_u64, 0xa1_u8, 0x71_u8, 13_u64), (8, 0xb1, 0x72, 14)]
+        {
+            let transaction_id = TransactionId(B256::repeat_byte(transaction_byte));
+            let transaction_hash = B256::repeat_byte(transaction_byte.saturating_add(1));
+            let block_hash = B256::from(U256::from(block_number));
+            state.transactions.push(TransactionRow {
+                reservation: NonceReservation {
+                    transaction_id,
+                    plan_id: None,
+                    vault: VaultAddress(Address::with_last_byte(vault_byte)),
+                    signer,
+                    nonce,
+                    calldata: Bytes::new(),
+                    calldata_hash: B256::ZERO,
+                    max_fee_per_gas: U256::from(24_u8),
+                    max_priority_fee_per_gas: U256::ONE,
+                    gas_limit: 25_000,
+                    movement_assets: U256::from(25_u8),
+                    created_block: 10,
+                    created_at: 10,
+                },
+                state: TransactionState::ReconciliationPending,
+                transaction_hash: Some(transaction_hash),
+                raw_signed_transaction: None,
+                submitted_at: Some(10),
+                included_block: Some(block_number),
+                included_block_hash: Some(block_hash),
+                updated_at: block_number,
+            });
+            state.conformance_records.push(ConformanceRecord {
+                transaction_id,
+                transaction_hash,
+                block_number,
+                block_hash,
+                action_count: 1,
+                movement_assets: U256::from(25_u8),
+                positive_loss_assets: U256::ZERO,
+                report_hash: B256::repeat_byte(transaction_byte.saturating_add(2)),
+                validated_at: block_number,
+            });
+        }
+
+        let pending = load_pending_reconciliations(&state)
+            .unwrap_or_else(|error| panic!("load reconciliation rows: {error}"));
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|row| row.signer == signer));
+        assert_eq!(
+            pending.iter().map(|row| row.vault).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                VaultAddress(Address::with_last_byte(0xa1)),
+                VaultAddress(Address::with_last_byte(0xb1)),
+            ])
+        );
+    }
+
+    #[test]
+    fn pending_reconciliation_overflow_fails_before_returning_an_incomplete_exclusion_set() {
+        let mut state = JsonState::default();
+        let signer = Address::with_last_byte(0x44);
+        let row_count = MAX_PENDING_RECONCILIATIONS_PER_LOAD
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("test row count overflow"));
+        for index in 0..row_count {
+            let number = u64::try_from(index)
+                .unwrap_or_else(|error| panic!("test index conversion: {error}"));
+            let transaction_id = TransactionId(B256::from(U256::from(number.saturating_add(1))));
+            let transaction_hash = B256::from(U256::from(number.saturating_add(10_000)));
+            let included_block = number.saturating_add(100);
+            let block_hash = B256::from(U256::from(included_block));
+            let vault_byte = u8::try_from(index.checked_rem(255).unwrap_or_default())
+                .unwrap_or_else(|error| panic!("test vault byte conversion: {error}"));
+            state.transactions.push(TransactionRow {
+                reservation: NonceReservation {
+                    transaction_id,
+                    plan_id: None,
+                    vault: VaultAddress(Address::with_last_byte(vault_byte)),
+                    signer,
+                    nonce: number,
+                    calldata: Bytes::new(),
+                    calldata_hash: B256::ZERO,
+                    max_fee_per_gas: U256::from(24_u8),
+                    max_priority_fee_per_gas: U256::ONE,
+                    gas_limit: 25_000,
+                    movement_assets: U256::from(25_u8),
+                    created_block: 10,
+                    created_at: 10,
+                },
+                state: TransactionState::ReconciliationPending,
+                transaction_hash: Some(transaction_hash),
+                raw_signed_transaction: None,
+                submitted_at: Some(10),
+                included_block: Some(included_block),
+                included_block_hash: Some(block_hash),
+                updated_at: included_block,
+            });
+            state.conformance_records.push(ConformanceRecord {
+                transaction_id,
+                transaction_hash,
+                block_number: included_block,
+                block_hash,
+                action_count: 1,
+                movement_assets: U256::from(25_u8),
+                positive_loss_assets: U256::ZERO,
+                report_hash: B256::from(U256::from(number.saturating_add(20_000))),
+                validated_at: included_block,
+            });
+        }
+
+        assert!(matches!(
+            load_pending_reconciliations(&state),
+            Err(StorageError::Invariant(
+                "pending reconciliation set exceeds bounded executor capacity"
+            ))
+        ));
+    }
 
     #[test]
     fn long_initial_backfill_retains_early_topology_logs() {

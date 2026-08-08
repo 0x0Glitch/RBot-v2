@@ -127,8 +127,9 @@ are set with `maximum_log_range` rather than compiled into the binary.
 
 RPC URLs and signing secrets remain in the environment variables named by the
 configuration. For local test execution, `local_development.execute_chain_id`
-must explicitly equal the configured chain ID. Production release evidence can
-authorize only the restricted remote signer.
+must explicitly equal the configured chain ID. Production operation should use
+the restricted remote signer because a local environment key remains
+exportable.
 
 Initial EIP-1559 fees come from the provider's live `eth_gasPrice` and
 `eth_maxPriorityFeePerGas` responses. The bot signs with twice the live total
@@ -221,11 +222,20 @@ files, and rollout scripts intentionally live outside this source repository.
 The installed service should run the binary directly, for example:
 
 ```bash
+export MORPHO_V2_LOCK_DIR=/var/lib/morpho/process-locks
 /opt/morpho/current/morpho-v2-reallocator run \
   --config /etc/morpho/config.json \
   --protocol-lock /etc/morpho/protocol-lock.toml \
+  --release-evidence /etc/morpho/release-evidence.json \
   --bind 127.0.0.1:9090
 ```
+
+The `--release-evidence` argument and `MORPHO_V2_LOCK_DIR` are mandatory when an
+Execute configuration uses the recommended `remote_signer`; evidence must match
+the running binary, configuration, and protocol lock. A `local_development`
+signer is test-only: it requires the exact configured `execute_chain_id`, does
+not use the process-lock directory, and must omit `--release-evidence` because
+release evidence cannot authorize an exportable local key.
 
 The service uses `Type=notify`. Its watchdog is acknowledged only after the
 supervisor, canonical chain loop, state loop, and storage owner all demonstrate
@@ -270,19 +280,12 @@ docker compose -f monitoring/compose.yaml up -d
 ```
 
 Prometheus is available at `http://127.0.0.1:9091` and Grafana at
-`http://127.0.0.1:3000`. The supplied scrape target expects the reallocator on
-the Docker host at port 9090. On Linux, bind the read-only API to an interface
-reachable from Docker and restrict port 9090 with the host firewall:
-
-```bash
-./target/release/morpho-v2-reallocator run \
-  --config config.yaml \
-  --protocol-lock protocol-lock.local.toml \
-  --bind 0.0.0.0:9090
-```
-
-If Prometheus runs elsewhere, change only the target in
-`monitoring/prometheus.yml`.
+`http://127.0.0.1:3000`. The reallocator API is intentionally loopback-only
+because it has no authentication. Run Prometheus on the host or place an
+authenticated, access-controlled local proxy in front of the API; the binary
+rejects wildcard and other non-loopback binds. If Prometheus runs elsewhere,
+change the target and provide that protected proxy rather than exposing port
+9090 directly.
 
 ## Verify
 

@@ -50,6 +50,11 @@ pub struct PlanningRevision {
     pub snapshot_block: BlockRef,
     /// Exact snapshot fingerprint used by planning and preflight.
     pub snapshot_fingerprint: B256,
+    /// Canonical head through which the exact snapshot was safely projected.
+    ///
+    /// This may be later than `snapshot_block` for an atomic-latest provider only after canonical
+    /// replay proves that no relevant intervening event invalidates the exact base snapshot.
+    pub projection_block: BlockRef,
     /// Monotonic per-vault planner generation.
     pub planner_generation: u64,
     /// Complete merged reason set; replacing an older notification cannot lose a reason.
@@ -59,18 +64,20 @@ pub struct PlanningRevision {
 impl PlanningRevision {
     /// Returns whether one exact snapshot fully covers this immutable planning generation.
     #[must_use]
-    pub fn accepts_snapshot(
+    pub fn accepts_state(
         &self,
-        block: BlockRef,
+        snapshot_block: BlockRef,
         fingerprint: B256,
+        projection_block: BlockRef,
         topology_revision: B256,
         config_revision: B256,
     ) -> bool {
-        block == self.snapshot_block
+        snapshot_block == self.snapshot_block
             && fingerprint == self.snapshot_fingerprint
+            && projection_block == self.projection_block
             && topology_revision == self.topology_revision
             && config_revision == self.config_revision
-            && self.latest_relevant_event_block <= block.number
+            && self.latest_relevant_event_block <= projection_block.number
     }
 
     /// Rebinds an unprocessed event generation to a newer exact snapshot that contains it.
@@ -79,22 +86,28 @@ impl PlanningRevision {
     /// for another event. Read-set/topology/config identity may never be borrowed across this
     /// boundary.
     #[must_use]
-    pub fn rebind_to_covered_snapshot(
+    pub fn rebind_to_covered_state(
         &self,
-        block: BlockRef,
+        snapshot_block: BlockRef,
         fingerprint: B256,
+        projection_block: BlockRef,
         topology_revision: B256,
         config_revision: B256,
     ) -> Option<Self> {
-        if self.latest_relevant_event_block > block.number
+        let projection_follows_snapshot =
+            projection_block.number > snapshot_block.number || projection_block == snapshot_block;
+        if !projection_follows_snapshot
+            || projection_block.timestamp < snapshot_block.timestamp
+            || self.latest_relevant_event_block > projection_block.number
             || self.topology_revision != topology_revision
             || self.config_revision != config_revision
         {
             return None;
         }
         let mut rebound = self.clone();
-        rebound.snapshot_block = block;
+        rebound.snapshot_block = snapshot_block;
         rebound.snapshot_fingerprint = fingerprint;
+        rebound.projection_block = projection_block;
         Some(rebound)
     }
 }
@@ -294,7 +307,17 @@ impl DirtyAccumulator {
         config_revision: B256,
         snapshot_block: BlockRef,
         snapshot_fingerprint: B256,
+        projection_block: BlockRef,
     ) -> Option<PlanningRevision> {
+        let dirty = self.vaults.get(&vault)?;
+        let projection_follows_snapshot =
+            projection_block.number > snapshot_block.number || projection_block == snapshot_block;
+        if !projection_follows_snapshot
+            || projection_block.timestamp < snapshot_block.timestamp
+            || dirty.latest_relevant_event_block > projection_block.number
+        {
+            return None;
+        }
         let dirty = self.vaults.remove(&vault)?;
         Some(PlanningRevision {
             vault,
@@ -304,6 +327,7 @@ impl DirtyAccumulator {
             config_revision,
             snapshot_block,
             snapshot_fingerprint,
+            projection_block,
             planner_generation: dirty.planner_generation,
             dirty_reasons: dirty.reasons,
         })
@@ -368,6 +392,7 @@ mod tests {
                 B256::repeat_byte(3),
                 block(10_000),
                 B256::repeat_byte(4),
+                block(10_000),
             )
             .expect("test revision must exist");
         assert_eq!(revision.latest_relevant_event_block, 10_000);
@@ -387,6 +412,7 @@ mod tests {
                 B256::repeat_byte(3),
                 block(1),
                 B256::repeat_byte(4),
+                block(1),
             )
             .expect("test revision must exist");
         dirty.mark(vault, 2, DirtyReason::ReadSet, true);
@@ -397,6 +423,7 @@ mod tests {
                 B256::repeat_byte(3),
                 block(2),
                 B256::repeat_byte(6),
+                block(2),
             )
             .expect("test revision must exist");
         assert_eq!(first.read_set_revision, 1);
@@ -413,25 +440,39 @@ mod tests {
         let mut dirty = DirtyAccumulator::default();
         dirty.mark(vault, 9, DirtyReason::EconomicState, false);
         let revision = dirty
-            .bind_snapshot(vault, topology, config, block(10), fingerprint)
+            .bind_snapshot(vault, topology, config, block(10), fingerprint, block(10))
             .expect("test revision must exist");
-        assert!(revision.accepts_snapshot(block(10), fingerprint, topology, config));
+        assert!(revision.accepts_state(block(10), fingerprint, block(10), topology, config,));
 
         let mut event_above_snapshot = revision.clone();
         event_above_snapshot.latest_relevant_event_block = 11;
-        assert!(!event_above_snapshot.accepts_snapshot(block(10), fingerprint, topology, config));
-        assert!(!revision.accepts_snapshot(block(10), fingerprint, B256::repeat_byte(8), config));
+        assert!(!event_above_snapshot.accepts_state(
+            block(10),
+            fingerprint,
+            block(10),
+            topology,
+            config,
+        ));
+        assert!(!revision.accepts_state(
+            block(10),
+            fingerprint,
+            block(10),
+            B256::repeat_byte(8),
+            config,
+        ));
         let rebound = revision
-            .rebind_to_covered_snapshot(block(12), B256::repeat_byte(7), topology, config)
-            .expect("newer exact snapshot covers the same event generation");
+            .rebind_to_covered_state(block(12), B256::repeat_byte(7), block(12), topology, config)
+            .expect("newer exact state covers the same event generation");
         assert_eq!(rebound.snapshot_block, block(12));
         assert_eq!(rebound.snapshot_fingerprint, B256::repeat_byte(7));
+        assert_eq!(rebound.projection_block, block(12));
         assert_eq!(rebound.planner_generation, revision.planner_generation);
         assert!(
             revision
-                .rebind_to_covered_snapshot(
+                .rebind_to_covered_state(
                     block(12),
                     B256::repeat_byte(7),
+                    block(12),
                     B256::repeat_byte(8),
                     config,
                 )
@@ -451,6 +492,7 @@ mod tests {
                 B256::repeat_byte(3),
                 block(10),
                 B256::repeat_byte(4),
+                block(10),
             )
             .expect("test revision must exist");
         dirty.mark(vault, 9, DirtyReason::ReadSet, true);
@@ -461,6 +503,7 @@ mod tests {
                 B256::repeat_byte(3),
                 block(10),
                 B256::repeat_byte(6),
+                block(10),
             )
             .expect("test revision must exist");
         assert_ne!(old.read_set_revision, rebuilt.read_set_revision);
@@ -480,6 +523,7 @@ mod tests {
                 B256::repeat_byte(3),
                 block(300),
                 B256::repeat_byte(4),
+                block(300),
             )
             .expect("strategy tick revision");
         assert_eq!(revision.latest_relevant_event_block, 300);
@@ -498,6 +542,7 @@ mod tests {
                 B256::repeat_byte(3),
                 block(301),
                 B256::repeat_byte(4),
+                block(301),
             )
             .expect("continuation revision");
         assert_eq!(revision.latest_relevant_event_block, 301);
@@ -506,5 +551,57 @@ mod tests {
                 .dirty_reasons
                 .contains(&DirtyReason::StrategyContinuation)
         );
+    }
+
+    #[test]
+    fn later_projection_covers_strategy_and_post_transaction_work_once() {
+        let vault = VaultAddress(Address::with_last_byte(1));
+        let topology = B256::repeat_byte(2);
+        let config = B256::repeat_byte(3);
+        let fingerprint = B256::repeat_byte(4);
+        let snapshot = block(100);
+        let projected = block(105);
+        let mut dirty = DirtyAccumulator::default();
+        dirty.mark(vault, 105, DirtyReason::StrategyTick, false);
+        dirty.mark_post_transaction(vault, 104);
+
+        let revision = dirty
+            .bind_snapshot(vault, topology, config, snapshot, fingerprint, projected)
+            .expect("later canonical projection covers both dirty reasons");
+        assert!(!dirty.is_vault_dirty(vault));
+        assert_eq!(revision.snapshot_block, snapshot);
+        assert_eq!(revision.projection_block, projected);
+        assert_eq!(revision.latest_relevant_event_block, 105);
+        assert!(revision.dirty_reasons.contains(&DirtyReason::StrategyTick));
+        assert!(
+            revision
+                .dirty_reasons
+                .contains(&DirtyReason::PostTransaction)
+        );
+        assert!(
+            revision
+                .rebind_to_covered_state(snapshot, fingerprint, projected, topology, config)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn projection_before_latest_relevant_event_keeps_work_dirty() {
+        let vault = VaultAddress(Address::with_last_byte(1));
+        let mut dirty = DirtyAccumulator::default();
+        dirty.mark_post_transaction(vault, 105);
+        assert!(
+            dirty
+                .bind_snapshot(
+                    vault,
+                    B256::repeat_byte(2),
+                    B256::repeat_byte(3),
+                    block(100),
+                    B256::repeat_byte(4),
+                    block(104),
+                )
+                .is_none()
+        );
+        assert!(dirty.is_vault_dirty(vault));
     }
 }

@@ -21,7 +21,10 @@ use morpho_v2_reallocator::reconciliation::classification::{
     canonical_receipt_outcome, persist_canonical_receipt_outcome,
 };
 use morpho_v2_reallocator::storage::StorageError;
-use morpho_v2_reallocator::storage::actor::StorageService;
+use morpho_v2_reallocator::storage::actor::{
+    MAX_CHECKPOINT_BYTES, MAX_JOURNAL_SEGMENT_BYTES, MAX_JOURNAL_SEGMENTS, MAX_MANIFEST_BYTES,
+    StorageHandle, StorageService,
+};
 use morpho_v2_reallocator::storage::models::{
     CanonicalBlockRecord, CanonicalLogRecord, CanonicalReceiptRecord, ConformanceRecord,
     FinalPreflightRecord, NonceReservation, ReconciliationRecord, SignedAttemptRecord,
@@ -61,6 +64,84 @@ fn reservation(signer: Address) -> NonceReservation {
 
 async fn reopen(path: &Path) -> Result<StorageService, StorageError> {
     StorageService::start(path, 8, 1_800_000_000)
+}
+
+#[test]
+fn oversized_checkpoint_is_rejected_before_json_allocation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("state.json");
+    std::fs::File::create(&path)?.set_len(MAX_CHECKPOINT_BYTES.saturating_add(1))?;
+    assert!(matches!(
+        StorageService::start(&path, 8, 1_800_000_000),
+        Err(StorageError::InputTooLarge {
+            kind: "checkpoint",
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_manifest_and_journal_are_rejected_before_parsing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_directory = TempDir::new()?;
+    let manifest_state = manifest_directory.path().join("state.json");
+    std::fs::write(&manifest_state, br#"{"format_version":4,"revision":0,"canonical_blocks":[],"canonical_logs":[],"canonical_receipts":[],"chain_cursors":{},"exact_snapshots":[],"plans":[],"final_preflights":[],"transactions":[],"rate_movement_reservations":[],"transaction_attempts":[],"conformance_records":[],"reconciliation_records":[],"topology_history":[],"rate_episodes":[],"top_k_apy_memory":[]}"#)?;
+    std::fs::File::create(manifest_directory.path().join("manifest.json"))?
+        .set_len(MAX_MANIFEST_BYTES.saturating_add(1))?;
+    assert!(matches!(
+        StorageService::start(&manifest_state, 8, 1_800_000_000),
+        Err(StorageError::InputTooLarge {
+            kind: "manifest",
+            ..
+        })
+    ));
+
+    let journal_directory = TempDir::new()?;
+    let journal_state = journal_directory.path().join("state.json");
+    let service = StorageService::start(&journal_state, 8, 1_800_000_000)?;
+    service.shutdown().await?;
+    std::fs::File::create(
+        journal_directory
+            .path()
+            .join("journal")
+            .join("segment-00000000000000000001.jsonl"),
+    )?
+    .set_len(MAX_JOURNAL_SEGMENT_BYTES.saturating_add(1))?;
+    assert!(matches!(
+        StorageService::start(&journal_state, 8, 1_800_000_000),
+        Err(StorageError::InputTooLarge {
+            kind: "journal segment",
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn excessive_journal_segment_count_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let state = directory.path().join("state.json");
+    let service = StorageService::start(&state, 8, 1_800_000_000)?;
+    service.shutdown().await?;
+    for sequence in 1..=MAX_JOURNAL_SEGMENTS.saturating_add(1) {
+        std::fs::write(
+            directory
+                .path()
+                .join("journal")
+                .join(format!("segment-{sequence:020}.jsonl")),
+            [],
+        )?;
+    }
+    assert!(matches!(
+        StorageService::start(&state, 8, 1_800_000_000),
+        Err(StorageError::InputTooLarge {
+            kind: "journal segment count",
+            ..
+        })
+    ));
+    Ok(())
 }
 
 fn read_json(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
@@ -104,6 +185,171 @@ fn rate_episode(vault: VaultAddress, detection: BlockRef, salt: u8) -> RateSigna
         Ok(episode) => episode,
         Err(error) => panic!("valid rate episode fixture: {error}"),
     }
+}
+
+async fn persist_reconciled_rate_fixture(
+    handle: &StorageHandle,
+    signer: Address,
+    ancestor: BlockRef,
+    included: BlockRef,
+    reconciled: BlockRef,
+) -> Result<(RateSignalEpisode, B256), Box<dyn std::error::Error>> {
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    for canonical in [ancestor, included, reconciled] {
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 999,
+                    block: canonical,
+                },
+                Vec::new(),
+                canonical.timestamp,
+            )
+            .await?;
+    }
+    let mut snapshot = sample_snapshot();
+    snapshot.context.block = ancestor;
+    handle
+        .persist_snapshot(snapshot.clone(), ancestor.timestamp)
+        .await?;
+    let mut episode = rate_episode(vault, ancestor, 0x41);
+    episode.confirm_short(ancestor, Assets(U256::from(1_000_u64)))?;
+    handle
+        .persist_rate_episode(episode.clone(), ancestor.timestamp)
+        .await?;
+    let mut plan = sample_plan(&snapshot);
+    plan.reason = PlanReason::RateRebalance;
+    plan.plan_id = PlanId(B256::repeat_byte(0xbc));
+    plan.episode_id = Some(episode.episode_id);
+    plan.solver_certificate.rate_episode_id = Some(episode.episode_id.0);
+    plan.solver_certificate.objective_branch = Some(episode.objective_branch);
+    plan.projection.movement_assets = U256::from(100_u64);
+    handle
+        .persist_plan(plan.clone(), ancestor.timestamp)
+        .await?;
+    let mut nonce = reservation(signer);
+    nonce.plan_id = Some(plan.plan_id);
+    handle
+        .reserve_rate_movement_and_nonce(nonce, episode.episode_id, U256::from(100_u64))
+        .await?;
+    let raw = Bytes::from_static(&[0x02, 0x46]);
+    let hash = alloy::primitives::keccak256(&raw);
+    handle
+        .persist_signed_transaction(SignedTransactionRecord {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            transaction_hash: hash,
+            raw_signed_transaction: raw,
+            updated_at: ancestor.timestamp,
+        })
+        .await?;
+    for transition in [
+        TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::Signed,
+            next_state: TransactionState::Submitted,
+            transaction_hash: Some(hash),
+            submitted_at: Some(ancestor.timestamp),
+            included_block: None,
+            included_block_hash: None,
+            updated_at: ancestor.timestamp,
+        },
+        TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::Submitted,
+            next_state: TransactionState::Included,
+            transaction_hash: Some(hash),
+            submitted_at: None,
+            included_block: Some(included.number),
+            included_block_hash: Some(included.hash),
+            updated_at: included.timestamp,
+        },
+        TransactionTransition {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            expected_state: TransactionState::Included,
+            next_state: TransactionState::Confirmed,
+            transaction_hash: None,
+            submitted_at: None,
+            included_block: None,
+            included_block_hash: None,
+            updated_at: reconciled.timestamp,
+        },
+    ] {
+        handle.transition_transaction(transition).await?;
+    }
+    handle
+        .persist_conformance(ConformanceRecord {
+            transaction_id: TransactionId(B256::repeat_byte(0x71)),
+            transaction_hash: hash,
+            block_number: included.number,
+            block_hash: included.hash,
+            action_count: 1,
+            movement_assets: U256::from(100_u64),
+            positive_loss_assets: U256::ZERO,
+            report_hash: B256::repeat_byte(0xc1),
+            validated_at: reconciled.timestamp,
+        })
+        .await?;
+    let mut confirmed_episode = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("reserved rate episode disappeared")?;
+    confirmed_episode.confirm_pending(U256::from(100_u64))?;
+    let mut reconciled_snapshot = sample_snapshot();
+    reconciled_snapshot.context.block = reconciled;
+    reconciled_snapshot.snapshot_hash = B256::repeat_byte(0xab);
+    handle
+        .persist_reconciliation(
+            ReconciliationRecord {
+                transaction_id: TransactionId(B256::repeat_byte(0x71)),
+                snapshot_hash: reconciled_snapshot.snapshot_hash,
+                block: reconciled,
+                current_rate_spread: U256::ONE,
+                service_constraints_met: true,
+                next_plan_needed: true,
+                pending_deployment_resolved: false,
+                report_hash: B256::repeat_byte(0xd1),
+                reconciled_at: reconciled.timestamp,
+            },
+            reconciled_snapshot,
+            Some(confirmed_episode),
+        )
+        .await?;
+    Ok((episode, hash))
+}
+
+#[tokio::test]
+async fn bounded_snapshot_lookup_returns_newest_snapshot_inside_window()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let service = reopen(&directory.path().join("bounded-snapshots.json")).await?;
+    let handle = service.handle();
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    for (number, hash_byte) in [(12_u64, 0xa1_u8), (14, 0xa2), (16, 0xa3)] {
+        let mut snapshot = sample_snapshot();
+        snapshot.context.block = block(number, hash_byte, hash_byte.saturating_sub(1));
+        snapshot.snapshot_hash = B256::repeat_byte(hash_byte);
+        handle.persist_snapshot(snapshot, number).await?;
+    }
+
+    let selected = handle
+        .load_latest_exact_snapshot_in_range(vault, 13, 15)
+        .await?
+        .ok_or("bounded lookup omitted the covered snapshot")?;
+    assert_eq!(selected.context.block.number, 14);
+    assert!(
+        handle
+            .load_latest_exact_snapshot_in_range(vault, 15, 15)
+            .await?
+            .is_none()
+    );
+    assert!(matches!(
+        handle
+            .load_latest_exact_snapshot_in_range(vault, 16, 15)
+            .await,
+        Err(StorageError::Invariant("exact snapshot range is inverted"))
+    ));
+    service.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -833,7 +1079,7 @@ async fn rate_movement_and_nonce_are_reserved_and_released_atomically()
 }
 
 #[tokio::test]
-async fn failed_post_state_reconciliation_releases_rate_budget_for_fresh_planning()
+async fn conformed_post_state_failure_confirms_rate_budget_across_restart_and_reorg()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let path = directory.path().join("post-state-recovery.json");
@@ -937,16 +1183,11 @@ async fn failed_post_state_reconciliation_releases_rate_budget_for_fresh_plannin
         })
         .await?;
     handle
-        .transition_transaction(TransactionTransition {
-            transaction_id: TransactionId(B256::repeat_byte(0x71)),
-            expected_state: TransactionState::ConformanceValidated,
-            next_state: TransactionState::Failed,
-            transaction_hash: Some(hash),
-            submitted_at: None,
-            included_block: Some(included.number),
-            included_block_hash: Some(included.hash),
-            updated_at: confirmed.timestamp,
-        })
+        .finalize_conformed_post_state_failure(
+            TransactionId(B256::repeat_byte(0x71)),
+            TransactionState::ConformanceValidated,
+            confirmed.timestamp,
+        )
         .await?;
 
     assert!(handle.load_unresolved(signer).await?.is_none());
@@ -955,12 +1196,47 @@ async fn failed_post_state_reconciliation_releases_rate_budget_for_fresh_plannin
         .await?
         .ok_or("rate episode disappeared after recoverable mismatch")?;
     assert_eq!(active.pending_movement.0, U256::ZERO);
-    assert_eq!(active.available_budget()?, U256::from(1_000_u64));
+    assert_eq!(active.confirmed_movement.0, U256::from(100_u64));
+    assert_eq!(active.available_budget()?, U256::from(900_u64));
     service.shutdown().await?;
+
+    // A crash/reopen cannot return the already-executed movement to the strategy budget.
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let active = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("rate episode disappeared after restart")?;
+    assert_eq!(active.pending_movement.0, U256::ZERO);
+    assert_eq!(active.confirmed_movement.0, U256::from(100_u64));
+    assert_eq!(active.available_budget()?, U256::from(900_u64));
     assert_eq!(
         read_json(&path)?["rate_movement_reservations"][0]["state"],
-        "released"
+        "confirmed"
     );
+
+    // If canonical inclusion itself is later orphaned, the ordinary rewind path must reopen the
+    // confirmed movement and nonce lane exactly once.
+    handle
+        .rewind_to_ancestor(
+            snapshot.context.chain_id,
+            snapshot.context.block,
+            snapshot.context.block.timestamp,
+        )
+        .await?;
+    let orphaned = handle
+        .load_unresolved(signer)
+        .await?
+        .ok_or("orphaned conformed failure did not reopen nonce ownership")?;
+    assert_eq!(orphaned.state, TransactionState::Orphaned);
+    let active = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("rate episode disappeared after inclusion reorg")?;
+    assert_eq!(active.pending_movement.0, U256::from(100_u64));
+    assert_eq!(active.confirmed_movement.0, U256::ZERO);
+    assert_eq!(active.available_budget()?, U256::from(900_u64));
+    service.shutdown().await?;
     Ok(())
 }
 
@@ -1164,6 +1440,291 @@ async fn reconciled_rate_movement_reopens_and_reconciles_after_reorg()
         Some(morpho_v2_reallocator::storage::models::RateMovementReservationState::Pending)
     );
     service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphaned_reconciliation_snapshot_reopens_canonical_inclusion_for_revalidation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory.path().join("reconciliation-snapshot-reorg.json");
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let signer = Address::with_last_byte(0x72);
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    let ancestor = sample_snapshot().context.block;
+    let included = block(13, 0x13, 0x12);
+    let reconciled = block(14, 0x14, 0x13);
+    let (episode, _hash) =
+        persist_reconciled_rate_fixture(&handle, signer, ancestor, included, reconciled).await?;
+
+    let rewind = handle
+        .rewind_to_ancestor(999, included, included.timestamp)
+        .await?;
+    assert_eq!(rewind.transactions_orphaned, 0);
+    assert!(handle.load_unresolved(signer).await?.is_none());
+    let mut pending_reconciliations = handle.load_pending_reconciliations().await?;
+    assert_eq!(pending_reconciliations.len(), 1);
+    let revalidation = pending_reconciliations
+        .pop()
+        .ok_or("orphaned reconciliation was not reopened")?;
+    assert_eq!(revalidation.state, TransactionState::ReconciliationPending);
+    assert_eq!(revalidation.included_block, included.number);
+    assert_eq!(revalidation.included_block_hash, included.hash);
+    assert!(
+        handle
+            .load_conformance(revalidation.transaction_id)
+            .await?
+            .is_some()
+    );
+    let reopened_episode = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("rate episode disappeared after reconciliation rewind")?;
+    assert_eq!(reopened_episode.confirmed_movement.0, U256::from(100_u64));
+    assert_eq!(reopened_episode.pending_movement.0, U256::ZERO);
+    assert_eq!(
+        handle
+            .load_pending_reconciliation_context(revalidation.transaction_id)
+            .await?
+            .and_then(|context| context.rate_movement)
+            .map(|movement| movement.state),
+        Some(morpho_v2_reallocator::storage::models::RateMovementReservationState::Confirmed)
+    );
+
+    let new_reconciliation_block = block(14, 0x24, 0x13);
+    handle
+        .apply_canonical_block(
+            CanonicalBlockRecord {
+                chain_id: 999,
+                block: new_reconciliation_block,
+            },
+            Vec::new(),
+            new_reconciliation_block.timestamp,
+        )
+        .await?;
+    let reconfirmed_episode = reopened_episode;
+    let mut new_snapshot = sample_snapshot();
+    new_snapshot.context.block = new_reconciliation_block;
+    new_snapshot.snapshot_hash = B256::repeat_byte(0xac);
+    handle
+        .persist_reconciliation(
+            ReconciliationRecord {
+                transaction_id: revalidation.transaction_id,
+                snapshot_hash: new_snapshot.snapshot_hash,
+                block: new_reconciliation_block,
+                current_rate_spread: U256::ONE,
+                service_constraints_met: true,
+                next_plan_needed: false,
+                pending_deployment_resolved: false,
+                report_hash: B256::repeat_byte(0xe1),
+                reconciled_at: new_reconciliation_block.timestamp,
+            },
+            new_snapshot,
+            Some(reconfirmed_episode),
+        )
+        .await?;
+    assert!(handle.load_unresolved(signer).await?.is_none());
+    assert!(handle.load_pending_reconciliations().await?.is_empty());
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn revalidation_failure_keeps_an_already_confirmed_rate_movement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let path = directory
+        .path()
+        .join("revalidation-post-state-failure.json");
+    let service = reopen(&path).await?;
+    let handle = service.handle();
+    let signer = Address::with_last_byte(0x72);
+    let vault = VaultAddress(Address::with_last_byte(0x11));
+    let ancestor = sample_snapshot().context.block;
+    let included = block(13, 0x13, 0x12);
+    let reconciled = block(14, 0x14, 0x13);
+    let (episode, _hash) =
+        persist_reconciled_rate_fixture(&handle, signer, ancestor, included, reconciled).await?;
+
+    handle
+        .rewind_to_ancestor(999, included, included.timestamp)
+        .await?;
+    let pending = handle
+        .load_pending_reconciliations()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("reconciliation-only row disappeared")?;
+    handle
+        .finalize_conformed_post_state_failure(
+            pending.transaction_id,
+            TransactionState::ReconciliationPending,
+            included.timestamp,
+        )
+        .await?;
+
+    assert!(handle.load_pending_reconciliations().await?.is_empty());
+    assert!(handle.load_unresolved(signer).await?.is_none());
+    let active = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("confirmed episode disappeared after revalidation failure")?;
+    assert_eq!(active.pending_movement.0, U256::ZERO);
+    assert_eq!(active.confirmed_movement.0, U256::from(100_u64));
+    assert_eq!(active.available_budget()?, U256::from(900_u64));
+
+    // The movement is reopened only if the successful inclusion itself leaves the canonical
+    // branch, not merely because a later post-state check failed.
+    handle
+        .rewind_to_ancestor(999, ancestor, ancestor.timestamp)
+        .await?;
+    let orphaned = handle
+        .load_unresolved(signer)
+        .await?
+        .ok_or("orphaned inclusion did not reopen the failed lifecycle")?;
+    assert_eq!(orphaned.state, TransactionState::Orphaned);
+    let reopened = handle
+        .load_active_rate_episode(vault, episode.rate_group)
+        .await?
+        .ok_or("rate episode disappeared after inclusion reorg")?;
+    assert_eq!(reopened.pending_movement.0, U256::from(100_u64));
+    assert_eq!(reopened.confirmed_movement.0, U256::ZERO);
+    service.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_only_rewind_never_creates_a_second_unresolved_nonce_lane()
+-> Result<(), Box<dyn std::error::Error>> {
+    for later_state in [TransactionState::Signed, TransactionState::Submitted] {
+        let directory = TempDir::new()?;
+        let path = directory
+            .path()
+            .join(format!("reconciliation-with-{later_state:?}.json"));
+        let service = reopen(&path).await?;
+        let handle = service.handle();
+        let signer = Address::with_last_byte(0x72);
+        let vault = VaultAddress(Address::with_last_byte(0x11));
+        let ancestor = sample_snapshot().context.block;
+        let included = block(13, 0x13, 0x12);
+        let reconciled = block(14, 0x14, 0x13);
+        let (episode, _first_hash) =
+            persist_reconciled_rate_fixture(&handle, signer, ancestor, included, reconciled)
+                .await?;
+
+        let second_transaction_id = TransactionId(B256::repeat_byte(0x72));
+        let mut second_reservation = reservation(signer);
+        second_reservation.transaction_id = second_transaction_id;
+        second_reservation.nonce = 8;
+        second_reservation.created_block = reconciled.number;
+        second_reservation.created_at = reconciled.timestamp;
+        handle.reserve_nonce(second_reservation).await?;
+        let second_raw = Bytes::from_static(&[0x02, 0x72]);
+        let second_hash = alloy::primitives::keccak256(&second_raw);
+        handle
+            .persist_signed_transaction(SignedTransactionRecord {
+                transaction_id: second_transaction_id,
+                transaction_hash: second_hash,
+                raw_signed_transaction: second_raw,
+                updated_at: reconciled.timestamp,
+            })
+            .await?;
+        if later_state == TransactionState::Submitted {
+            handle
+                .transition_transaction(TransactionTransition {
+                    transaction_id: second_transaction_id,
+                    expected_state: TransactionState::Signed,
+                    next_state: TransactionState::Submitted,
+                    transaction_hash: Some(second_hash),
+                    submitted_at: Some(reconciled.timestamp),
+                    included_block: None,
+                    included_block_hash: None,
+                    updated_at: reconciled.timestamp,
+                })
+                .await?;
+        }
+
+        handle
+            .rewind_to_ancestor(999, included, included.timestamp)
+            .await?;
+
+        let unresolved = handle
+            .load_unresolved(signer)
+            .await?
+            .ok_or("later nonce-owning transaction disappeared during rewind")?;
+        assert_eq!(unresolved.transaction_id, second_transaction_id);
+        assert_eq!(unresolved.state, later_state);
+        let pending = handle.load_pending_reconciliations().await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending.first().map(|row| (row.transaction_id, row.state)),
+            Some((
+                TransactionId(B256::repeat_byte(0x71)),
+                TransactionState::ReconciliationPending,
+            ))
+        );
+        let still_confirmed = handle
+            .load_active_rate_episode(vault, episode.rate_group)
+            .await?
+            .ok_or("confirmed rate episode disappeared during reconciliation-only rewind")?;
+        assert_eq!(still_confirmed.confirmed_movement.0, U256::from(100_u64));
+        assert_eq!(still_confirmed.pending_movement.0, U256::ZERO);
+
+        handle
+            .transition_transaction(TransactionTransition {
+                transaction_id: second_transaction_id,
+                expected_state: later_state,
+                next_state: TransactionState::Failed,
+                transaction_hash: Some(second_hash),
+                submitted_at: None,
+                included_block: None,
+                included_block_hash: None,
+                updated_at: included.timestamp,
+            })
+            .await?;
+        assert!(handle.load_unresolved(signer).await?.is_none());
+
+        let revalidation_block = block(14, 0x24, 0x13);
+        handle
+            .apply_canonical_block(
+                CanonicalBlockRecord {
+                    chain_id: 999,
+                    block: revalidation_block,
+                },
+                Vec::new(),
+                revalidation_block.timestamp,
+            )
+            .await?;
+        let mut snapshot = sample_snapshot();
+        snapshot.context.block = revalidation_block;
+        snapshot.snapshot_hash = B256::repeat_byte(0xad);
+        handle
+            .persist_reconciliation(
+                ReconciliationRecord {
+                    transaction_id: TransactionId(B256::repeat_byte(0x71)),
+                    snapshot_hash: snapshot.snapshot_hash,
+                    block: revalidation_block,
+                    current_rate_spread: U256::ONE,
+                    service_constraints_met: true,
+                    next_plan_needed: false,
+                    pending_deployment_resolved: false,
+                    report_hash: B256::repeat_byte(0xe2),
+                    reconciled_at: revalidation_block.timestamp,
+                },
+                snapshot,
+                Some(still_confirmed),
+            )
+            .await?;
+        assert!(handle.load_pending_reconciliations().await?.is_empty());
+        let final_episode = handle
+            .load_active_rate_episode(vault, episode.rate_group)
+            .await?
+            .ok_or("rate episode disappeared after post-state revalidation")?;
+        assert_eq!(final_episode.confirmed_movement.0, U256::from(100_u64));
+        assert_eq!(final_episode.pending_movement.0, U256::ZERO);
+        service.shutdown().await?;
+    }
     Ok(())
 }
 
@@ -1512,23 +2073,50 @@ async fn transaction_boundaries_recover_after_every_reopen()
     let service = reopen(&path).await?;
     let mut reconciled_snapshot = sample_snapshot();
     reconciled_snapshot.context.block = block(21, 0x21, 0x20);
+    let reconciliation_record = ReconciliationRecord {
+        transaction_id: TransactionId(B256::repeat_byte(0x71)),
+        snapshot_hash: reconciled_snapshot.snapshot_hash,
+        block: reconciled_snapshot.context.block,
+        current_rate_spread: U256::from(1_u64),
+        service_constraints_met: true,
+        next_plan_needed: false,
+        pending_deployment_resolved: true,
+        report_hash: B256::repeat_byte(0xd1),
+        reconciled_at: 1_800_000_010,
+    };
+    assert!(matches!(
+        service
+            .handle()
+            .persist_reconciliation(
+                reconciliation_record.clone(),
+                reconciled_snapshot.clone(),
+                None,
+            )
+            .await,
+        Err(StorageError::StaleTransition)
+    ));
+    assert_eq!(
+        service
+            .handle()
+            .load_unresolved(signer)
+            .await?
+            .map(|pending| pending.state),
+        Some(TransactionState::ConformanceValidated)
+    );
     service
         .handle()
-        .persist_reconciliation(
-            ReconciliationRecord {
-                transaction_id: TransactionId(B256::repeat_byte(0x71)),
-                snapshot_hash: reconciled_snapshot.snapshot_hash,
+        .apply_canonical_block(
+            CanonicalBlockRecord {
+                chain_id: 999,
                 block: reconciled_snapshot.context.block,
-                current_rate_spread: U256::from(1_u64),
-                service_constraints_met: true,
-                next_plan_needed: false,
-                pending_deployment_resolved: true,
-                report_hash: B256::repeat_byte(0xd1),
-                reconciled_at: 1_800_000_010,
             },
-            reconciled_snapshot,
-            None,
+            Vec::new(),
+            reconciled_snapshot.context.block.timestamp,
         )
+        .await?;
+    service
+        .handle()
+        .persist_reconciliation(reconciliation_record, reconciled_snapshot, None)
         .await?;
     service.shutdown().await?;
     let service = reopen(&path).await?;

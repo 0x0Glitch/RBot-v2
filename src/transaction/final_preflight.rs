@@ -252,6 +252,9 @@ pub enum PreflightSourceError {
     /// Local durability, configuration, or protocol identity is inconsistent.
     #[error("exact preflight source has a fatal invariant failure at `{0}`")]
     FatalAt(&'static str),
+    /// One vault's exact accounting source is deterministically unavailable.
+    #[error("exact preflight vault source has a fatal failure at `{0}`")]
+    VaultFatalAt(&'static str),
 }
 
 /// One-head final preflight or submission failure.

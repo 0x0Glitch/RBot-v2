@@ -41,7 +41,7 @@ use crate::{
         current_state::{CurrentStateError, CurrentStateSourceError, reconcile_current_state},
     },
     runtime::{
-        controller::{ControllerError, RuntimeRegistry, RuntimeVaultState},
+        controller::{ControllerError, RuntimeRegistry, RuntimeVaultState, VaultRuntimeStatus},
         current_state_source::LiveCurrentStateSource,
         failure::{FailureDisposition, SignerQuarantineReason, VaultQuarantineReason},
         identity::RuntimeIdentities,
@@ -49,12 +49,13 @@ use crate::{
         preflight_source::LiveRatePreflightSource,
         state_service::{desired_runtime_state, runtime_reason},
     },
+    state::projection::project_snapshot_to_head,
     storage::{
         StorageError,
         actor::StorageHandle,
         models::{
-            CanonicalReceiptRecord, ConformanceRecord, TransactionAttemptKind, TransactionState,
-            TransactionTransition,
+            CanonicalReceiptRecord, ConformanceRecord, PendingReconciliationTransaction,
+            TransactionAttemptKind, TransactionState, TransactionTransition,
         },
     },
     telemetry::alerts::{Alert, AlertDispatcher, AlertKind, AlertSeverity},
@@ -168,6 +169,11 @@ impl ExecutionServiceError {
                     reason: SignerQuarantineReason::DurabilityOrIdentity,
                 }
             }
+            Self::Preflight(PreflightError::Source(
+                crate::transaction::final_preflight::PreflightSourceError::VaultFatalAt(_),
+            )) => FailureDisposition::QuarantineVault {
+                reason: VaultQuarantineReason::AccountingUnavailable,
+            },
             Self::Preflight(PreflightError::Reservation(ReservationError::Poisoned)) => {
                 // The in-memory resource set may be partially mutated and the restart factory
                 // deliberately reuses this execution owner. Continuing would defer every future
@@ -580,6 +586,81 @@ where
             }
             self.advance_pending(pending.vault, pending).await?;
         }
+        // Reconciliation-only rows do not own their historical nonce. They exclude only their
+        // own vault from fresh signing; a healthy sibling vault may still use the shared signer.
+        // Keep the complete initial set through this tick: even a successful reconciliation must
+        // not let a plan for that same vault, built before reconciliation, sign immediately.
+        let pending_reconciliations = self.storage.load_pending_reconciliations().await?;
+        let reconciliation_vaults = pending_reconciliations
+            .iter()
+            .map(|pending| pending.vault)
+            .collect::<BTreeSet<_>>();
+        let mut deferred_reconciliation_error = None;
+        for pending in pending_reconciliations {
+            // A nonce-owning transaction always has priority across every vault sharing the
+            // signer. Its recovery above is the only work allowed on this lane during the tick.
+            if processed_signers.contains(&pending.signer) {
+                continue;
+            }
+            let Some(vault) = self
+                .config
+                .app
+                .vaults
+                .iter()
+                .find(|vault| vault.address == pending.vault)
+            else {
+                self.emit_alert(
+                    AlertSeverity::P0,
+                    AlertKind::ReconciliationMismatch,
+                    Some(pending.vault),
+                    "Pending reconciliation is missing from configuration",
+                    "restore the transaction-time vault configuration so canonical post-state can be revalidated; no new transaction will be signed in its place",
+                    None,
+                    runtime_unix_timestamp(),
+                )
+                .await;
+                continue;
+            };
+            let reconciliation_status = self.runtime.get(vault.address).await;
+            if !reconciliation_attempt_allowed(reconciliation_status.as_ref()) {
+                // A deterministic fatal mismatch is retried only after the affected vault leaves
+                // quarantine. The durable row remains available for that recovery attempt.
+                continue;
+            }
+            if vault.signer_address != pending.signer {
+                self.pause_reconciliation_failure(vault.address).await?;
+                self.emit_alert(
+                    AlertSeverity::P0,
+                    AlertKind::ReconciliationMismatch,
+                    Some(pending.vault),
+                    "Pending reconciliation signer changed in configuration",
+                    "restore the transaction-time allocator identity so canonical post-state can be revalidated; no new transaction will be signed in its place",
+                    None,
+                    runtime_unix_timestamp(),
+                )
+                .await;
+                continue;
+            }
+            if let Err(error) = self.advance_reconciliation_pending(vault, pending).await {
+                match reconciliation_failure_scope(&error) {
+                    ReconciliationFailureScope::VaultLocal => {
+                        tracing::warn!(
+                            vault = %vault.address.0,
+                            error = %error,
+                            "vault reconciliation remains pending"
+                        );
+                    }
+                    ReconciliationFailureScope::ProviderRetry => {
+                        // Preserve provider breaker accounting after every otherwise-healthy vault
+                        // has had a chance to use the shared signer during this tick.
+                        if deferred_reconciliation_error.is_none() {
+                            deferred_reconciliation_error = Some(error);
+                        }
+                    }
+                    ReconciliationFailureScope::Global => return Err(error),
+                }
+            }
+        }
         for signer in self
             .config
             .app
@@ -605,6 +686,9 @@ where
                 let Some(vault) = signer_vaults.get(index).copied() else {
                     return Err(ExecutionServiceError::Recovery);
                 };
+                if reconciliation_vaults.contains(&vault.address) {
+                    continue;
+                }
                 let status = self.runtime.get(vault.address).await;
                 let ready = status
                     .as_ref()
@@ -613,8 +697,12 @@ where
                 // rebuilds exact state and the semantic plan at the current canonical head, so
                 // requiring this background plan's block to remain the latest head phase-locks
                 // execution on fast chains and provides no additional safety.
-                let plan_reason = self.api.plan(vault.address).await.map(|plan| plan.reason);
-                if ready && let Some(reason) = plan_reason {
+                let published_plan = self
+                    .api
+                    .plan(vault.address)
+                    .await
+                    .map(|plan| (plan.reason, plan.plan_id));
+                if ready && let Some((reason, plan_id)) = published_plan {
                     // Advance before the bounded attempt. A temporarily unexecutable first vault
                     // must not monopolize the shared allocator lane across controller ticks.
                     let next_index = index
@@ -622,18 +710,19 @@ where
                         .and_then(|next| next.checked_rem(signer_vaults.len()))
                         .ok_or(ExecutionServiceError::Recovery)?;
                     self.next_vault_index.store(next_index, Ordering::Release);
-                    self.execute(vault.address, reason).await?;
+                    self.execute(vault.address, reason, plan_id).await?;
                     break;
                 }
             }
         }
-        Ok(())
+        deferred_reconciliation_error.map_or(Ok(()), Err)
     }
 
     async fn execute(
         &self,
         vault_address: VaultAddress,
         reason: PlanReason,
+        published_plan_id: crate::domain::PlanId,
     ) -> Result<(), ExecutionServiceError> {
         let vault = self
             .config
@@ -722,6 +811,21 @@ where
         )
         .await;
         if let Err(error) = preflight {
+            if matches!(
+                error,
+                PreflightError::Source(
+                    crate::transaction::final_preflight::PreflightSourceError::VaultFatalAt(_)
+                )
+            ) {
+                self.runtime
+                    .update(vault.address, |status| {
+                        status.transition(
+                            RuntimeVaultState::PausedUnsupportedConfiguration,
+                            Some("this vault's exact accounting source is unavailable".to_owned()),
+                        )
+                    })
+                    .await?;
+            }
             if let Some(pending) = self.storage.load_unresolved(vault.signer_address).await? {
                 self.runtime
                     .update(vault.address, |status| {
@@ -747,7 +851,9 @@ where
                 status.transition(RuntimeVaultState::PendingTransaction, None)
             })
             .await?;
-        self.api.clear_plan(vault.address).await;
+        self.api
+            .clear_plan_if(vault.address, published_plan_id)
+            .await;
         Ok(())
     }
 
@@ -945,97 +1051,17 @@ where
                 }
             }
             TransactionState::ConformanceValidated => {
-                let conformance = self
-                    .storage
-                    .load_conformance(pending.transaction_id)
-                    .await?
-                    .map(conformance_report)
-                    .ok_or(ExecutionServiceError::Recovery)?;
-                let source = LiveCurrentStateSource::new(
-                    Arc::clone(&self.config),
-                    vault.address,
-                    self.identities.clone(),
-                    Arc::clone(&self.provider),
-                    self.storage.clone(),
-                    self.api.clone(),
-                );
-                let report = match reconcile_current_state(
-                    &self.storage,
-                    &source,
+                self.reconcile_validated_post_state(
                     vault,
-                    &conformance,
-                    head.timestamp,
+                    pending.transaction_id,
+                    pending.state,
+                    head,
                 )
-                .await
-                {
-                    Ok(report) => report,
-                    // The chain cursor is committed before the state owner publishes the
-                    // matching exact topology/snapshot checkpoint. That normal bounded race is
-                    // retried on the next controller tick; no lifecycle state is advanced.
-                    Err(CurrentStateError::Source(CurrentStateSourceError::ContextNotReady)) => {
-                        return Ok(());
-                    }
-                    Err(
-                        error @ CurrentStateError::Source(
-                            CurrentStateSourceError::RetryableAt(_)
-                            | CurrentStateSourceError::ProviderOutageAt(_),
-                        ),
-                    ) => return Err(error.into()),
-                    Err(error) if current_state_failure_is_recoverable(&error) => {
-                        self.recover_terminal_outcome(
-                            vault,
-                            pending.transaction_id,
-                            head,
-                            RecoveryTrigger::PostStateMismatch,
-                        )
-                        .await?;
-                        self.storage
-                            .transition_transaction(TransactionTransition {
-                                transaction_id: pending.transaction_id,
-                                expected_state: TransactionState::ConformanceValidated,
-                                next_state: TransactionState::Failed,
-                                transaction_hash: pending.transaction_hash,
-                                submitted_at: None,
-                                included_block: pending.included_block,
-                                included_block_hash: pending.included_block_hash,
-                                updated_at: head.timestamp,
-                            })
-                            .await?;
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        self.pause_reconciliation_failure(vault.address).await?;
-                        self.emit_alert(
-                            AlertSeverity::P0,
-                            AlertKind::ReconciliationMismatch,
-                            Some(vault.address),
-                            "Exact reconciliation hit a fatal invariant",
-                            "contract identity or durable reconciliation evidence is inconsistent; Execute is stopped",
-                            None,
-                            head.timestamp,
-                        )
-                        .await;
-                        return Err(error.into());
-                    }
-                };
-                let snapshot = self
-                    .storage
-                    .load_exact_snapshot(vault.address, report.block)
-                    .await?
-                    .ok_or(ExecutionServiceError::Recovery)?;
-                let desired =
-                    desired_runtime_state(self.config.app.node.mode, &snapshot, true, None);
-                let reason = runtime_reason(self.config.app.node.mode, &snapshot, true, None);
-                self.runtime
-                    .update(vault.address, |status| {
-                        status.transaction_id = None;
-                        status.snapshot_hash = Some(snapshot.snapshot_hash);
-                        status.transition(desired, reason)
-                    })
-                    .await?;
+                .await?;
             }
             TransactionState::AbortedBeforeSigning
             | TransactionState::Reverted
+            | TransactionState::ReconciliationPending
             | TransactionState::Reconciled
             | TransactionState::Failed => return Err(ExecutionServiceError::Recovery),
             TransactionState::Cancelled => return Ok(()),
@@ -1051,6 +1077,136 @@ where
                 return Ok(());
             }
         }
+        Ok(())
+    }
+
+    async fn advance_reconciliation_pending(
+        &self,
+        vault: &crate::config::ValidatedVaultConfig,
+        pending: PendingReconciliationTransaction,
+    ) -> Result<(), ExecutionServiceError> {
+        if pending.state != TransactionState::ReconciliationPending {
+            return Err(ExecutionServiceError::Recovery);
+        }
+        // Re-check after the bounded batch load. A nonce-owning row always has priority and the
+        // reconciliation-only path must never reason about, replace, or sign for that lane.
+        if self
+            .storage
+            .load_unresolved(pending.signer)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let head = self
+            .storage
+            .load_cursor(self.config.app.chain.chain_id)
+            .await?
+            .ok_or(ExecutionServiceError::Recovery)?;
+        self.reconcile_validated_post_state(vault, pending.transaction_id, pending.state, head)
+            .await
+    }
+
+    async fn reconcile_validated_post_state(
+        &self,
+        vault: &crate::config::ValidatedVaultConfig,
+        transaction_id: TransactionId,
+        expected_state: TransactionState,
+        head: BlockRef,
+    ) -> Result<(), ExecutionServiceError> {
+        if !expected_state.requires_reconciliation() {
+            return Err(ExecutionServiceError::Recovery);
+        }
+        let conformance = self
+            .storage
+            .load_conformance(transaction_id)
+            .await?
+            .map(conformance_report)
+            .ok_or(ExecutionServiceError::Recovery)?;
+        let source = LiveCurrentStateSource::new(
+            Arc::clone(&self.config),
+            vault.address,
+            self.identities.clone(),
+            Arc::clone(&self.provider),
+            self.storage.clone(),
+            self.api.clone(),
+        );
+        let report = match reconcile_current_state(
+            &self.storage,
+            &source,
+            vault,
+            &conformance,
+            head.timestamp,
+        )
+        .await
+        {
+            Ok(report) => report,
+            // The chain cursor is committed before the state owner publishes the matching exact
+            // topology/snapshot checkpoint. That normal bounded race is retried on the next
+            // controller tick; no lifecycle state is advanced.
+            Err(CurrentStateError::Source(CurrentStateSourceError::ContextNotReady)) => {
+                return Ok(());
+            }
+            Err(
+                error @ CurrentStateError::Source(
+                    CurrentStateSourceError::RetryableAt(_)
+                    | CurrentStateSourceError::ProviderOutageAt(_),
+                ),
+            ) => return Err(error.into()),
+            Err(error) if current_state_failure_is_recoverable(&error) => {
+                // Receipt/event conformance already proves that this transaction executed its
+                // exact asset movement. Commit that movement before rebuilding a follow-up plan;
+                // treating the later state surprise like a revert would return spent episode
+                // budget and can authorize the same movement twice.
+                self.storage
+                    .finalize_conformed_post_state_failure(
+                        transaction_id,
+                        expected_state,
+                        head.timestamp,
+                    )
+                    .await?;
+                self.recover_terminal_outcome(
+                    vault,
+                    transaction_id,
+                    head,
+                    RecoveryTrigger::PostStateMismatch,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                self.pause_reconciliation_failure(vault.address).await?;
+                self.emit_alert(
+                    AlertSeverity::P0,
+                    AlertKind::ReconciliationMismatch,
+                    Some(vault.address),
+                    "Exact reconciliation hit a fatal invariant",
+                    "contract identity or durable reconciliation evidence is inconsistent; Execute is stopped",
+                    None,
+                    head.timestamp,
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
+        let snapshot = self
+            .storage
+            .load_exact_snapshot(vault.address, report.block)
+            .await?
+            .ok_or(ExecutionServiceError::Recovery)?;
+        let desired = desired_runtime_state(self.config.app.node.mode, &snapshot, true, None);
+        let reason = runtime_reason(self.config.app.node.mode, &snapshot, true, None);
+        self.runtime
+            .update(vault.address, |status| {
+                apply_reconciliation_to_runtime_status(
+                    status,
+                    snapshot.context.block,
+                    snapshot.snapshot_hash,
+                    desired,
+                    reason,
+                )
+            })
+            .await?;
         Ok(())
     }
 
@@ -1356,12 +1512,13 @@ where
                 required_gas_limit,
             )
             .await?;
-        Ok(elapsed
-            >= self
-                .config
+        Ok(identical_rebroadcast_due(
+            elapsed,
+            self.config
                 .app
                 .execution
-                .identical_rebroadcast_after_opportunities)
+                .identical_rebroadcast_after_opportunities,
+        ))
     }
 
     async fn classify_consumed_nonce(
@@ -1576,6 +1733,24 @@ where
                 .await?;
             return Ok(());
         }
+        self.cancel_pending_attempt(
+            vault,
+            pending,
+            head,
+            TransactionState::Orphaned,
+            CancellationReason::MaterialInvalidation,
+        )
+        .await
+    }
+
+    async fn cancel_pending_attempt(
+        &self,
+        vault: &crate::config::ValidatedVaultConfig,
+        pending: &crate::storage::models::UnresolvedTransaction,
+        head: BlockRef,
+        expected_state: TransactionState,
+        reason: CancellationReason,
+    ) -> Result<(), ExecutionServiceError> {
         let validated = self.validated_pending(vault, pending)?;
         let maximum = u128::try_from(self.config.app.execution.maximum_fee_per_gas_wei)
             .map_err(|_| ExecutionServiceError::FeeRange)?;
@@ -1591,7 +1766,7 @@ where
                 .ok_or(ExecutionServiceError::FeeRange)?,
         )
         .await?;
-        let decision = PendingDecision::Cancel(CancellationReason::MaterialInvalidation);
+        let decision = PendingDecision::Cancel(reason);
         let outcome = execute_pending_attempt(
             &self.storage,
             self.signer.as_ref(),
@@ -1599,7 +1774,7 @@ where
             &self.config.app.execution,
             PendingAttemptRequest {
                 pending: validated,
-                expected_state: TransactionState::Orphaned,
+                expected_state,
                 decision,
                 signer_request_id: derive_pending_request_id(
                     pending.transaction_id,
@@ -1623,7 +1798,7 @@ where
                 %transaction_hash,
                 transaction_id = %pending.transaction_id.0,
                 rpc_error_category = ?category,
-                "orphaned plan cancellation is indeterminate; durable recovery retains the nonce lane"
+                "plan cancellation is indeterminate; durable recovery retains the nonce lane"
             );
         }
         Ok(())
@@ -1670,10 +1845,11 @@ where
             last_attempt_at: InclusionOpportunity(last_attempt),
             touched: TouchedResources::from_plan(&plan, vault)?,
         };
+        let signals = self.pending_safety_signals(vault, &plan).await?;
         let mut decision = assess_pending(
             &clock,
             InclusionOpportunity(current),
-            PendingSafetySignals::default(),
+            signals,
             &self.config.app.execution,
         )?;
         if decision == PendingDecision::Wait {
@@ -1754,6 +1930,58 @@ where
             );
         }
         Ok(())
+    }
+
+    async fn pending_safety_signals(
+        &self,
+        vault: &crate::config::ValidatedVaultConfig,
+        plan: &crate::domain::V2Plan,
+    ) -> Result<PendingSafetySignals, ExecutionServiceError> {
+        let Some(snapshot) = self.api.snapshot(vault.address).await else {
+            return Ok(PendingSafetySignals {
+                provider_ambiguous: true,
+                ..PendingSafetySignals::default()
+            });
+        };
+        if snapshot.context.block.number < plan.snapshot.block.number {
+            return Ok(PendingSafetySignals {
+                provider_ambiguous: true,
+                ..PendingSafetySignals::default()
+            });
+        }
+        let projection = project_snapshot_to_head(&snapshot, snapshot.context.block, vault);
+        let service_constraint_failed = projection.as_ref().map_or(true, |projection| {
+            !projection.deposit_headroom_satisfied
+                || !projection.atomic_exit_coverage_satisfied
+                || !projection.source_constraints_satisfied
+        });
+        let mut signals = PendingSafetySignals {
+            material_invalidation: snapshot.context.static_config_revision != plan.config_revision
+                || snapshot.context.dynamic_topology_revision != plan.topology_revision,
+            service_constraint_failed,
+            reward_policy_expired: !snapshot.capabilities.reward_policy_ready,
+            signer_role_lost: !snapshot.capabilities.can_allocate,
+            external_idle_lock_created: !snapshot.idle_locks.unattributed_idle_assets.is_zero()
+                || snapshot.idle_locks.locks.iter().any(|lock| {
+                    lock.created_block > plan.snapshot.block.number
+                        && !lock.remaining_assets.is_zero()
+                }),
+            ..PendingSafetySignals::default()
+        };
+        if let Some(episode_id) = plan.episode_id {
+            let episode = self
+                .storage
+                .load_active_rate_episode(vault.address, vault.rate_group.id)
+                .await?;
+            match episode {
+                Some(episode) if episode.episode_id == episode_id => {
+                    signals.reward_policy_expired |=
+                        snapshot.context.evm_timestamp >= episode.expires_at;
+                }
+                _ => signals.material_invalidation = true,
+            }
+        }
+        Ok(signals)
     }
 
     async fn ensure_daily_gas_budget(
@@ -1853,7 +2081,9 @@ where
         // The terminal lifecycle transition releases any pending episode movement. Remove the
         // published plan before reading again so no consumer can mistake the old context for a
         // retry instruction.
-        self.api.clear_plan(vault.address).await;
+        self.api
+            .clear_plan_through(vault.address, head.number, u64::MAX)
+            .await;
         self.runtime
             .update(vault.address, |status| {
                 status.transaction_id = None;
@@ -1980,6 +2210,18 @@ where
     ) -> Result<(), ControllerError> {
         self.runtime
             .update(vault, |status| {
+                if !matches!(
+                    status.state,
+                    RuntimeVaultState::CatchingUp
+                        | RuntimeVaultState::Recovery
+                        | RuntimeVaultState::PendingTransaction
+                        | RuntimeVaultState::PausedReconciliationFailure
+                ) {
+                    status.transition(
+                        RuntimeVaultState::CatchingUp,
+                        Some("isolating one vault after reconciliation failure".to_owned()),
+                    )?;
+                }
                 status.transition(
                     RuntimeVaultState::PausedReconciliationFailure,
                     Some("canonical transaction reconciliation failed".to_owned()),
@@ -2010,6 +2252,69 @@ fn round_robin_index(start: usize, offset: usize, length: usize) -> Option<usize
     start
         .checked_add(offset)
         .and_then(|index| index.checked_rem(length))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationFailureScope {
+    VaultLocal,
+    ProviderRetry,
+    Global,
+}
+
+fn reconciliation_attempt_allowed(status: Option<&VaultRuntimeStatus>) -> bool {
+    !status.is_some_and(|status| status.state.is_persistent_quarantine())
+}
+
+fn reconciliation_failure_scope(error: &ExecutionServiceError) -> ReconciliationFailureScope {
+    // Durability, controller ownership, and signer-lane ambiguity are never scoped down merely
+    // because they happened while reconciling one vault.
+    if matches!(
+        error,
+        ExecutionServiceError::Storage(_)
+            | ExecutionServiceError::CurrentState(CurrentStateError::Storage(_))
+            | ExecutionServiceError::Planning(PlanningServiceError::Storage(_))
+            | ExecutionServiceError::Planning(PlanningServiceError::Controller(_))
+    ) {
+        return ReconciliationFailureScope::Global;
+    }
+    if provider_dependency_failed(error) {
+        return ReconciliationFailureScope::ProviderRetry;
+    }
+    match error.disposition() {
+        FailureDisposition::Retry { .. }
+        | FailureDisposition::RefreshAndReplan
+        | FailureDisposition::QuarantineVault { .. } => ReconciliationFailureScope::VaultLocal,
+        FailureDisposition::QuarantineSigner { .. }
+        | FailureDisposition::RestartWorker
+        | FailureDisposition::FatalProcessIntegrity => ReconciliationFailureScope::Global,
+    }
+}
+
+fn reconciliation_may_publish_runtime_state(
+    current_head: Option<BlockRef>,
+    reconciled_head: BlockRef,
+) -> bool {
+    current_head
+        .is_none_or(|current| current.number < reconciled_head.number || current == reconciled_head)
+}
+
+fn apply_reconciliation_to_runtime_status(
+    status: &mut VaultRuntimeStatus,
+    reconciled_head: BlockRef,
+    reconciled_snapshot_hash: B256,
+    desired: RuntimeVaultState,
+    reason: Option<String>,
+) -> Result<(), ControllerError> {
+    status.transaction_id = None;
+    if reconciliation_may_publish_runtime_state(status.canonical_head, reconciled_head) {
+        status.snapshot_hash = Some(reconciled_snapshot_hash);
+        status.transition(desired, reason)
+    } else {
+        // Reconciliation owns and releases the transaction lane, but the state service may already
+        // have published a newer canonical generation. Let that generation decide readiness on its
+        // next refresh instead of claiming Automatic from this older post-inclusion snapshot.
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2120,6 +2425,10 @@ fn contract_identity_failed(error: &ExecutionServiceError) -> bool {
 
 fn runtime_unix_timestamp() -> u64 {
     u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or_default()
+}
+
+const fn identical_rebroadcast_due(elapsed_opportunities: u64, configured_delay: u64) -> bool {
+    elapsed_opportunities >= configured_delay
 }
 
 fn validate_recovered_routine_transaction(
@@ -2279,10 +2588,13 @@ mod tests {
     use alloy::primitives::{Address, B256, Bytes, U256};
 
     use super::{
-        ExecutionServiceError, confirmed_attempt_was_superseded, contract_identity_failed,
-        current_state_failure_is_recoverable, map_recovery_provider_view,
-        provider_dependency_failed, provider_error_is_outage, receipt_matches_canonical_header,
-        receipt_reconciliation_is_retryable, receipt_reconciliation_is_state_drift,
+        ExecutionServiceError, ReconciliationFailureScope, apply_reconciliation_to_runtime_status,
+        confirmed_attempt_was_superseded, contract_identity_failed,
+        current_state_failure_is_recoverable, identical_rebroadcast_due,
+        map_recovery_provider_view, provider_dependency_failed, provider_error_is_outage,
+        receipt_matches_canonical_header, receipt_reconciliation_is_retryable,
+        receipt_reconciliation_is_state_drift, reconciliation_attempt_allowed,
+        reconciliation_failure_scope, reconciliation_may_publish_runtime_state,
         recovered_transaction_is_included, round_robin_index,
     };
     use crate::{
@@ -2295,7 +2607,10 @@ mod tests {
             conformance::{ConformanceError, ReceiptReconciliationError},
             current_state::{CurrentStateError, CurrentStateSourceError},
         },
-        runtime::failure::FailureDisposition,
+        runtime::{
+            controller::{RuntimeVaultState, VaultRuntimeStatus},
+            failure::FailureDisposition,
+        },
         storage::models::TransactionState,
         transaction::final_preflight::{PreflightError, PreflightSourceError, ReservationError},
     };
@@ -2312,6 +2627,16 @@ mod tests {
             block_number: None,
             transaction_index: None,
         }
+    }
+
+    #[test]
+    fn ambiguous_initial_send_reaches_configured_identical_rebroadcast() {
+        // HyperEVM's checked-in policy waits six eligible inclusion opportunities. There is no
+        // wall-clock deadline in this decision: signed bytes continue to own the nonce until the
+        // normal pending lifecycle resolves them.
+        assert!(!identical_rebroadcast_due(5, 6));
+        assert!(identical_rebroadcast_due(6, 6));
+        assert!(identical_rebroadcast_due(7, 6));
     }
 
     #[test]
@@ -2343,6 +2668,129 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(order, vec![2, 3, 0, 1]);
         assert_eq!(round_robin_index(0, 0, 0), None);
+    }
+
+    #[test]
+    fn reconciliation_only_work_is_vault_scoped_while_nonce_ownership_is_signer_scoped() {
+        let signer = Address::with_last_byte(0x44);
+        let vault_a = crate::domain::VaultAddress(Address::with_last_byte(0xa1));
+        let vault_b = crate::domain::VaultAddress(Address::with_last_byte(0xb1));
+        let pending_vaults = std::collections::BTreeSet::from([vault_a]);
+        let mut nonce_owners = std::collections::BTreeSet::new();
+
+        // Pending reconciliation on A prevents stale same-tick signing for A, both before and
+        // after a successful attempt, without claiming B's shared signer lane.
+        assert!(pending_vaults.contains(&vault_a));
+        assert!(!pending_vaults.contains(&vault_b));
+        assert!(nonce_owners.insert(signer));
+
+        // A real unresolved nonce remains signer-wide and therefore prevents every sibling vault
+        // from reserving a second nonce.
+        let unresolved_lane = std::collections::BTreeSet::from([signer]);
+        assert!(!unresolved_lane.is_disjoint(&nonce_owners));
+        assert!(!unresolved_lane.contains(&Address::with_last_byte(0x45)));
+    }
+
+    #[test]
+    fn reconciliation_failure_scoping_preserves_shared_signer_liveness() {
+        let vault_local = ExecutionServiceError::CurrentState(CurrentStateError::Identity);
+        assert_eq!(
+            reconciliation_failure_scope(&vault_local),
+            ReconciliationFailureScope::VaultLocal
+        );
+
+        let retry = ExecutionServiceError::CurrentState(CurrentStateError::Source(
+            CurrentStateSourceError::RetryableAt("vault_adapter"),
+        ));
+        assert_eq!(
+            reconciliation_failure_scope(&retry),
+            ReconciliationFailureScope::VaultLocal
+        );
+
+        let provider = ExecutionServiceError::CurrentState(CurrentStateError::Source(
+            CurrentStateSourceError::ProviderOutageAt("eth_call"),
+        ));
+        assert_eq!(
+            reconciliation_failure_scope(&provider),
+            ReconciliationFailureScope::ProviderRetry
+        );
+
+        let nonce_ambiguity = ExecutionServiceError::UnknownNonce;
+        assert_eq!(
+            reconciliation_failure_scope(&nonce_ambiguity),
+            ReconciliationFailureScope::Global
+        );
+
+        let vault = crate::domain::VaultAddress(Address::with_last_byte(0xa1));
+        let mut quarantined = VaultRuntimeStatus::starting(vault);
+        quarantined.state = RuntimeVaultState::PausedReconciliationFailure;
+        assert!(!reconciliation_attempt_allowed(Some(&quarantined)));
+
+        let mut healthy_sibling = VaultRuntimeStatus::starting(crate::domain::VaultAddress(
+            Address::with_last_byte(0xb1),
+        ));
+        healthy_sibling.state = RuntimeVaultState::Automatic;
+        assert!(reconciliation_attempt_allowed(Some(&healthy_sibling)));
+    }
+
+    #[test]
+    fn older_reconciliation_cannot_replace_newer_runtime_state() {
+        let block = |number: u64, hash: u8| BlockRef {
+            number,
+            hash: B256::repeat_byte(hash),
+            parent_hash: B256::repeat_byte(hash.saturating_sub(1)),
+            timestamp: number,
+            gas_limit: 3_000_000,
+        };
+        let reconciled = block(100, 1);
+        assert!(reconciliation_may_publish_runtime_state(None, reconciled));
+        assert!(reconciliation_may_publish_runtime_state(
+            Some(block(99, 9)),
+            reconciled
+        ));
+        assert!(reconciliation_may_publish_runtime_state(
+            Some(reconciled),
+            reconciled
+        ));
+        assert!(!reconciliation_may_publish_runtime_state(
+            Some(block(101, 2)),
+            reconciled
+        ));
+        assert!(!reconciliation_may_publish_runtime_state(
+            Some(block(100, 3)),
+            reconciled
+        ));
+
+        let vault = crate::domain::VaultAddress(Address::with_last_byte(0x11));
+        let transaction = TransactionId(B256::repeat_byte(0x22));
+        let newer_snapshot_hash = B256::repeat_byte(0x33);
+        let mut status = VaultRuntimeStatus {
+            vault,
+            state: RuntimeVaultState::PendingTransaction,
+            canonical_head: Some(block(101, 2)),
+            snapshot_hash: Some(newer_snapshot_hash),
+            plan_id: None,
+            episode_id: None,
+            transaction_id: Some(transaction),
+            current_rate_spread: Some(U256::from(7_u8)),
+            reason: Some("newer pending state".to_owned()),
+            revision: 4,
+        };
+        assert!(
+            apply_reconciliation_to_runtime_status(
+                &mut status,
+                reconciled,
+                B256::repeat_byte(0x44),
+                RuntimeVaultState::Automatic,
+                None,
+            )
+            .is_ok()
+        );
+        assert_eq!(status.transaction_id, None);
+        assert_eq!(status.state, RuntimeVaultState::PendingTransaction);
+        assert_eq!(status.snapshot_hash, Some(newer_snapshot_hash));
+        assert_eq!(status.reason.as_deref(), Some("newer pending state"));
+        assert_eq!(status.revision, 4);
     }
 
     #[test]
@@ -2450,6 +2898,13 @@ mod tests {
             source_outage.disposition(),
             FailureDisposition::Retry { .. }
         ));
+        assert!(matches!(
+            ExecutionServiceError::Preflight(PreflightError::Source(
+                PreflightSourceError::VaultFatalAt("exact_snapshot"),
+            ))
+            .disposition(),
+            FailureDisposition::QuarantineVault { .. }
+        ));
         assert!(provider_dependency_failed(&source_outage));
         let semantic_retry = ExecutionServiceError::Preflight(PreflightError::Source(
             PreflightSourceError::RetryableAt("provider"),
@@ -2475,6 +2930,20 @@ mod tests {
             FailureDisposition::QuarantineSigner { .. }
         ));
         assert!(contract_identity_failed(&identity));
+    }
+
+    #[test]
+    fn authoritative_snapshot_subcall_retry_never_quarantines_signer_or_vault() {
+        let disposition = ExecutionServiceError::Preflight(PreflightError::Source(
+            PreflightSourceError::RetryableAt("exact_snapshot_authoritative_call"),
+        ))
+        .disposition();
+        assert!(matches!(disposition, FailureDisposition::Retry { .. }));
+        assert!(!matches!(
+            disposition,
+            FailureDisposition::QuarantineSigner { .. }
+                | FailureDisposition::QuarantineVault { .. }
+        ));
     }
 
     #[test]
