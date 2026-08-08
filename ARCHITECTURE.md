@@ -550,7 +550,7 @@ The transaction becomes `reconciled` only after this record is durable.
 
 ## 14. JSON persistence design
 
-The storage actor owns format version 3. State includes:
+The storage actor owns format version 4. State includes:
 
 - canonical blocks, logs, receipts, and chain cursors;
 - exact snapshots and topology history;
@@ -657,13 +657,74 @@ and protocol lock, installs a versioned directory, and atomically switches
 watchdog, filesystem, privilege, and writable-path boundaries.
 
 The previous Cargo/tmux process has now been replaced by a CI-built, checksummed
-binary running directly under systemd. The live Shadow canary uses a versioned
+binary running directly under systemd. The live Execute service uses a versioned
 release directory, an atomic `/opt/morpho/current` symlink, a protected
-environment file, and durable state owned by the dedicated `morpho` user. A
-tagged `main` release and a complete rollback exercise remain release-governance
-requirements. No routine production deployment compiles on the host.
+environment file, and durable state owned by the dedicated `morpho` user.
+Backup/restore and failed-cutover rollback drills have passed. No routine
+production deployment compiles on the host.
 
 ## 19. Live execution evidence
+
+### 19.1 Current Execute validation: 25 USDC withdrawal/deposit cycle
+
+The 2026-08-08 validation used the CI-built Linux artifact whose deployment
+manifest records source `4bf89d6de34ccb128b6587843418fb663abca4d0`, binary
+SHA-256 `1eb8dbc685cfbc337789228c227d6e5e3a620440f03a76a8a293e1438c8d58bb`,
+configuration revision
+`0x4edab04e63492a2181bcb25dc5577e3e97db9f249d9c6780ecf5ce04c6dc4bb7`,
+and production protocol-lock digest
+`0x9cda304cb9df0b7f9a8441511e5f1075df217d57c0723fcf284179b9f9df690c`.
+
+The initial Top-K plan moved 25.201330 USDC, within the requested 20–30 USDC
+test range. The normal 90% tranche then produced a 2.520133 USDC follow-up. A
+separate user cycle withdrew exactly 25 USDC through the zero-penalty atomic
+force-deallocation path and deposited the same 25 USDC back. The bot detected
+both changes without supervision and completed the following allocator calls:
+
+| Purpose | Nonce | Movement | Included block | Transaction |
+| --- | ---: | ---: | ---: | --- |
+| Initial Top-K redistribution | 8 | 25.201330 USDC | 42,602,435 | `0x45518c96bd886ee9c12f793daba98ce33ff5b32fded204ab70cd65a8fee9bd4b` |
+| Top-K convergence tranche | 9 | 2.520133 USDC | 42,602,460 | `0x001bddd34794068b5dde323c4f26eee07a10559eaa7cb4c38c6ab743de7d545a` |
+| Post-withdrawal redistribution | 10 | 1.080535 USDC | 42,602,649 | `0x4ebb018efdce11d40ba5621c9b69080dda33bbe99782cb14067ac3bec9454796` |
+| Post-withdrawal convergence | 11 | 1.040640 USDC | 42,602,674 | `0x0c9c1856aaca63cbf71e48493235d052d0afc45963409bc094743907fd459a48` |
+| Deposit capital deployment | 12 | 22.500000 USDC | 42,602,704 | `0x44013082d5be45cb85f9786a982467b76757dd3ec2cebd560a35d3836a61cbfa` |
+| Deposit convergence tranche | 13 | 2.250000 USDC | 42,602,735 | `0xf111309cfed10dd87934b44dfe013fd1ad16e4a8b9b4c7a79492663d9aecacce` |
+
+The user withdrawal was transaction
+`0xc79ed24c67fd34c1fec9c8939ae94351d1a15fdd7c41a05a79dff05198c25e30`
+at block 42,602,638. The approval and deposit were
+`0x5c9104b201e431020a6d6dd0e12e6bc6da47cb155c1a57d8ed51acc2a0d6ee12`
+at block 42,602,689 and
+`0xe74ec7f73e33d4d68fe621d78f3cc8c6271ff68796798cf85064e3e03111436b`
+at block 42,602,693.
+
+Both the paid primary provider and the public HyperEVM provider returned the
+same successful status, transaction hash, inclusion block, block hash, and gas
+used for every allocator transaction. Every transaction passed ordered protocol
+event conformance and a separate fresh-state reconciliation. Both providers
+reported confirmed allocator nonce 14 afterward; durable storage had no
+unresolved transaction.
+
+The initial normalized Top-K allocation-deviation score moved from 100% to
+10.000006% and then 1.000001% across the two 90% tranches. This is the Top-K
+allocation score, not an assertion that global market rates were equalized. At
+the final snapshot, the vault held 29 USDC total: 1.25 USDC in the configured
+liquidity adapter and 27.751493 USDC in direct positions. Direct assets were
+approximately 11.200597 USDC in each of the two leading markets, 5.070283 USDC
+in the third selected market, and 0.280016 USDC residual in the former market.
+The vault is below the configured 25,000 USDC threshold for a four-market set,
+so the active target is 40/40/20 across three markets. The remaining sub-USDC
+deviation is below the configured 1 USDC minimum action and correctly produced
+no further plan.
+
+The final selected-market native supply APYs were approximately 7.0911%,
+7.0343%, and 6.7943%; the residual former market supplied approximately 1.0058%.
+The service finished `active/running`, Execute-ready with no readiness reasons,
+zero systemd restarts, no warning-or-higher journal entries since the corrected
+deployment, no published plan, and exactly the starting 12 USDC wallet balance,
+28 vault shares, and 29 USDC vault total assets.
+
+### 19.2 Earlier execution and Shadow evidence
 
 The deposit/withdraw/rebalance exercise produced:
 
@@ -940,6 +1001,42 @@ The shareholder projection remains an independent no-sacrifice safety check.
 A regression test proves that zero parent max rate can yield zero shareholder
 delta and positive recoverable-asset gain without conflating them.
 
+### 20.21 Bounded preflight retry reused an old identity
+
+**Symptom:** the first production Execute attempt correctly aborted before
+signing, then every retry failed with `duplicate preflight identity`. No bytes
+were signed and nonce 8 remained free, but execution could not make progress.
+
+**Root cause:** the HyperEVM end-to-end snapshot-to-sign bound was only 750 ms.
+The exact preflight needed about 660 ms before its final parallel RPC gate, so
+ordinary provider latency could exceed the bound. The unsigned reservation was
+then aborted correctly, but `preflight_id` was derived only from plan, snapshot
+head, and calldata. A new transaction attempt against the same exact snapshot
+therefore collided with the earlier audit record.
+
+**Resolution:** the reviewed HyperEVM bound is now 10 seconds, within the
+operator-approved 5–20 second latency envelope. Preflight identity additionally
+binds the transaction attempt and both simulation evidence hashes. Replaying an
+exact identical record is idempotent, while the same identity with different
+evidence still fails closed. The signing-gate debug record now names the exact
+deferral reason. Targeted retry/idempotence tests and the full CI suite pass. The
+corrected artifact subsequently signed, included, conformed, and reconciled six
+consecutive allocator transactions using nonces 8–13.
+
+### 20.22 Deployment readiness rejected a healthy pending transaction
+
+**Symptom:** an Execute cutover could be treated as failed if the bot submitted
+a transaction before the installer's readiness probe finished. A service with
+one durable pending transaction deliberately reports Execute readiness false,
+so a generic HTTP-200 requirement could roll the symlink back while the new
+binary still owned the nonce.
+
+**Resolution:** the installer accepts only full readiness or the exact narrow
+state `ready_for_shadow=true`, `ready_for_execute=false`, and
+`reasons=["pending_transaction"]`. Provider, identity, storage, exact-state, or
+mixed degraded reasons still fail the deployment and trigger rollback. Shell
+syntax plus accepted/rejected JSON fixtures cover this cutover rule.
+
 ## 21. Remaining issues and review risks
 
 These are ordered by potential production impact, not implementation effort.
@@ -950,18 +1047,11 @@ CI now publishes an immutable Linux binary, release manifest, and checksums.
 The installed deployment manifest records the source revision, Cargo.lock hash,
 config revision, protocol-lock digest, binary SHA-256, build environment, release
 version, and deployment timestamp. Build metrics expose the same source
-revision. The remaining governance gap is that the canary comes from the
-reviewed PR merge result rather than a signed/tagged `main` release.
+revision, and production promotion uses the artifact built from `main`. The
+remaining governance gap is that releases are not yet signed and tagged under a
+formal approval policy.
 
-### 21.2 The reviewed branch is not merged to `main`
-
-The code and green CI are on draft PR #1. Production currently uses source copied
-from that branch, while `main` remains older.
-
-**Recommended change:** senior review, approve, merge, tag a release, and deploy
-only a tagged artifact.
-
-### 21.3 Live signer is a host-local private key
+### 21.2 Live signer is a host-local private key
 
 The signer API is restricted, the EOA is exclusive, and the secret is outside
 the repository, but host compromise can still expose it.
@@ -971,7 +1061,7 @@ mTLS/KMS/HSM-backed key material after an operational design review. If local ke
 operation remains accepted, harden the instance, user, secret permissions,
 network, backups, and access audit.
 
-### 21.4 Independent provider quality needs review
+### 21.3 Independent provider quality needs review
 
 The current fallback/checkpoint topology must be confirmed to be operationally
 independent and production-grade. A public fallback from the same underlying
@@ -980,7 +1070,7 @@ infrastructure is not a strong Byzantine check.
 **Recommended change:** use a separately operated paid checkpoint/receipt
 provider, monitor disagreement and latency, and run failover drills.
 
-### 21.5 Latest-only block binding deserves an external review
+### 21.4 Latest-only block binding deserves an external review
 
 The current design binds a reported-latest aggregate through canonical replay,
 topology revision, code identity, and absence of later relevant events. API
@@ -993,39 +1083,30 @@ RPC trust model, or should Execute require a provider-specific EIP-1898/block-ha
 capability, a verified multicall block-hash return, or two independent current
 state aggregates?
 
-### 21.6 Economic effectiveness is not yet proven at meaningful scale
+### 21.5 Economic effectiveness is not yet proven at meaningful scale
 
-The live vault currently has about 40 USDC total and about 39 USDC in one direct
-market. At block 42,578,865 that market supplied roughly 0.8906% APY, while the
-three selected markets supplied roughly 7.1062%, 7.0602%, and 6.6730% APY.
-The weakest selected improvement is therefore more than 578 APY bps, well above
-the 200-bps entry and 250-bps exit gates. The next candidate supplied roughly
-6.2213% APY, only about 45 bps below the third selected market, so the 100-bps
-replacement rule correctly prevented churn. Top-K therefore has a clear
-40/40/20 target. The exact four-action estimate was
-931,662 gas and the signed limit with 15% headroom was 1,071,412 gas. With the
-0.1 gwei live quote, the signed initial fee is 0.2 gwei. The configured 3x gas
-multiplier and 100-USDC/HYPE ceiling require roughly 0.065 USDC of 24-hour gain,
-while the 39.001213-USDC direct portfolio projects only 0.005652 USDC. A live
-estimate at block 42,578,738 was 931,662 gas, producing the exact 1,071,412
-signed limit and a 65,290-unit required gain versus 5,652 units available. At
-unchanged rates, linear scaling requires about 450.528875 USDC of direct capital
-to clear that conservative gate; use at least 500 USDC as a risk-approved buffer
-because rates and gas can move.
+The 29 USDC live test proves transaction correctness and liveness, not that a
+small vault can materially change large Morpho markets or earn more incremental
+yield than it spends on gas. The curator explicitly approved disabling the
+Top-K gas-versus-24-hour-yield gate for this small-TVL production exercise. That
+setting does not weaken principal, role, bytecode, cap, loss, calldata, nonce,
+receipt, or reconciliation checks, but it can make routine execution
+economically inefficient.
 
-The local historical sample contained 85 exact snapshots over two short windows
-separated by about 23 hours. The same three markets remained selected; only the
-ordering of the first three changed on differences far smaller than the 200/250/
-100 APY-bps transition gates. This supports the checked-in 5% entry, 1% target,
-and 1% minimum score improvement as anti-churn defaults for this observed state,
-but it is not long-duration production evidence.
+The live cycle required six allocator transactions because each calculated
+movement used a 90% tranche and the withdrawal/deposit disturbances were allowed
+to converge before the next disturbance. At final state, selected supply APYs
+were about 6.79–7.09%, while the residual former market supplied about 1.01%.
+This clearly validates the selected direction and diversified allocation, but
+the vault's tens of USDC cannot materially alter market-wide utilization or
+rates.
 
-**Recommended test:** fund the vault at a meaningful but risk-approved amount,
-enable at least two genuinely controllable active markets, create repeatable
-borrow/deposit/withdraw disturbances, and record multiple before/after
-utilizations, solver certificates, transaction costs, and convergence time.
+**Recommended operating review:** decide the minimum vault TVL, minimum absolute
+yield improvement, and acceptable transaction frequency at which the disabled
+economic gate should be re-enabled. Repeat the same evidence collection at that
+TVL before interpreting strategy results as market-level economic proof.
 
-### 21.7 Market-set policy needs curator confirmation
+### 21.6 Market-set policy needs curator confirmation
 
 Disabled and synchronization-required markets are excluded from strategy spread,
 but configured active zero-exposure destinations can be included when seed
@@ -1041,7 +1122,7 @@ vault cannot materially influence.
 - Should a target be declared unreachable earlier based on sensitivity to
   available vault capital?
 
-### 21.8 Solver optimality is bounded to its candidate lattice
+### 21.7 Solver optimality is bounded to its candidate lattice
 
 The certificate proves completion for the generated integer lattice, not a
 closed-form proof over every possible asset amount. This is likely acceptable
@@ -1051,7 +1132,7 @@ for 5–20 second operation, but senior review should confirm that the lattice a
 **Recommended test:** differential brute force on reduced domains and randomized
 multi-market cases, comparing chosen movement to every feasible integer amount.
 
-### 21.9 Live external-state stress coverage is incomplete
+### 21.8 Live external-state stress coverage is incomplete
 
 The code refreshes/retries when another user changes state before inclusion, and
 unit/integration tests cover many drift cases. The production deployment has not
@@ -1062,7 +1143,7 @@ repay, liquidity removal, cap event, and reorg while a transaction is pending.
 small controlled live environment, with failures injected at every durability
 boundary.
 
-### 21.10 Telegram/PagerDuty and monitoring need live operational proof
+### 21.9 Telegram/PagerDuty and monitoring need live operational proof
 
 Code and test transports exist, but external alerts are not currently required
 for the live instance and the Prometheus/Grafana stack has not been documented as
@@ -1073,7 +1154,7 @@ deploy Prometheus/Grafana or a managed equivalent, and alert on readiness loss,
 block lag, repeated snapshot retries, unresolved nonce age, reconciliation
 failure, and low gas balance.
 
-### 21.11 Log heartbeat is exact-refresh based, not every-chain-block based
+### 21.10 Log heartbeat is exact-refresh based, not every-chain-block based
 
 This is intentional and reduces noise, but an operator may misread block-number
 gaps as missed chain data. WebSocket coalescing or a transient latest snapshot
@@ -1084,7 +1165,7 @@ correct.
 observed head, durable cursor, latest exact snapshot, skipped/coalesced heads, and
 snapshot retry count. Document this directly in the operator runbook.
 
-### 21.12 Force-deallocation helper is intentionally narrow
+### 21.11 Force-deallocation helper is intentionally narrow
 
 The Python fallback supports configured direct Morpho Market V1 adapter
 positions for exact `withdraw`. It does not add the same fallback to `redeem-all`
@@ -1094,7 +1175,7 @@ and does not construct arbitrary adapter data.
 general withdrawal-liquidity preparation flow into a separate tool with explicit
 adapter profiles and penalty ceilings?
 
-### 21.13 Live atomic cutover and rollback drill are complete
+### 21.12 Live atomic cutover and rollback drill are complete
 
 CI release and systemd/install assets implement versioned directories, manifest
 verification, atomic `current` switching, direct binary execution, and readiness
@@ -1104,7 +1185,7 @@ to the current artifact all passed with zero unresolved transactions. The
 remaining operational work is to automate and periodically rehearse this exact
 documented procedure rather than treating a one-time drill as permanent proof.
 
-### 21.14 Disk and build-cache operations need a runbook
+### 21.13 Disk and build-cache operations need a runbook
 
 The instance was initially above 94% disk use. The release build succeeded after
 temporary linker artifacts were reclaimed, but low disk can interrupt builds,
@@ -1113,7 +1194,7 @@ logs, or journal persistence.
 **Recommended change:** establish disk alerts, log rotation, journal/data backup
 retention, Cargo target retention, and a minimum-free-space pre-deploy gate.
 
-### 21.15 Same-host backup recovery is proven; fresh-host recovery remains
+### 21.14 Same-host backup recovery is proven; fresh-host recovery remains
 
 The live service was stopped at durable revision 129,861 with zero unresolved
 transactions. Its built-in backup command created a protected backup, and an
@@ -1126,7 +1207,7 @@ not yet been demonstrated.
 manifest, restore on a clean host, verify cursor/nonce/receipt state, resume, and
 compare API hashes before allowing Execute.
 
-### 21.16 No independent smart-contract/integration audit has been completed
+### 21.15 No independent smart-contract/integration audit has been completed
 
 Runtime hashes and official sources are pinned, and CI is green, but internal
 tests can still share an incorrect assumption with implementation.
@@ -1176,20 +1257,23 @@ The current reviewed working tree passed:
 - HyperEVM protocol-lock validation
 - operator shell syntax checks
 
-The current systemd-managed AWS Shadow canary reports:
+The current systemd-managed AWS Execute service reports:
 
 ```json
 {
   "ready": true,
   "ready_for_observation": true,
   "ready_for_shadow": true,
-  "ready_for_execute": false,
-  "reasons": ["non_execute_mode"]
+  "ready_for_execute": true,
+  "reasons": []
 }
 ```
 
-This proves live and Shadow readiness for the deployed artifact. Execute remains
-deliberately disabled because the current 40 USDC plan does not clear the
-conservative gas-versus-recoverable-gain gate. It does not close the remaining
-economic-scale, infrastructure-independence, rollback, or external-review issues
-listed above.
+The service is `active/running` with zero systemd restarts, confirmed allocator
+nonce 14, zero unresolved transactions, no remaining plan, and no
+warning-or-higher journal entry since the corrected deployment. The six current
+allocator receipts agree across both providers and have durable conformance and
+post-state reconciliation records. This closes the local-code, CI, deployment,
+small-value execution-liveness, restart, and same-host recovery gates. It does
+not remove the explicit economic-scale, signer-host, provider-independence,
+fresh-host recovery, or external-review risks listed above.
